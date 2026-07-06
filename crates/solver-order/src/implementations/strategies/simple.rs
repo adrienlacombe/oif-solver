@@ -5,8 +5,8 @@
 use alloy_primitives::{hex, U256};
 use async_trait::async_trait;
 use solver_types::{
-	with_0x_prefix, ConfigSchema, ExecutionContext, ExecutionDecision, ExecutionParams, Field,
-	FieldType, Order, Schema,
+	is_native_address, with_0x_prefix, ConfigSchema, ExecutionContext, ExecutionDecision,
+	ExecutionParams, Field, FieldType, Order, Schema,
 };
 
 use crate::{ExecutionStrategy, StrategyError};
@@ -95,20 +95,32 @@ impl ExecutionStrategy for SimpleStrategy {
 					});
 
 					// Get token address from the asset's InteropAddress
-					let token_address = asset
+					let (token_address, is_native_token) = asset
 						.ethereum_address()
-						.map(|addr| hex::encode(addr.as_slice()))
+						.map(|addr| {
+							let address = solver_types::Address(addr.as_slice().to_vec());
+							(hex::encode(addr.as_slice()), is_native_address(&address))
+						})
 						.unwrap_or_else(|e| {
 							tracing::warn!(
 								order_id = %order.id,
 								error = %e,
 								"Failed to get token address from asset"
 							);
-							String::new()
+							(String::new(), false)
 						});
 
-					// Build the balance key (chain_id, Some(token_address))
-					let balance_key = (chain_id, Some(token_address.clone()));
+					let token_display = if is_native_token {
+						"native".to_string()
+					} else {
+						with_0x_prefix(&token_address)
+					};
+
+					let balance_key = if is_native_token {
+						(chain_id, None)
+					} else {
+						(chain_id, Some(token_address.clone()))
+					};
 
 					// Check if we have the balance for this token
 					if let Some(balance_str) = context.solver_balances.get(&balance_key) {
@@ -120,17 +132,13 @@ impl ExecutionStrategy for SimpleStrategy {
 							tracing::warn!(
 								order_id = %order.id,
 								chain_id = chain_id,
-								token = %with_0x_prefix(&token_address),
+								token = %token_display,
 								balance = ?balance,
 								required = ?required,
 								"Insufficient token balance for order"
 							);
 							return ExecutionDecision::Skip(format!(
-								"Insufficient balance on chain {}: have {} need {} of token {}",
-								chain_id,
-								balance,
-								required,
-								with_0x_prefix(&token_address)
+								"Insufficient balance on chain {chain_id}: have {balance} need {required} of token {token_display}"
 							));
 						}
 					} else {
@@ -138,13 +146,11 @@ impl ExecutionStrategy for SimpleStrategy {
 						tracing::warn!(
 							order_id = %order.id,
 							chain_id = chain_id,
-							token = %with_0x_prefix(&token_address),
+							token = %token_display,
 							"No balance information available for token"
 						);
 						return ExecutionDecision::Skip(format!(
-							"No balance information for token {} on chain {}",
-							with_0x_prefix(&token_address),
-							chain_id
+							"No balance information for token {token_display} on chain {chain_id}"
 						));
 					}
 				}
@@ -442,6 +448,35 @@ mod tests {
 			ExecutionDecision::Defer(duration) => {
 				println!("Defer duration: {duration:?}");
 				panic!("Expected Execute but got Defer");
+			},
+		}
+	}
+
+	#[tokio::test]
+	async fn test_should_execute_uses_native_balance_for_native_output() {
+		let strategy = SimpleStrategy::new(100);
+		let mut order_data = create_test_order_data();
+		order_data.outputs[0].token = [0u8; 32];
+		order_data.outputs[0].amount = U256::from(95);
+		let order = create_test_order(order_data);
+
+		let mut context =
+			create_test_context(vec![(1, "50000000000"), (137, "30000000000")], vec![]);
+		context
+			.solver_balances
+			.insert((137, None), "200".to_string());
+
+		let decision = strategy.should_execute(&order, &context).await;
+
+		match decision {
+			ExecutionDecision::Execute(params) => {
+				assert_eq!(params.gas_price, U256::from(50000000000u64));
+			},
+			ExecutionDecision::Skip(reason) => {
+				panic!("Expected Execute for sufficient native balance, got Skip: {reason}");
+			},
+			ExecutionDecision::Defer(duration) => {
+				panic!("Expected Execute for sufficient native balance, got Defer: {duration:?}");
 			},
 		}
 	}
