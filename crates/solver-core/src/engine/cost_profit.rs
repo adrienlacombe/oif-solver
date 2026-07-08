@@ -42,8 +42,8 @@ use solver_types::{
 		MAX_CALLBACK_DATA_BYTES,
 	},
 	utils::{conversion::ceil_dp, formatting::format_percentage},
-	APIError, Address, ApiErrorType, GetQuoteRequest, InteropAddress, NetworkKind, Order,
-	OrderInput, OrderOutput, StorageKey, SwapType, Transaction, ValidatedQuoteContext,
+	APIError, Address, ApiErrorType, GetQuoteRequest, InteropAddress, NetworkKind, NetworksConfig,
+	Order, OrderInput, OrderOutput, StorageKey, SwapType, Transaction, ValidatedQuoteContext,
 };
 use std::primitive::str;
 use std::{str::FromStr, sync::Arc};
@@ -623,15 +623,16 @@ impl CostProfitService {
 					let mut input_usd_values = Vec::new();
 
 					for (input, input_amount) in known_inputs {
-						let input_chain_id = input.asset.ethereum_chain_id().map_err(|e| {
-							CostProfitError::Calculation(format!("Invalid input chain: {e}"))
-						})?;
-						let input_addr = input.asset.ethereum_address().map_err(|e| {
-							CostProfitError::Calculation(format!("Invalid input address: {e}"))
-						})?;
+						let (input_chain_id, input_addr) = self
+							.token_lookup_key_for_asset(
+								&input.asset,
+								"input chain",
+								"input address",
+							)
+							.await?;
 						let input_token = self
 							.token_manager
-							.get_token_info(input_chain_id, &Address(input_addr.0.to_vec()))
+							.get_token_info(input_chain_id, &input_addr)
 							.await?;
 
 						// Convert raw amount to USD
@@ -698,15 +699,16 @@ impl CostProfitService {
 					let mut output_usd_values = Vec::new();
 
 					for (output, output_amount) in known_outputs {
-						let output_chain_id = output.asset.ethereum_chain_id().map_err(|e| {
-							CostProfitError::Calculation(format!("Invalid output chain: {e}"))
-						})?;
-						let output_addr = output.asset.ethereum_address().map_err(|e| {
-							CostProfitError::Calculation(format!("Invalid output address: {e}"))
-						})?;
+						let (output_chain_id, output_addr) = self
+							.token_lookup_key_for_asset(
+								&output.asset,
+								"output chain",
+								"output address",
+							)
+							.await?;
 						let output_token = self
 							.token_manager
-							.get_token_info(output_chain_id, &Address(output_addr.0.to_vec()))
+							.get_token_info(output_chain_id, &output_addr)
 							.await?;
 
 						// Convert raw amount to USD
@@ -799,13 +801,13 @@ impl CostProfitService {
 
 		// Get decimals for all input tokens
 		for input in &request.intent.inputs {
-			if let (Ok(chain_id), Ok(eth_addr)) = (
-				input.asset.ethereum_chain_id(),
-				input.asset.ethereum_address(),
-			) {
+			if let Ok((chain_id, token_address)) = self
+				.token_lookup_key_for_asset(&input.asset, "input chain", "input address")
+				.await
+			{
 				let decimals = self
 					.token_manager
-					.get_token_info(chain_id, &Address(eth_addr.0.to_vec()))
+					.get_token_info(chain_id, &token_address)
 					.await
 					.ok()
 					.map(|info| info.decimals)
@@ -817,13 +819,13 @@ impl CostProfitService {
 		// Get decimals for all output tokens
 		for output in &request.intent.outputs {
 			if !decimals_map.contains_key(&output.asset) {
-				if let (Ok(chain_id), Ok(eth_addr)) = (
-					output.asset.ethereum_chain_id(),
-					output.asset.ethereum_address(),
-				) {
+				if let Ok((chain_id, token_address)) = self
+					.token_lookup_key_for_asset(&output.asset, "output chain", "output address")
+					.await
+				{
 					let decimals = self
 						.token_manager
-						.get_token_info(chain_id, &Address(eth_addr.0.to_vec()))
+						.get_token_info(chain_id, &token_address)
 						.await
 						.ok()
 						.map(|info| info.decimals)
@@ -1492,32 +1494,24 @@ impl CostProfitService {
 		let requested_outputs = order_parsed.parse_requested_outputs();
 
 		for input in &available_inputs {
-			let chain_id = input.asset.ethereum_chain_id().map_err(|e| {
-				CostProfitError::Calculation(format!("Failed to get input chain ID: {e}"))
-			})?;
-			let network_kind = config
-				.networks
-				.get(&chain_id)
-				.map(|network| network.kind)
-				.unwrap_or_default();
-			let token_address =
-				Self::token_address_for_network(&input.asset, network_kind, "input token")?;
+			let (chain_id, token_address) = Self::token_lookup_key_for_asset_with_networks(
+				&input.asset,
+				&config.networks,
+				"input chain ID",
+				"input token",
+			)?;
 			self.token_manager
 				.get_token_info(chain_id, &token_address)
 				.await?;
 		}
 
 		for output in &requested_outputs {
-			let chain_id = output.asset.ethereum_chain_id().map_err(|e| {
-				CostProfitError::Calculation(format!("Failed to get output chain ID: {e}"))
-			})?;
-			let network_kind = config
-				.networks
-				.get(&chain_id)
-				.map(|network| network.kind)
-				.unwrap_or_default();
-			let token_address =
-				Self::token_address_for_network(&output.asset, network_kind, "output token")?;
+			let (chain_id, token_address) = Self::token_lookup_key_for_asset_with_networks(
+				&output.asset,
+				&config.networks,
+				"output chain ID",
+				"output token",
+			)?;
 			self.token_manager
 				.get_token_info(chain_id, &token_address)
 				.await?;
@@ -1528,17 +1522,52 @@ impl CostProfitService {
 		Self::validate_callback_policy_before_simulation(&requested_outputs, config)
 	}
 
+	async fn token_lookup_key_for_asset(
+		&self,
+		asset: &InteropAddress,
+		chain_field: &str,
+		address_field: &str,
+	) -> Result<(u64, Address), CostProfitError> {
+		let networks = self.token_manager.get_networks().await;
+		Self::token_lookup_key_for_asset_with_networks(asset, &networks, chain_field, address_field)
+	}
+
+	fn token_lookup_key_for_asset_with_networks(
+		asset: &InteropAddress,
+		networks: &NetworksConfig,
+		chain_field: &str,
+		address_field: &str,
+	) -> Result<(u64, Address), CostProfitError> {
+		let chain_id = asset.ethereum_chain_id().map_err(|e| {
+			CostProfitError::Calculation(format!("Failed to get {chain_field}: {e}"))
+		})?;
+		let network_kind = networks
+			.get(&chain_id)
+			.map(|network| network.kind)
+			.unwrap_or_default();
+		let token_address = Self::token_address_for_network(asset, network_kind, address_field)?;
+		Ok((chain_id, token_address))
+	}
+
 	fn token_address_for_network(
 		asset: &InteropAddress,
 		network_kind: NetworkKind,
 		field: &str,
 	) -> Result<Address, CostProfitError> {
 		match network_kind {
-			NetworkKind::Evm => {
-				let ethereum_addr = asset.ethereum_address().map_err(|e| {
-					CostProfitError::Calculation(format!("Failed to get {field} address: {e}"))
-				})?;
-				Ok(Address(ethereum_addr.0.to_vec()))
+			NetworkKind::Evm => match asset.address.len() {
+				len if len == InteropAddress::ETH_ADDRESS_LENGTH as usize => {
+					let ethereum_addr = asset.ethereum_address().map_err(|e| {
+						CostProfitError::Calculation(format!("Failed to get {field} address: {e}"))
+					})?;
+					Ok(Address(ethereum_addr.0.to_vec()))
+				},
+				len if len == InteropAddress::BYTES32_ADDRESS_LENGTH as usize => {
+					Ok(Address(asset.address.clone()))
+				},
+				len => Err(CostProfitError::Calculation(format!(
+						"Failed to get {field} address: Invalid address length: expected 20 or 32, got {len}"
+					))),
 			},
 			NetworkKind::Starknet => {
 				if asset.address.len() != InteropAddress::BYTES32_ADDRESS_LENGTH as usize {
@@ -3135,15 +3164,9 @@ impl CostProfitService {
 		let mut total_usd = Decimal::ZERO;
 
 		for input in inputs {
-			let chain_id = input.asset.ethereum_chain_id().map_err(|e| {
-				CostProfitError::Calculation(format!("Failed to get chain ID: {e}"))
-			})?;
-			let ethereum_addr = input
-				.asset
-				.ethereum_address()
-				.map_err(|e| CostProfitError::Calculation(format!("Failed to get address: {e}")))?;
-			let token_address = Address(ethereum_addr.0.to_vec());
-
+			let (chain_id, token_address) = self
+				.token_lookup_key_for_asset(&input.asset, "chain ID", "address")
+				.await?;
 			let token_info = self
 				.token_manager
 				.get_token_info(chain_id, &token_address)
@@ -3172,15 +3195,9 @@ impl CostProfitService {
 		let mut total_usd = Decimal::ZERO;
 
 		for output in outputs {
-			let chain_id = output.asset.ethereum_chain_id().map_err(|e| {
-				CostProfitError::Calculation(format!("Failed to get chain ID: {e}"))
-			})?;
-			let ethereum_addr = output
-				.asset
-				.ethereum_address()
-				.map_err(|e| CostProfitError::Calculation(format!("Failed to get address: {e}")))?;
-			let token_address = Address(ethereum_addr.0.to_vec());
-
+			let (chain_id, token_address) = self
+				.token_lookup_key_for_asset(&output.asset, "chain ID", "address")
+				.await?;
 			let token_info = self
 				.token_manager
 				.get_token_info(chain_id, &token_address)
@@ -3208,14 +3225,9 @@ impl CostProfitService {
 		asset: &solver_types::InteropAddress,
 	) -> Result<U256, CostProfitError> {
 		// Get token info
-		let chain_id = asset
-			.ethereum_chain_id()
-			.map_err(|e| CostProfitError::Calculation(format!("Failed to get chain ID: {e}")))?;
-		let ethereum_addr = asset.ethereum_address().map_err(|e| {
-			CostProfitError::Calculation(format!("Failed to get ethereum address: {e}"))
-		})?;
-		let token_address = Address(ethereum_addr.0.to_vec());
-
+		let (chain_id, token_address) = self
+			.token_lookup_key_for_asset(asset, "chain ID", "token")
+			.await?;
 		let token_info = self
 			.token_manager
 			.get_token_info(chain_id, &token_address)
@@ -3461,14 +3473,25 @@ mod tests {
 	}
 
 	#[test]
-	fn token_address_for_network_keeps_evm_address_validation_strict() {
+	fn token_address_for_network_accepts_eip155_bytes32_domain_envelope() {
 		let asset = InteropAddress::from((1, Address(vec![0x12; Address::BYTES32_LENGTH])));
+
+		let address =
+			CostProfitService::token_address_for_network(&asset, NetworkKind::Evm, "input token")
+				.expect("EIP-155 bytes32 domain-envelope token should be accepted");
+
+		assert_eq!(address.0, asset.address);
+	}
+
+	#[test]
+	fn token_address_for_network_keeps_evm_address_validation_strict() {
+		let asset = InteropAddress::from((1, Address(vec![0x12; 31])));
 
 		let error =
 			CostProfitService::token_address_for_network(&asset, NetworkKind::Evm, "input token")
-				.expect_err("EVM token should still require a 20-byte address");
+				.expect_err("Malformed EVM token should still be rejected");
 
-		assert!(format!("{error}").contains("expected 20, got 32"));
+		assert!(format!("{error}").contains("expected 20 or 32, got 31"));
 	}
 
 	#[test]
