@@ -20,6 +20,8 @@ on:
       - docs/**
       - "**.md"
       - .claude/**
+permissions:
+  contents: read
 # run concurrency group for the workflow
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
