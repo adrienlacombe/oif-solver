@@ -42,8 +42,8 @@ use solver_types::{
 		MAX_CALLBACK_DATA_BYTES,
 	},
 	utils::{conversion::ceil_dp, formatting::format_percentage},
-	APIError, Address, ApiErrorType, GetQuoteRequest, InteropAddress, Order, OrderInput,
-	OrderOutput, StorageKey, SwapType, Transaction, ValidatedQuoteContext,
+	APIError, Address, ApiErrorType, GetQuoteRequest, InteropAddress, NetworkKind, Order,
+	OrderInput, OrderOutput, StorageKey, SwapType, Transaction, ValidatedQuoteContext,
 };
 use std::primitive::str;
 use std::{str::FromStr, sync::Arc};
@@ -1495,10 +1495,13 @@ impl CostProfitService {
 			let chain_id = input.asset.ethereum_chain_id().map_err(|e| {
 				CostProfitError::Calculation(format!("Failed to get input chain ID: {e}"))
 			})?;
-			let ethereum_addr = input.asset.ethereum_address().map_err(|e| {
-				CostProfitError::Calculation(format!("Failed to get input token address: {e}"))
-			})?;
-			let token_address = Address(ethereum_addr.0.to_vec());
+			let network_kind = config
+				.networks
+				.get(&chain_id)
+				.map(|network| network.kind)
+				.unwrap_or_default();
+			let token_address =
+				Self::token_address_for_network(&input.asset, network_kind, "input token")?;
 			self.token_manager
 				.get_token_info(chain_id, &token_address)
 				.await?;
@@ -1508,10 +1511,13 @@ impl CostProfitService {
 			let chain_id = output.asset.ethereum_chain_id().map_err(|e| {
 				CostProfitError::Calculation(format!("Failed to get output chain ID: {e}"))
 			})?;
-			let ethereum_addr = output.asset.ethereum_address().map_err(|e| {
-				CostProfitError::Calculation(format!("Failed to get output token address: {e}"))
-			})?;
-			let token_address = Address(ethereum_addr.0.to_vec());
+			let network_kind = config
+				.networks
+				.get(&chain_id)
+				.map(|network| network.kind)
+				.unwrap_or_default();
+			let token_address =
+				Self::token_address_for_network(&output.asset, network_kind, "output token")?;
 			self.token_manager
 				.get_token_info(chain_id, &token_address)
 				.await?;
@@ -1520,6 +1526,30 @@ impl CostProfitService {
 		}
 
 		Self::validate_callback_policy_before_simulation(&requested_outputs, config)
+	}
+
+	fn token_address_for_network(
+		asset: &InteropAddress,
+		network_kind: NetworkKind,
+		field: &str,
+	) -> Result<Address, CostProfitError> {
+		match network_kind {
+			NetworkKind::Evm => {
+				let ethereum_addr = asset.ethereum_address().map_err(|e| {
+					CostProfitError::Calculation(format!("Failed to get {field} address: {e}"))
+				})?;
+				Ok(Address(ethereum_addr.0.to_vec()))
+			},
+			NetworkKind::Starknet => {
+				if asset.address.len() != InteropAddress::BYTES32_ADDRESS_LENGTH as usize {
+					return Err(CostProfitError::Calculation(format!(
+						"Failed to get {field} address: invalid Starknet address length: expected 32, got {}",
+						asset.address.len()
+					)));
+				}
+				Ok(Address(asset.address.clone()))
+			},
+		}
 	}
 
 	fn validate_callback_calldata(calldata: Option<&str>) -> Result<(), CostProfitError> {
@@ -3400,6 +3430,46 @@ mod tests {
 	// Test price constants for consistent mock pricing across test functions
 	const ETH_USD_PRICE: f64 = 4000.0;
 	const USDC_USD_PRICE: f64 = 1.0;
+
+	#[test]
+	fn token_address_for_network_accepts_starknet_bytes32_asset() {
+		let token = vec![0x12; Address::BYTES32_LENGTH];
+		let asset = InteropAddress::from((358974494, Address(token.clone())));
+
+		let address = CostProfitService::token_address_for_network(
+			&asset,
+			NetworkKind::Starknet,
+			"input token",
+		)
+		.expect("Starknet bytes32 token should be accepted");
+
+		assert_eq!(address.0, token);
+	}
+
+	#[test]
+	fn token_address_for_network_rejects_starknet_evm_sized_asset() {
+		let asset = InteropAddress::from((358974494, Address(vec![0x12; Address::EVM_LENGTH])));
+
+		let error = CostProfitService::token_address_for_network(
+			&asset,
+			NetworkKind::Starknet,
+			"input token",
+		)
+		.expect_err("EVM-sized Starknet token should be rejected");
+
+		assert!(format!("{error}").contains("invalid Starknet address length"));
+	}
+
+	#[test]
+	fn token_address_for_network_keeps_evm_address_validation_strict() {
+		let asset = InteropAddress::from((1, Address(vec![0x12; Address::BYTES32_LENGTH])));
+
+		let error =
+			CostProfitService::token_address_for_network(&asset, NetworkKind::Evm, "input token")
+				.expect_err("EVM token should still require a 20-byte address");
+
+		assert!(format!("{error}").contains("expected 20, got 32"));
+	}
 
 	#[test]
 	fn test_validate_callback_calldata_rejects_over_shared_limit() {
