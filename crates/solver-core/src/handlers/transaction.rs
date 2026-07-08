@@ -54,20 +54,10 @@ fn stage_hash(order: &Order, tx_type: TransactionType) -> Option<&TransactionHas
 fn set_stage_hash(order: &mut Order, tx_type: TransactionType, tx_hash: TransactionHash) {
 	match tx_type {
 		TransactionType::Prepare => order.prepare_tx_hash = Some(tx_hash),
-		TransactionType::Fill => {
-			order.fill_tx_hash = Some(tx_hash.clone());
-			if !order.fill_tx_hashes.contains(&tx_hash) {
-				order.fill_tx_hashes.push(tx_hash);
-			}
-		},
+		TransactionType::Fill => order.set_fill_transaction_hash(tx_hash),
 		TransactionType::PostFill => order.post_fill_tx_hash = Some(tx_hash),
 		TransactionType::PreClaim => order.pre_claim_tx_hash = Some(tx_hash),
-		TransactionType::Claim => {
-			order.claim_tx_hash = Some(tx_hash.clone());
-			if !order.claim_tx_hashes.contains(&tx_hash) {
-				order.claim_tx_hashes.push(tx_hash);
-			}
-		},
+		TransactionType::Claim => order.set_claim_transaction_hash(tx_hash),
 		TransactionType::Approval
 		| TransactionType::Withdrawal
 		| TransactionType::Bridge
@@ -1110,7 +1100,8 @@ mod tests {
 
 		let updated_order = state_machine.get_order(&order.id).await.unwrap();
 		assert_eq!(updated_order.status, OrderStatus::Executed);
-		assert_eq!(updated_order.fill_tx_hash, Some(child_hash));
+		assert_eq!(updated_order.fill_tx_hash, Some(child_hash.clone()));
+		assert_eq!(updated_order.fill_tx_hashes, vec![child_hash]);
 		let events = drain_events(&mut receiver);
 		assert_eq!(
 			events
@@ -1197,6 +1188,7 @@ mod tests {
 		// resolves the stage to a tx whose receipt actually exists.
 		let updated_order = state_machine.get_order(&order.id).await.unwrap();
 		assert_eq!(updated_order.fill_tx_hash, Some(observed_hash.clone()));
+		assert_eq!(updated_order.fill_tx_hashes, vec![observed_hash.clone()]);
 		let events = drain_events(&mut receiver);
 		assert_eq!(
 			events
@@ -1629,6 +1621,7 @@ mod tests {
 				priority_fee: Some(U256::from(1_000_000_000u64)),
 			}))
 			.with_fill_tx_hashes(vec![first_hash.clone(), second_hash.clone()])
+			.with_expected_fill_tx_count(Some(2))
 			.build();
 
 		let (handler, mut receiver, state_machine) =

@@ -388,10 +388,10 @@ impl OrderStateMachine {
 	) -> Result<Order, OrderStateError> {
 		self.update_order_with(order_id, |order| match tx_type {
 			TransactionType::Prepare => order.prepare_tx_hash = Some(tx_hash.clone()),
-			TransactionType::Fill => order.add_fill_transaction_hash(tx_hash.clone()),
+			TransactionType::Fill => order.set_fill_transaction_hash(tx_hash.clone()),
 			TransactionType::PostFill => order.post_fill_tx_hash = Some(tx_hash.clone()),
 			TransactionType::PreClaim => order.pre_claim_tx_hash = Some(tx_hash.clone()),
-			TransactionType::Claim => order.add_claim_transaction_hash(tx_hash.clone()),
+			TransactionType::Claim => order.set_claim_transaction_hash(tx_hash.clone()),
 			TransactionType::Approval
 			| TransactionType::Withdrawal
 			| TransactionType::Bridge
@@ -1094,10 +1094,39 @@ mod tests {
 			)
 			.await
 			.unwrap();
-		assert_eq!(updated.fill_tx_hash, Some(tx_hash));
+		assert_eq!(updated.fill_tx_hash, Some(second_fill_hash.clone()));
+		assert_eq!(updated.fill_tx_hashes, vec![second_fill_hash]);
+
+		let mut multi_fill_order = create_test_order();
+		multi_fill_order.id = "test_order_multi_fill".to_string();
+		multi_fill_order.expected_fill_tx_count = Some(2);
+		state_machine.store_order(&multi_fill_order).await.unwrap();
+
+		let first_multi_fill_hash = solver_types::TransactionHash("0xmulti1".as_bytes().to_vec());
+		let updated = state_machine
+			.set_transaction_hash(
+				"test_order_multi_fill",
+				first_multi_fill_hash.clone(),
+				TransactionType::Fill,
+			)
+			.await
+			.unwrap();
+		assert_eq!(updated.fill_tx_hash, Some(first_multi_fill_hash.clone()));
+		assert_eq!(updated.fill_tx_hashes, vec![first_multi_fill_hash.clone()]);
+
+		let second_multi_fill_hash = solver_types::TransactionHash("0xmulti2".as_bytes().to_vec());
+		let updated = state_machine
+			.set_transaction_hash(
+				"test_order_multi_fill",
+				second_multi_fill_hash.clone(),
+				TransactionType::Fill,
+			)
+			.await
+			.unwrap();
+		assert_eq!(updated.fill_tx_hash, Some(first_multi_fill_hash.clone()));
 		assert_eq!(
 			updated.fill_tx_hashes,
-			vec![updated.fill_tx_hash.clone().unwrap(), second_fill_hash]
+			vec![first_multi_fill_hash, second_multi_fill_hash]
 		);
 	}
 
