@@ -39,4 +39,4 @@ tracing = "0.1"
 [dev-dependencies]
 alloy-json-rpc = "1.0.37"
 proptest = "1"
-wiremock = "0.5"
+wiremock = "0.6"

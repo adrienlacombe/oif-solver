@@ -53,4 +53,4 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 tempfile = "3"
 tokio-test = "0.4"
-wiremock = "0.5"
+wiremock = "0.6"
