@@ -299,20 +299,10 @@ enum StageResolution {
 fn set_order_stage_hash(order: &mut Order, tx_type: TransactionType, tx_hash: TransactionHash) {
 	match tx_type {
 		TransactionType::Prepare => order.prepare_tx_hash = Some(tx_hash),
-		TransactionType::Fill => {
-			order.fill_tx_hash = Some(tx_hash.clone());
-			if !order.fill_tx_hashes.contains(&tx_hash) {
-				order.fill_tx_hashes.push(tx_hash);
-			}
-		},
+		TransactionType::Fill => order.set_fill_transaction_hash(tx_hash),
 		TransactionType::PostFill => order.post_fill_tx_hash = Some(tx_hash),
 		TransactionType::PreClaim => order.pre_claim_tx_hash = Some(tx_hash),
-		TransactionType::Claim => {
-			order.claim_tx_hash = Some(tx_hash.clone());
-			if !order.claim_tx_hashes.contains(&tx_hash) {
-				order.claim_tx_hashes.push(tx_hash);
-			}
-		},
+		TransactionType::Claim => order.set_claim_transaction_hash(tx_hash),
 		TransactionType::Approval
 		| TransactionType::Withdrawal
 		| TransactionType::Bridge

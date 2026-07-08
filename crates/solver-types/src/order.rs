@@ -303,6 +303,22 @@ impl Order {
 		}
 	}
 
+	/// Sets the canonical fill transaction hash for scalar fills.
+	///
+	/// Same-nonce replacements produce several attempted hashes for one scalar
+	/// fill. Only the confirmed replacement should remain in order state; true
+	/// multi-leg fills are identified by an explicit expected count and keep the
+	/// plural list.
+	pub fn set_fill_transaction_hash(&mut self, tx_hash: TransactionHash) {
+		if matches!(self.expected_fill_tx_count, Some(count) if count > 1) {
+			self.add_fill_transaction_hash(tx_hash);
+			return;
+		}
+
+		self.fill_tx_hash = Some(tx_hash.clone());
+		self.fill_tx_hashes = vec![tx_hash];
+	}
+
 	/// Returns every known claim transaction hash, falling back to the legacy
 	/// single hash for orders stored before `claim_tx_hashes` existed.
 	pub fn claim_transaction_hashes(&self) -> Vec<TransactionHash> {
@@ -328,6 +344,22 @@ impl Order {
 		if !self.claim_tx_hashes.contains(&tx_hash) {
 			self.claim_tx_hashes.push(tx_hash);
 		}
+	}
+
+	/// Sets the canonical claim transaction hash for scalar claims.
+	///
+	/// Same-nonce replacements produce several attempted hashes for one scalar
+	/// claim. Only the confirmed replacement should remain in order state; true
+	/// multi-leg claims are identified by an explicit expected count and keep the
+	/// plural list.
+	pub fn set_claim_transaction_hash(&mut self, tx_hash: TransactionHash) {
+		if matches!(self.expected_claim_tx_count, Some(count) if count > 1) {
+			self.add_claim_transaction_hash(tx_hash);
+			return;
+		}
+
+		self.claim_tx_hash = Some(tx_hash.clone());
+		self.claim_tx_hashes = vec![tx_hash];
 	}
 
 	/// Parse the order data based on its standard
