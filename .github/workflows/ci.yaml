@@ -31,6 +31,9 @@ jobs:
     if: ${{ github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
     name: Test changed-files
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       changed-rust-files: ${{ steps.changed-files-yaml.outputs.code_any_changed }}
       changed-lockfile-files: ${{ steps.changed-files-yaml.outputs.lockfile_any_changed }}
@@ -90,6 +93,8 @@ jobs:
   msrv:
     if: ${{ github.event.pull_request.draft == false && github.event_name != 'push' && (needs.changed_files.outputs.changed-rust-files == 'true' || needs.changed_files.outputs.changed-lockfile-files == 'true') }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     needs: changed_files
     steps:
       # Checkout the repository
@@ -116,6 +121,8 @@ jobs:
     if: ${{ github.event.pull_request.draft == false && github.event_name != 'push' && needs.changed_files.outputs.changed-rust-files == 'true' }}
     needs: changed_files
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       # Checkout the repository
       - name: Harden the runner (Audit all outbound calls)
@@ -139,6 +146,8 @@ jobs:
     if: ${{ github.event.pull_request.draft == false && github.event_name != 'push' && needs.changed_files.outputs.changed-rust-files == 'true' }}
     needs: changed_files
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       # Checkout the repository
       - name: Harden the runner (Audit all outbound calls)

@@ -27,7 +27,7 @@ async fn compact_order_with_unauthorized_allocator_data_is_rejected_at_intake() 
 	let token_id = h.compact_deposit_user_token_a(amount_in).await?;
 	let amount_out = amount_with_decimals(990);
 
-	let order = compact_order(&h, token_id, amount_in, amount_out, 1);
+	let order = compact_order(&h, token_id, amount_in, amount_out, next_order_nonce());
 	let request = build_compact_request(&h, &order, lock_tag, b"garbage allocator data").await?;
 
 	let client = reqwest::Client::builder()
@@ -71,7 +71,7 @@ async fn compact_order_with_short_reset_period_is_rejected_at_intake() -> anyhow
 		.compact_deposit_user_token_a_with_reset_period(amount_in, CompactResetPeriod::OneSecond)
 		.await?;
 	let amount_out = amount_with_decimals(990);
-	let order = compact_order(&h, token_id, amount_in, amount_out, 2);
+	let order = compact_order(&h, token_id, amount_in, amount_out, next_order_nonce());
 	let request = build_compact_request(&h, &order, lock_tag, &[]).await?;
 
 	let recipient_balance_before = h
@@ -131,6 +131,10 @@ fn compact_order(
 			context: Default::default(),
 		}],
 	}
+}
+
+fn next_order_nonce() -> u64 {
+	uuid::Uuid::new_v4().as_u128() as u64
 }
 
 async fn build_compact_request(

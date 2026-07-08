@@ -320,6 +320,10 @@ impl std::fmt::Debug for NonceStore {
 mod tests {
 	use super::*;
 
+	fn next_test_nonce() -> u64 {
+		uuid::Uuid::new_v4().as_u128() as u64
+	}
+
 	#[test]
 	fn test_new_valid() {
 		let store = create_nonce_store(StoreConfig::Memory, "test-solver", 300);
@@ -339,8 +343,9 @@ mod tests {
 	#[test]
 	fn test_nonce_key_format() {
 		let store = create_nonce_store(StoreConfig::Memory, "my-solver", 300).unwrap();
-		let key = store.nonce_key(12345);
-		assert_eq!(key, "my-solver:admin:nonce:12345");
+		let nonce = next_test_nonce();
+		let key = store.nonce_key(nonce);
+		assert_eq!(key, format!("my-solver:admin:nonce:{nonce}"));
 	}
 
 	#[test]
@@ -348,8 +353,9 @@ mod tests {
 		let store =
 			create_nonce_store_with_namespace(StoreConfig::Memory, "my-solver", "siwe", 300)
 				.unwrap();
-		let key = store.nonce_key(12345);
-		assert_eq!(key, "my-solver:siwe:nonce:12345");
+		let nonce = next_test_nonce();
+		let key = store.nonce_key(nonce);
+		assert_eq!(key, format!("my-solver:siwe:nonce:{nonce}"));
 	}
 
 	#[test]
@@ -428,8 +434,13 @@ mod tests {
 	async fn test_invalid_nonce() {
 		let store = create_nonce_store(StoreConfig::Memory, "test-solver", 300).unwrap();
 
-		// Random nonce that was never generated
-		let result = store.consume(12345).await;
+		let missing_nonce = loop {
+			let candidate = next_test_nonce();
+			if !store.exists(candidate).await.unwrap() {
+				break candidate;
+			}
+		};
+		let result = store.consume(missing_nonce).await;
 		assert!(matches!(result, Err(NonceError::NotFound)));
 	}
 
@@ -541,8 +552,9 @@ mod tests {
 		)
 		.expect("expected redis nonce store to initialize lazily");
 
-		let key = store.nonce_key(42);
-		assert_eq!(key, "test-solver:siwe:nonce:42");
+		let nonce = next_test_nonce();
+		let key = store.nonce_key(nonce);
+		assert_eq!(key, format!("test-solver:siwe:nonce:{nonce}"));
 	}
 
 	#[test]

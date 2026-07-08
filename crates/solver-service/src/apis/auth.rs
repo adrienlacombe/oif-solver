@@ -916,6 +916,10 @@ mod tests {
 		PrivateKeySigner::from_bytes(&B256::from([0x42u8; 32])).expect("valid test private key")
 	}
 
+	fn next_test_nonce() -> u64 {
+		uuid::Uuid::new_v4().as_u128() as u64
+	}
+
 	fn create_test_siwe_state(
 		jwt_service: Option<Arc<JwtService>>,
 		admin_enabled: bool,
@@ -2015,8 +2019,8 @@ mod tests {
 		let signer = create_test_siwe_signer();
 		let nonce_store =
 			Arc::new(create_nonce_store(StoreConfig::Memory, "test-solver", 300).unwrap());
-		let bad_nonce = "abc12345";
-		let message = super::build_siwe_message("localhost", signer.address(), 1, bad_nonce, 300);
+		let bad_nonce = format!("bad{}", next_test_nonce());
+		let message = super::build_siwe_message("localhost", signer.address(), 1, &bad_nonce, 300);
 		let signature = signer.sign_message_sync(message.as_bytes()).unwrap();
 		let request = SiweVerifyRequest {
 			message,
@@ -2044,7 +2048,13 @@ mod tests {
 		let signer = create_test_siwe_signer();
 		let nonce_store =
 			Arc::new(create_nonce_store(StoreConfig::Memory, "test-solver", 300).unwrap());
-		let nonce = super::format_siwe_nonce(999_999_999);
+		let missing_nonce_id = loop {
+			let candidate = next_test_nonce();
+			if !nonce_store.exists(candidate).await.unwrap() {
+				break candidate;
+			}
+		};
+		let nonce = super::format_siwe_nonce(missing_nonce_id);
 		let message = super::build_siwe_message("localhost", signer.address(), 1, &nonce, 300);
 		let signature = signer.sign_message_sync(message.as_bytes()).unwrap();
 		let request = SiweVerifyRequest {
@@ -2118,15 +2128,24 @@ mod tests {
 
 	#[test]
 	fn test_format_and_parse_siwe_nonce_roundtrip() {
-		let nonce = super::format_siwe_nonce(12345);
-		assert_eq!(nonce, "00000000000000012345");
-		assert_eq!(super::parse_siwe_nonce(&nonce).unwrap(), 12345);
+		let nonce_id = next_test_nonce();
+		let nonce = super::format_siwe_nonce(nonce_id);
+		assert!(nonce.len() >= 20);
+		assert!(nonce.chars().all(|c| c.is_ascii_digit()));
+		assert!(nonce.ends_with(&nonce_id.to_string()));
+		assert_eq!(super::parse_siwe_nonce(&nonce).unwrap(), nonce_id);
 	}
 
 	#[test]
 	fn test_parse_siwe_nonce_rejects_short_or_non_numeric() {
-		assert!(super::parse_siwe_nonce("1234567").is_err());
-		assert!(super::parse_siwe_nonce("abc12345").is_err());
+		let short_nonce = next_test_nonce()
+			.to_string()
+			.chars()
+			.take(7)
+			.collect::<String>();
+		let non_numeric_nonce = format!("x{}", next_test_nonce());
+		assert!(super::parse_siwe_nonce(&short_nonce).is_err());
+		assert!(super::parse_siwe_nonce(&non_numeric_nonce).is_err());
 	}
 
 	#[test]
@@ -2134,17 +2153,12 @@ mod tests {
 		let address = "0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B"
 			.parse::<alloy_primitives::Address>()
 			.unwrap();
-		let message = super::build_siwe_message(
-			"solver.example.com",
-			address,
-			1,
-			"00000000000000012345",
-			300,
-		);
+		let nonce = super::format_siwe_nonce(next_test_nonce());
+		let message = super::build_siwe_message("solver.example.com", address, 1, &nonce, 300);
 
 		assert!(message.contains("solver.example.com wants you to sign in"));
 		assert!(message.contains("Chain ID: 1"));
-		assert!(message.contains("Nonce: 00000000000000012345"));
+		assert!(message.contains(&format!("Nonce: {nonce}")));
 		assert!(message.contains("URI: https://solver.example.com"));
 	}
 
