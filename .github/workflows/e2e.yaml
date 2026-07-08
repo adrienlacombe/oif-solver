@@ -43,10 +43,10 @@ jobs:
           egress-policy: audit
 
       - name: Checkout solver
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Checkout oif-contracts
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: openintentsframework/oif-contracts
           path: oif-contracts
@@ -80,7 +80,7 @@ jobs:
             forge-build-${{ runner.os }}-
 
       - name: Install Foundry (anvil + forge)
-        uses: foundry-rs/foundry-toolchain@de808b1eea699e761c404bda44ba8f21aba30b2c # v1.4.0
+        uses: foundry-rs/foundry-toolchain@b00af27efadbc7b4ca8b82abbd903b17cc874d2a # v1.9.0
         with:
           version: stable
 
@@ -96,7 +96,7 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@1.88.0
       - name: Cargo cache
-        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2.7.7
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           shared-key: e2e-suite
 
@@ -159,7 +159,7 @@ jobs:
           egress-policy: audit
 
       - name: Checkout solver
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Restore forge build output
         id: forge-cache
@@ -173,7 +173,7 @@ jobs:
       # anvil is needed at runtime; forge is only needed for the cache-miss
       # fallback below.
       - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@de808b1eea699e761c404bda44ba8f21aba30b2c # v1.4.0
+        uses: foundry-rs/foundry-toolchain@b00af27efadbc7b4ca8b82abbd903b17cc874d2a # v1.9.0
         with:
           version: stable
 
@@ -181,7 +181,7 @@ jobs:
       # rebuild oif-contracts in this shard instead of taking down the matrix.
       - name: Checkout oif-contracts (cache miss fallback)
         if: steps.forge-cache.outputs.cache-hit != 'true'
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: openintentsframework/oif-contracts
           path: oif-contracts
@@ -197,7 +197,7 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@1.88.0
       - name: Cargo cache
-        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2.7.7
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           shared-key: e2e-suite
 
