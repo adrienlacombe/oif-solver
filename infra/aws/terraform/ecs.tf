@@ -49,6 +49,7 @@ resource "aws_ecs_task_definition" "solver" {
           awslogs-group         = aws_cloudwatch_log_group.solver.name
           awslogs-region        = var.aws_region
           awslogs-stream-prefix = "solver"
+          mode                  = "blocking"
         }
       }
     }
@@ -88,6 +89,7 @@ resource "aws_ecs_task_definition" "seed" {
           awslogs-group         = aws_cloudwatch_log_group.solver.name
           awslogs-region        = var.aws_region
           awslogs-stream-prefix = "seed"
+          mode                  = "blocking"
         }
       }
     }

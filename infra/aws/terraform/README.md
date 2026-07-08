@@ -7,7 +7,7 @@ This Terraform root provisions the AWS runtime for the `solver` binary:
 - Public or internal ALB with `/health` checks
 - ECS Fargate cluster, long-running service task definition, and one-off seed task definition
 - MemoryDB for Redis in cluster mode
-- CloudWatch logs
+- CloudWatch logs, alarms, and dashboard
 - IAM roles for ECS execution, optional Secrets Manager decrypt, and optional KMS signing
 - Secrets Manager wiring for `REDIS_URL`, `BOOTSTRAP_CONFIG`, `JWT_SECRET`, and `SOLVER_PRIVATE_KEY`
 
@@ -82,13 +82,17 @@ aws ecs run-task \
 After the seed task succeeds, scale the service:
 
 ```hcl
-service_desired_count = 1
+service_desired_count = 2
 ```
 
 ```bash
 terraform apply
 curl "$(terraform output -raw alb_url)/health"
 ```
+
+Production deployments should keep `service_desired_count >= 2` for availability during
+rolling deployments. Alarms and the dashboard are enabled by default; set
+`alarm_actions` and `ok_actions` to SNS topic ARNs when paging or notifications are ready.
 
 ## Existing VPC
 

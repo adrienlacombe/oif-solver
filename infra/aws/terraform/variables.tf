@@ -210,6 +210,17 @@ variable "health_check_grace_period_seconds" {
   default     = 120
 }
 
+variable "target_group_deregistration_delay_seconds" {
+  description = "ALB target group deregistration delay in seconds."
+  type        = number
+  default     = 60
+
+  validation {
+    condition     = var.target_group_deregistration_delay_seconds >= 0 && var.target_group_deregistration_delay_seconds <= 3600
+    error_message = "target_group_deregistration_delay_seconds must be between 0 and 3600."
+  }
+}
+
 variable "memorydb_node_type" {
   description = "MemoryDB node type."
   type        = string
@@ -334,4 +345,58 @@ variable "log_retention_days" {
   description = "CloudWatch log retention for solver task logs."
   type        = number
   default     = 30
+}
+
+variable "enable_cloudwatch_alarms" {
+  description = "Create CloudWatch alarms for the ECS service and ALB."
+  type        = bool
+  default     = true
+}
+
+variable "enable_cloudwatch_dashboard" {
+  description = "Create a CloudWatch dashboard for the solver service."
+  type        = bool
+  default     = true
+}
+
+variable "alarm_actions" {
+  description = "SNS topic ARNs or other alarm action ARNs for CloudWatch alarm transitions."
+  type        = list(string)
+  default     = []
+}
+
+variable "ok_actions" {
+  description = "SNS topic ARNs or other action ARNs for CloudWatch OK transitions."
+  type        = list(string)
+  default     = []
+}
+
+variable "alb_5xx_alarm_threshold" {
+  description = "ALB 5xx count per minute that triggers an alarm."
+  type        = number
+  default     = 0
+}
+
+variable "target_5xx_alarm_threshold" {
+  description = "Target 5xx count per minute that triggers an alarm."
+  type        = number
+  default     = 0
+}
+
+variable "target_response_time_p99_alarm_threshold_seconds" {
+  description = "Target response time p99 threshold in seconds."
+  type        = number
+  default     = 5
+}
+
+variable "ecs_cpu_alarm_threshold_percent" {
+  description = "Average ECS service CPU utilization percentage that triggers an alarm."
+  type        = number
+  default     = 80
+}
+
+variable "ecs_memory_alarm_threshold_percent" {
+  description = "Average ECS service memory utilization percentage that triggers an alarm."
+  type        = number
+  default     = 80
 }

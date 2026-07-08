@@ -87,3 +87,8 @@ output "execution_role_arn" {
   description = "IAM role ARN used by ECS to pull images, write logs, and fetch secrets."
   value       = aws_iam_role.execution.arn
 }
+
+output "cloudwatch_dashboard_name" {
+  description = "CloudWatch dashboard name for the solver service."
+  value       = try(aws_cloudwatch_dashboard.solver[0].dashboard_name, null)
+}

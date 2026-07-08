@@ -8,11 +8,12 @@ resource "aws_lb" "solver" {
 }
 
 resource "aws_lb_target_group" "solver" {
-  name        = local.name
-  port        = var.container_port
-  protocol    = "HTTP"
-  target_type = "ip"
-  vpc_id      = local.vpc_id
+  name                 = local.name
+  port                 = var.container_port
+  protocol             = "HTTP"
+  target_type          = "ip"
+  vpc_id               = local.vpc_id
+  deregistration_delay = var.target_group_deregistration_delay_seconds
 
   health_check {
     enabled             = true

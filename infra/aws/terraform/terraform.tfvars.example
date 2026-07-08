@@ -6,7 +6,7 @@ environment = "dev"
 solver_id = "oif-solver-dev"
 
 # First apply: keep at 0, push the image, fill secrets, run the seed task.
-# Second apply: set to 1 or more.
+# Second apply: set to 2 or more for production availability.
 service_desired_count = 0
 
 # Build and push this tag into the ECR repository created by Terraform.
@@ -26,6 +26,10 @@ create_solver_private_key_secret = false
 
 # Use HTTPS if you already have an ACM cert in this region.
 acm_certificate_arn = null
+
+# Optional SNS action ARNs for CloudWatch alarms.
+alarm_actions = []
+ok_actions    = []
 
 tags = {
   Owner = "solver-team"
