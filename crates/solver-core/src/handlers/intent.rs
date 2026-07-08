@@ -843,7 +843,9 @@ mod tests {
 	use solver_types::utils::tests::builders::{
 		Eip7683OrderDataBuilder, IntentBuilder, MandateOutputBuilder, OrderBuilder,
 	};
-	use solver_types::{Address, DiscoveryEvent, ExecutionParams, Intent, Order, SolverEvent};
+	use solver_types::{
+		Address, DiscoveryEvent, ExecutionParams, Intent, Order, OrderStatus, SolverEvent,
+	};
 	use std::collections::HashMap;
 	use std::sync::Arc;
 	use std::time::Duration;
@@ -2059,11 +2061,14 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_handle_intent_execute_stores_order_with_execution_params_attached() {
+	async fn test_handle_intent_execute_stores_order_with_execution_params_and_status_attached() {
 		// When should_execute returns Execute(params), the order MUST be persisted
 		// with execution_params already attached. Otherwise a crash between
 		// store_order and the prepare handler's params write strands the order on
 		// recovery (NeedsExecution + missing params, no resumption path).
+		// Orders that already exist on-chain skip prepare, so they must also be
+		// persisted as Executing before the fill confirmation can advance them to
+		// Executed.
 		let mut mock_storage = MockStorageInterface::new();
 		let mut mock_order_interface = MockOrderInterface::new();
 		let mut mock_strategy = MockExecutionStrategy::new();
@@ -2094,7 +2099,7 @@ mod tests {
 				}
 				matches!(
 					serde_json::from_slice::<Order>(bytes),
-					Ok(o) if o.execution_params.is_some()
+					Ok(o) if o.execution_params.is_some() && o.status == OrderStatus::Executing
 				)
 			})
 			.times(1)
