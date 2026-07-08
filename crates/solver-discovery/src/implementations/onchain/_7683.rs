@@ -223,6 +223,7 @@ const STARKNET_U128_MAX: U256 = U256::from_limbs([u64::MAX, u64::MAX, 0, 0]);
 const STARKNET_ORIGIN_DATA_STATIC_SIZE: usize = 384;
 const STARKNET_ORIGIN_DATA_U128_WORDS: usize = 24;
 const HYPERLANE7683_EVM_ORIGIN_DATA_SIZE: usize = 448;
+const HYPERLANE7683_EVM_ORIGIN_DATA_U128_WORDS: usize = 28;
 const STARKNET_EVENTS_PAGE_SIZE: u64 = 128;
 
 struct StarknetOpenFeltDecoder {
@@ -399,16 +400,21 @@ impl StarknetOpenFeltDecoder {
 			));
 		}
 
-		if size != U256::from(STARKNET_ORIGIN_DATA_STATIC_SIZE) {
-			return Err(DiscoveryError::ParseError(format!(
-				"malformed Starknet Open event: origin_data size at felt index {size_index} must be {STARKNET_ORIGIN_DATA_STATIC_SIZE} bytes"
-			)));
-		}
+		let size = size.to::<usize>();
+		let expected_u128_words = match size {
+			STARKNET_ORIGIN_DATA_STATIC_SIZE => STARKNET_ORIGIN_DATA_U128_WORDS,
+			HYPERLANE7683_EVM_ORIGIN_DATA_SIZE => HYPERLANE7683_EVM_ORIGIN_DATA_U128_WORDS,
+			_ => {
+				return Err(DiscoveryError::ParseError(format!(
+					"malformed Starknet Open event: origin_data size at felt index {size_index} must be {STARKNET_ORIGIN_DATA_STATIC_SIZE} or {HYPERLANE7683_EVM_ORIGIN_DATA_SIZE} bytes"
+				)));
+			},
+		};
 
 		let u128_words = u128_words.to::<usize>();
-		if u128_words != STARKNET_ORIGIN_DATA_U128_WORDS {
+		if u128_words != expected_u128_words {
 			return Err(DiscoveryError::ParseError(format!(
-				"malformed Starknet Open event: origin_data u128 array at felt index {words_index} must contain {STARKNET_ORIGIN_DATA_U128_WORDS} values, got {u128_words}"
+				"malformed Starknet Open event: origin_data u128 array at felt index {words_index} must contain {expected_u128_words} values, got {u128_words}"
 			)));
 		}
 
@@ -437,6 +443,14 @@ impl StarknetOpenFeltDecoder {
 			field[0..16].copy_from_slice(&low.to_be_bytes::<32>()[16..32]);
 			field[16..32].copy_from_slice(&high.to_be_bytes::<32>()[16..32]);
 			fields.push(field);
+		}
+
+		if size == HYPERLANE7683_EVM_ORIGIN_DATA_SIZE {
+			let mut evm_origin_data = Vec::with_capacity(HYPERLANE7683_EVM_ORIGIN_DATA_SIZE);
+			for field in fields {
+				evm_origin_data.extend_from_slice(&field);
+			}
+			return Ok(evm_origin_data);
 		}
 
 		if fields.len() < 12 {
@@ -2292,6 +2306,41 @@ mod tests {
 		data
 	}
 
+	fn starknet_hyperlane7683_event_data_with_evm_origin_data() -> Vec<String> {
+		let mut data = vec![
+			felt_hex(0xabc),         // user
+			felt_hex(700001),        // origin chain id
+			felt_hex(u64::MAX),      // open deadline
+			felt_hex(1_700_000_100), // fill deadline
+			felt_hex(0x44),          // order id low
+			felt_hex(0),             // order id high
+			felt_hex(1),             // max spent length
+			felt_hex(0x1111),        // max token
+			felt_hex(100),           // max amount low
+			felt_hex(0),             // max amount high
+			felt_hex(0x2222),        // max recipient
+			felt_hex(700001),        // max chain domain
+			felt_hex(1),             // min received length
+			felt_hex(0x3333),        // min token
+			felt_hex(200),           // min amount low
+			felt_hex(0),             // min amount high
+			felt_hex(0x4444),        // min recipient
+			felt_hex(700002),        // min chain domain
+			felt_hex(1),             // fill instructions length
+			felt_hex(700002),        // destination chain domain
+			felt_hex(0x5555),        // destination settler
+			felt_hex(HYPERLANE7683_EVM_ORIGIN_DATA_SIZE as u64),
+			felt_hex(HYPERLANE7683_EVM_ORIGIN_DATA_U128_WORDS as u64),
+		];
+
+		let mut fields = Vec::new();
+		for byte in 0u8..14 {
+			fields.push([byte; 32]);
+		}
+		data.extend(starknet_origin_data_words(&fields));
+		data
+	}
+
 	fn create_starknet_rpc_event(keys: Vec<String>, data: Vec<String>) -> StarknetRpcEvent {
 		StarknetRpcEvent {
 			from_address: Some(felt_hex(0x1234)),
@@ -2631,6 +2680,25 @@ mod tests {
 		assert_eq!(
 			&order.fill_instructions[0].origin_data[416..448],
 			&[0u8; 32]
+		);
+	}
+
+	#[test]
+	fn decode_starknet_hyperlane7683_open_event_accepts_evm_origin_data_shape() {
+		let data = starknet_hyperlane7683_event_data_with_evm_origin_data();
+
+		let order = decode_starknet_hyperlane7683_open_event(&data).unwrap();
+
+		assert_eq!(order.open_deadline, u32::MAX);
+		assert_eq!(order.fill_instructions.len(), 1);
+		assert_eq!(
+			order.fill_instructions[0].origin_data.len(),
+			HYPERLANE7683_EVM_ORIGIN_DATA_SIZE
+		);
+		assert_eq!(&order.fill_instructions[0].origin_data[32..64], &[1u8; 32]);
+		assert_eq!(
+			&order.fill_instructions[0].origin_data[416..448],
+			&[13u8; 32]
 		);
 	}
 
