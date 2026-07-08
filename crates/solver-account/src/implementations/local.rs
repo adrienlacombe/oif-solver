@@ -285,7 +285,8 @@ mod tests {
 				assert_eq!(expected_address, actual_address);
 			},
 			#[cfg(feature = "kms")]
-			_ => panic!("Expected Local signer"),
+			crate::AccountSigner::Kms(_) => panic!("Expected Local signer"),
+			crate::AccountSigner::StarknetLocal(_) => panic!("Expected Local signer"),
 		}
 	}
 }
