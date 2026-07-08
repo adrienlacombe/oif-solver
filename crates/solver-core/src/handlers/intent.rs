@@ -9,6 +9,7 @@ use crate::engine::{
 	event_bus::EventBus,
 	token_manager::TokenManager,
 };
+use crate::order_preparation::order_requires_preparation;
 use crate::state::OrderStateMachine;
 use lru::LruCache;
 use solver_config::{source_finality_expected_delay_seconds, Config};
@@ -650,13 +651,22 @@ impl IntentHandler {
 							self.release_compact_deposits(&order).await;
 							return Err(IntentError::Storage(e.to_string()));
 						}
-						self.event_bus
-							.publish(SolverEvent::Order(OrderEvent::Preparing {
-								intent: intent.clone(),
-								order,
-								params,
-							}))
-							.ok();
+						if order_requires_preparation(&order) {
+							self.event_bus
+								.publish(SolverEvent::Order(OrderEvent::Preparing {
+									intent: intent.clone(),
+									order,
+									params,
+								}))
+								.ok();
+						} else {
+							self.event_bus
+								.publish(SolverEvent::Order(OrderEvent::Executing {
+									order,
+									params,
+								}))
+								.ok();
+						}
 					},
 					ExecutionDecision::Skip(reason) => {
 						// The order will never be stored, so its reservation would
@@ -855,6 +865,19 @@ mod tests {
 
 	fn create_test_order() -> Order {
 		let order_data = Eip7683OrderDataBuilder::new().build();
+		OrderBuilder::new()
+			.with_id("test_intent_123".to_string())
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.build()
+	}
+
+	fn create_test_order_requiring_prepare() -> Order {
+		let order_data = Eip7683OrderDataBuilder::new()
+			.lock_type(LockType::Permit2Escrow)
+			.raw_order_data("0x1234")
+			.sponsor("0x1111111111111111111111111111111111111111")
+			.signature("0xabcdef")
+			.build();
 		OrderBuilder::new()
 			.with_id("test_intent_123".to_string())
 			.with_data(serde_json::to_value(&order_data).unwrap())
@@ -2953,7 +2976,8 @@ mod tests {
 		let result = handler.handle(intent.clone()).await;
 		assert!(result.is_ok());
 
-		// Should receive IntentValidated and Preparing events
+		// Should receive IntentValidated and Executing events for orders that
+		// were already opened on-chain and do not need a prepare transaction.
 		let event1 = receiver.recv().await.unwrap();
 		match event1 {
 			SolverEvent::Discovery(solver_types::DiscoveryEvent::IntentValidated {
@@ -2967,9 +2991,92 @@ mod tests {
 
 		let event2 = receiver.recv().await.unwrap();
 		match event2 {
-			SolverEvent::Order(solver_types::OrderEvent::Preparing { .. }) => {
+			SolverEvent::Order(solver_types::OrderEvent::Executing { .. }) => {
 				// Success
 			},
+			_ => panic!("Expected Executing event"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_event_publishing_uses_preparing_for_orders_requiring_prepare() {
+		let mut mock_storage = MockStorageInterface::new();
+		let mut mock_order_interface = MockOrderInterface::new();
+		let mut mock_strategy = MockExecutionStrategy::new();
+
+		let intent = create_test_intent();
+		let solver_address = create_test_address();
+
+		mock_storage
+			.expect_exists()
+			.returning(|_| Box::pin(async move { Ok(false) }));
+		mock_storage
+			.expect_set_bytes()
+			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+		mock_order_interface
+			.expect_validate_and_create_order()
+			.times(1)
+			.returning(move |_, _, _, _, _, _| {
+				Box::pin(async move { Ok(create_test_order_requiring_prepare()) })
+			});
+		mock_order_interface
+			.expect_generate_fill_execution_transactions()
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async move { Ok(vec![create_test_fill_execution_transaction()]) })
+			});
+
+		mock_strategy.expect_should_execute().returning(|_, _| {
+			Box::pin(async move {
+				ExecutionDecision::Execute(ExecutionParams {
+					gas_price: U256::from(20000000000u64),
+					priority_fee: Some(U256::from(1000u64)),
+				})
+			})
+		});
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let order_service = Arc::new(OrderService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_order_interface) as Box<dyn solver_order::OrderInterface>,
+			)]),
+			Box::new(mock_strategy),
+		));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
+		let token_manager = Arc::new(TokenManager::new(
+			Default::default(),
+			delivery.clone(),
+			Arc::new(solver_account::AccountService::new(Box::new(
+				MockAccountInterface::new(),
+			))),
+		));
+		let (config, static_config) = create_test_config();
+		let mut receiver = event_bus.subscribe();
+		let cost_profit_service = create_mock_cost_profit_service();
+
+		let handler = IntentHandler::new(
+			order_service,
+			storage,
+			state_machine,
+			event_bus,
+			delivery,
+			solver_address,
+			token_manager,
+			cost_profit_service,
+			config,
+			&static_config,
+		);
+
+		let result = handler.handle(intent).await;
+		assert!(result.is_ok());
+
+		let _validated = receiver.recv().await.unwrap();
+		let event = receiver.recv().await.unwrap();
+		match event {
+			SolverEvent::Order(solver_types::OrderEvent::Preparing { .. }) => {},
 			_ => panic!("Expected Preparing event"),
 		}
 	}
