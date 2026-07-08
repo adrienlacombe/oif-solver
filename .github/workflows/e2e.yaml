@@ -80,7 +80,7 @@ jobs:
             forge-build-${{ runner.os }}-
 
       - name: Install Foundry (anvil + forge)
-        uses: foundry-rs/foundry-toolchain@de808b1eea699e761c404bda44ba8f21aba30b2c # v1.4.0
+        uses: foundry-rs/foundry-toolchain@b00af27efadbc7b4ca8b82abbd903b17cc874d2a # v1.4.0
         with:
           version: stable
 
@@ -173,7 +173,7 @@ jobs:
       # anvil is needed at runtime; forge is only needed for the cache-miss
       # fallback below.
       - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@de808b1eea699e761c404bda44ba8f21aba30b2c # v1.4.0
+        uses: foundry-rs/foundry-toolchain@b00af27efadbc7b4ca8b82abbd903b17cc874d2a # v1.4.0
         with:
           version: stable
 
