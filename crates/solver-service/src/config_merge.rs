@@ -31,6 +31,7 @@ use solver_config::{
 	SolverIngressMode, StorageConfig, StrategyConfig,
 };
 use solver_types::seed_overrides::OracleSelectionStrategyOverride;
+use solver_types::standards::hyperlane7683::HYPERLANE7683_STANDARD;
 use solver_types::utils::{STARKNET_MAINNET_CHAIN_ID, STARKNET_SEPOLIA_CHAIN_ID};
 use solver_types::{
 	networks::{NetworkKind, NetworkType, RpcEndpoint},
@@ -1967,6 +1968,10 @@ fn build_order_config_from_operator() -> OrderConfig {
 	// EIP-7683 order implementation
 	implementations.insert(
 		"eip7683".to_string(),
+		serde_json::Value::Object(serde_json::Map::new()),
+	);
+	implementations.insert(
+		HYPERLANE7683_STANDARD.to_string(),
 		serde_json::Value::Object(serde_json::Map::new()),
 	);
 
@@ -8192,6 +8197,7 @@ mod tests {
 		let order = build_order_config_from_operator();
 
 		assert!(order.implementations.contains_key("eip7683"));
+		assert!(order.implementations.contains_key(HYPERLANE7683_STANDARD));
 		assert_eq!(order.strategy.primary, "simple");
 		assert!(order.strategy.implementations.contains_key("simple"));
 	}
