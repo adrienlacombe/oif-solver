@@ -280,11 +280,24 @@ impl StarknetOpenFeltDecoder {
 		Ok(value.to::<u64>())
 	}
 
-	fn read_deadline_u32(&mut self) -> Result<u32, DiscoveryError> {
+	fn read_deadline_u32(&mut self, field: &'static str) -> Result<u32, DiscoveryError> {
 		let value = self.read_u64()?;
 		if value > u32::MAX as u64 {
+			return Err(DiscoveryError::ParseError(format!(
+				"malformed Starknet Open event: {field} value out of u32 range"
+			)));
+		}
+		Ok(value as u32)
+	}
+
+	fn read_open_deadline_u32(&mut self) -> Result<u32, DiscoveryError> {
+		let value = self.read_u64()?;
+		if value == u64::MAX {
+			return Ok(u32::MAX);
+		}
+		if value > u32::MAX as u64 {
 			return Err(DiscoveryError::ParseError(
-				"malformed Starknet Open event: deadline value out of u32 range".to_string(),
+				"malformed Starknet Open event: open_deadline value out of u32 range".to_string(),
 			));
 		}
 		Ok(value as u32)
@@ -460,8 +473,8 @@ pub fn decode_starknet_hyperlane7683_open_event(
 	let mut decoder = StarknetOpenFeltDecoder::new(data)?;
 	let user = decoder.read_address()?;
 	let origin_chain_id = U256::from(decoder.read_u32()?);
-	let open_deadline = decoder.read_deadline_u32()?;
-	let fill_deadline = decoder.read_deadline_u32()?;
+	let open_deadline = decoder.read_open_deadline_u32()?;
+	let fill_deadline = decoder.read_deadline_u32("fill_deadline")?;
 	let order_id = decoder.read_u256()?.to_be_bytes::<32>();
 	let max_spent = decoder.read_outputs()?;
 	let min_received = decoder.read_outputs()?;
@@ -2553,6 +2566,37 @@ mod tests {
 		assert!(order.max_spent.is_empty());
 		assert!(order.min_received.is_empty());
 		assert!(order.fill_instructions.is_empty());
+	}
+
+	#[test]
+	fn decode_starknet_hyperlane7683_open_event_accepts_open_deadline_sentinel() {
+		let mut data = minimal_starknet_hyperlane7683_event_data();
+		data[2] = felt_hex(u64::MAX);
+
+		let order = decode_starknet_hyperlane7683_open_event(&data).unwrap();
+
+		assert_eq!(order.open_deadline, u32::MAX);
+		assert_eq!(order.fill_deadline, 1_700_000_100);
+	}
+
+	#[test]
+	fn decode_starknet_hyperlane7683_open_event_rejects_oversized_open_deadline() {
+		let mut data = minimal_starknet_hyperlane7683_event_data();
+		data[2] = felt_hex(u32::MAX as u64 + 1);
+
+		let error = decode_starknet_hyperlane7683_open_event(&data).unwrap_err();
+
+		assert!(matches!(error, DiscoveryError::ParseError(_)));
+	}
+
+	#[test]
+	fn decode_starknet_hyperlane7683_open_event_rejects_fill_deadline_sentinel() {
+		let mut data = minimal_starknet_hyperlane7683_event_data();
+		data[3] = felt_hex(u64::MAX);
+
+		let error = decode_starknet_hyperlane7683_open_event(&data).unwrap_err();
+
+		assert!(matches!(error, DiscoveryError::ParseError(_)));
 	}
 
 	#[test]
