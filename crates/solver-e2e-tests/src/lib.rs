@@ -1184,16 +1184,11 @@ impl Harness {
 		from_block: u64,
 	) -> Result<(Option<(E, Log)>, u64)> {
 		let provider = self.provider_for(chain_id)?;
-		let head = provider
-			.get_block_number()
-			.await
-			.context("get_block_number")?;
 		let filter = Filter::new()
 			.address(address)
 			.event_signature(E::SIGNATURE_HASH)
 			.topic1(order_id)
-			.from_block(from_block)
-			.to_block(BlockNumberOrTag::Number(head));
+			.from_block(from_block);
 
 		let logs = provider.get_logs(&filter).await.context("get_logs")?;
 		let event = if let Some(log) = logs.into_iter().next() {
@@ -1203,7 +1198,7 @@ impl Harness {
 			None
 		};
 
-		Ok((event, head.saturating_add(1)))
+		Ok((event, from_block))
 	}
 
 	fn provider_for(&self, chain_id: u64) -> Result<&DynProvider> {
