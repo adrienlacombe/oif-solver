@@ -7,10 +7,12 @@
 use axum::extract::{Extension, Path};
 use solver_core::SolverEngine;
 use solver_types::{
-	bytes32_to_address, standards::eip7930::InteropAddress, utils::conversion::parse_address,
-	with_0x_prefix, AssetAmount, FillTransactionInfo, FillTransactionStatus, GetOrderError,
-	GetOrderResponse, Order, OrderResponse, OrderStatus, Settlement, SettlementType, StorageKey,
-	TransactionType,
+	bytes32_to_address,
+	standards::{eip7930::InteropAddress, hyperlane7683::HYPERLANE7683_STANDARD},
+	utils::conversion::parse_address,
+	with_0x_prefix, Address, AssetAmount, FillTransactionInfo, FillTransactionStatus,
+	GetOrderError, GetOrderResponse, Order, OrderResponse, OrderStatus, Settlement, SettlementType,
+	StorageKey, TransactionType,
 };
 
 /// Handles GET /orders/{id} requests.
@@ -84,6 +86,7 @@ async fn convert_order_to_response(order: Order) -> Result<OrderResponse, GetOrd
 	// Handle different order standards
 	match order.standard.as_str() {
 		"eip7683" => convert_eip7683_order_to_response(order).await,
+		HYPERLANE7683_STANDARD => convert_hyperlane7683_order_to_response(order).await,
 		_ => {
 			// Handle unknown standards
 			Err(GetOrderError::Internal(format!(
@@ -92,6 +95,192 @@ async fn convert_order_to_response(order: Order) -> Result<OrderResponse, GetOrd
 			)))
 		},
 	}
+}
+
+fn parse_u256_json_value(
+	value: &serde_json::Value,
+	field_name: &str,
+) -> Result<alloy_primitives::U256, GetOrderError> {
+	if let Some(number) = value.as_u64() {
+		return Ok(alloy_primitives::U256::from(number));
+	}
+
+	let raw = value
+		.as_str()
+		.ok_or_else(|| GetOrderError::Internal(format!("Missing or invalid {field_name} field")))?;
+	if let Some(hex) = raw.strip_prefix("0x") {
+		alloy_primitives::U256::from_str_radix(hex, 16)
+			.map_err(|e| GetOrderError::Internal(format!("Invalid {field_name}: {e}")))
+	} else {
+		raw.parse::<alloy_primitives::U256>()
+			.map_err(|e| GetOrderError::Internal(format!("Invalid {field_name}: {e}")))
+	}
+}
+
+fn parse_u64_json_value(value: &serde_json::Value, field_name: &str) -> Result<u64, GetOrderError> {
+	let parsed = parse_u256_json_value(value, field_name)?;
+	if parsed > alloy_primitives::U256::from(u64::MAX) {
+		return Err(GetOrderError::Internal(format!(
+			"{field_name} exceeds u64 max"
+		)));
+	}
+	Ok(parsed.to::<u64>())
+}
+
+fn parse_bytes32_json_value(
+	value: &serde_json::Value,
+	field_name: &str,
+) -> Result<[u8; 32], GetOrderError> {
+	if let Some(raw) = value.as_str() {
+		let bytes = alloy_primitives::hex::decode(raw.trim_start_matches("0x"))
+			.map_err(|e| GetOrderError::Internal(format!("Invalid {field_name}: {e}")))?;
+		return bytes.try_into().map_err(|bytes: Vec<u8>| {
+			GetOrderError::Internal(format!(
+				"Invalid {field_name} length: expected 32 bytes, got {}",
+				bytes.len()
+			))
+		});
+	}
+
+	let array = value.as_array().ok_or_else(|| {
+		GetOrderError::Internal(format!("Invalid {field_name} format - expected bytes32"))
+	})?;
+	if array.len() != 32 {
+		return Err(GetOrderError::Internal(format!(
+			"Invalid {field_name} length: expected 32 bytes, got {}",
+			array.len()
+		)));
+	}
+
+	let mut bytes = [0u8; 32];
+	for (idx, byte) in array.iter().enumerate() {
+		let raw = byte.as_u64().ok_or_else(|| {
+			GetOrderError::Internal(format!("Invalid {field_name} byte at index {idx}"))
+		})?;
+		if raw > u8::MAX as u64 {
+			return Err(GetOrderError::Internal(format!(
+				"Invalid {field_name} byte at index {idx}: {raw} exceeds u8 max"
+			)));
+		}
+		bytes[idx] = raw as u8;
+	}
+	Ok(bytes)
+}
+
+fn interop_address_from_bytes32(
+	chain_id: u64,
+	bytes: &[u8; 32],
+) -> Result<InteropAddress, GetOrderError> {
+	let address = if bytes[..12].iter().all(|byte| *byte == 0) {
+		let evm_address = with_0x_prefix(&bytes32_to_address(bytes));
+		parse_address(&evm_address).map_err(|e| {
+			GetOrderError::Internal(format!("Invalid EVM address in bytes32 token: {e}"))
+		})?
+	} else {
+		Address(bytes.to_vec())
+	};
+	Ok((chain_id, address).into())
+}
+
+fn hyperlane_asset_amounts(
+	order: &Order,
+	field_name: &str,
+	amount_side: &str,
+) -> Result<Vec<AssetAmount>, GetOrderError> {
+	let outputs = order.data.get(field_name).ok_or_else(|| {
+		GetOrderError::Internal(format!(
+			"Missing {field_name} field in Hyperlane7683 order data"
+		))
+	})?;
+	let outputs = outputs.as_array().ok_or_else(|| {
+		GetOrderError::Internal(format!(
+			"Invalid {field_name} format - expected array in Hyperlane7683 order data"
+		))
+	})?;
+
+	outputs
+		.iter()
+		.enumerate()
+		.map(|(idx, output)| {
+			let token = output.get("token").ok_or_else(|| {
+				GetOrderError::Internal(format!(
+					"Missing token field in Hyperlane7683 {amount_side} at index {idx}"
+				))
+			})?;
+			let token = parse_bytes32_json_value(token, "Hyperlane7683 token")?;
+
+			let amount = output.get("amount").ok_or_else(|| {
+				GetOrderError::Internal(format!(
+					"Missing amount field in Hyperlane7683 {amount_side} at index {idx}"
+				))
+			})?;
+			let amount = parse_u256_json_value(amount, "Hyperlane7683 amount")?;
+
+			let chain_id = output
+				.get("chain_id")
+				.or_else(|| output.get("chainId"))
+				.ok_or_else(|| {
+					GetOrderError::Internal(format!(
+						"Missing chain_id field in Hyperlane7683 {amount_side} at index {idx}"
+					))
+				})?;
+			let chain_id = parse_u64_json_value(chain_id, "Hyperlane7683 chain_id")?;
+
+			Ok(AssetAmount {
+				asset: interop_address_from_bytes32(chain_id, &token)?,
+				amount,
+			})
+		})
+		.collect()
+}
+
+fn fill_transaction_from_order(order: &Order) -> Option<FillTransactionInfo> {
+	order.fill_tx_hash.as_ref().map(|fill_tx_hash| {
+		// Determine fill transaction status based on order status
+		let tx_status = match order.status {
+			// Fill transaction completed successfully
+			OrderStatus::Executed
+			| OrderStatus::PostFilled
+			| OrderStatus::PreClaimed
+			| OrderStatus::Settled
+			| OrderStatus::Finalized => FillTransactionStatus::Executed,
+			// Fill transaction is in progress
+			OrderStatus::Executing => FillTransactionStatus::Pending,
+			// These states shouldn't have a fill_tx_hash, but if they do, log warning
+			OrderStatus::Created | OrderStatus::Pending => {
+				tracing::warn!(
+					order_id = %order.id,
+					status = ?order.status,
+					"Unexpected fill_tx_hash in pre-execution state"
+				);
+				FillTransactionStatus::Pending
+			},
+			// Fill transaction failed
+			OrderStatus::Failed(TransactionType::Fill, _) => FillTransactionStatus::Failed,
+			// Prepare failed - shouldn't have fill_tx_hash
+			OrderStatus::Failed(TransactionType::Prepare, _) => {
+				tracing::warn!(
+					order_id = %order.id,
+					"Unexpected fill_tx_hash when prepare transaction failed"
+				);
+				FillTransactionStatus::Failed
+			},
+			// Fill succeeded but later transaction failed
+			OrderStatus::Failed(TransactionType::PostFill, _)
+			| OrderStatus::Failed(TransactionType::PreClaim, _)
+			| OrderStatus::Failed(TransactionType::Claim, _)
+			| OrderStatus::Failed(TransactionType::Approval, _)
+			| OrderStatus::Failed(TransactionType::Withdrawal, _)
+			| OrderStatus::Failed(TransactionType::Bridge, _)
+			| OrderStatus::Failed(TransactionType::Pusher, _) => FillTransactionStatus::Executed,
+		};
+
+		FillTransactionInfo {
+			hash: with_0x_prefix(&alloy_primitives::hex::encode(&fill_tx_hash.0)),
+			status: tx_status,
+			timestamp: order.updated_at,
+		}
+	})
 }
 
 /// Converts an EIP-7683 order to API OrderResponse format.
@@ -235,52 +424,7 @@ async fn convert_eip7683_order_to_response(
 	});
 
 	// Try to retrieve fill transaction hash from storage
-	let fill_transaction = order.fill_tx_hash.as_ref().map(|fill_tx_hash| {
-		// Determine fill transaction status based on order status
-		let tx_status = match order.status {
-			// Fill transaction completed successfully
-			OrderStatus::Executed
-			| OrderStatus::PostFilled
-			| OrderStatus::PreClaimed
-			| OrderStatus::Settled
-			| OrderStatus::Finalized => FillTransactionStatus::Executed,
-			// Fill transaction is in progress
-			OrderStatus::Executing => FillTransactionStatus::Pending,
-			// These states shouldn't have a fill_tx_hash, but if they do, log warning
-			OrderStatus::Created | OrderStatus::Pending => {
-				tracing::warn!(
-					order_id = %order.id,
-					status = ?order.status,
-					"Unexpected fill_tx_hash in pre-execution state"
-				);
-				FillTransactionStatus::Pending
-			},
-			// Fill transaction failed
-			OrderStatus::Failed(TransactionType::Fill, _) => FillTransactionStatus::Failed,
-			// Prepare failed - shouldn't have fill_tx_hash
-			OrderStatus::Failed(TransactionType::Prepare, _) => {
-				tracing::warn!(
-					order_id = %order.id,
-					"Unexpected fill_tx_hash when prepare transaction failed"
-				);
-				FillTransactionStatus::Failed
-			},
-			// Fill succeeded but later transaction failed
-			OrderStatus::Failed(TransactionType::PostFill, _)
-			| OrderStatus::Failed(TransactionType::PreClaim, _)
-			| OrderStatus::Failed(TransactionType::Claim, _)
-			| OrderStatus::Failed(TransactionType::Approval, _)
-			| OrderStatus::Failed(TransactionType::Withdrawal, _)
-			| OrderStatus::Failed(TransactionType::Bridge, _)
-			| OrderStatus::Failed(TransactionType::Pusher, _) => FillTransactionStatus::Executed,
-		};
-
-		FillTransactionInfo {
-			hash: with_0x_prefix(&alloy_primitives::hex::encode(&fill_tx_hash.0)),
-			status: tx_status,
-			timestamp: order.updated_at,
-		}
-	});
+	let fill_transaction = fill_transaction_from_order(&order);
 
 	let response = OrderResponse {
 		id: order.id,
@@ -298,6 +442,40 @@ async fn convert_eip7683_order_to_response(
 	};
 
 	Ok(response)
+}
+
+/// Converts a Hyperlane7683 resolved order to API OrderResponse format.
+async fn convert_hyperlane7683_order_to_response(
+	order: solver_types::Order,
+) -> Result<OrderResponse, GetOrderError> {
+	let input_amounts = hyperlane_asset_amounts(&order, "min_received", "input")?;
+	let output_amounts = hyperlane_asset_amounts(&order, "max_spent", "output")?;
+
+	let settlement_data = serde_json::json!({
+		"standard": HYPERLANE7683_STANDARD,
+		"order_id": order.data.get("order_id").cloned().unwrap_or(serde_json::Value::Null),
+		"origin_chain_id": order.data.get("origin_chain_id").cloned().unwrap_or(serde_json::Value::Null),
+		"open_deadline": order.data.get("open_deadline").cloned().unwrap_or(serde_json::Value::Null),
+		"fill_deadline": order.data.get("fill_deadline").cloned().unwrap_or(serde_json::Value::Null),
+		"fill_instructions": order.data.get("fill_instructions").cloned().unwrap_or(serde_json::Value::Null)
+	});
+
+	let fill_transaction = fill_transaction_from_order(&order);
+
+	Ok(OrderResponse {
+		id: order.id,
+		status: order.status,
+		created_at: order.created_at,
+		updated_at: order.updated_at,
+		quote_id: order.quote_id,
+		input_amounts,
+		output_amounts,
+		settlement: Settlement {
+			settlement_type: SettlementType::Escrow,
+			data: settlement_data,
+		},
+		fill_transaction,
+	})
 }
 
 #[cfg(test)]
@@ -399,6 +577,52 @@ mod tests {
 				"signature": "0xsignature",
 				"nonce": "42",
 				"expires": "1640995800"
+			}))
+			.with_fill_tx_hash(Some(TransactionHash(hex::decode(TEST_ADDR).unwrap())))
+			.build()
+	}
+
+	fn evm_bytes32_json(address: &str) -> Vec<u8> {
+		let mut bytes = vec![0u8; 12];
+		bytes.extend(hex::decode(address.trim_start_matches("0x")).unwrap());
+		bytes
+	}
+
+	fn create_test_hyperlane7683_order(id: &str, status: OrderStatus) -> Order {
+		let starknet_token = vec![0x42u8; 32];
+		let evm_token = evm_bytes32_json(TEST_ADDR);
+
+		OrderBuilder::new()
+			.with_id(id)
+			.with_standard(HYPERLANE7683_STANDARD)
+			.with_status(status)
+			.with_solver_address(addr())
+			.with_quote_id(Some("quote-hyperlane"))
+			.with_input_chain_ids(vec![358974494])
+			.with_output_chain_ids(vec![1])
+			.with_data(json!({
+				"user": vec![0x11u8; 32],
+				"origin_chain_id": "358974494",
+				"open_deadline": 4102444800u64,
+				"fill_deadline": 4102444500u64,
+				"order_id": vec![0x82u8; 32],
+				"min_received": [{
+					"token": starknet_token,
+					"amount": "10000000000000000",
+					"recipient": vec![0x22u8; 32],
+					"chain_id": "358974494"
+				}],
+				"max_spent": [{
+					"token": evm_token,
+					"amount": "10000000000",
+					"recipient": evm_bytes32_json(TEST_ADDR),
+					"chain_id": "1"
+				}],
+				"fill_instructions": [{
+					"destination_chain_id": "1",
+					"destination_settler": evm_bytes32_json(TEST_ADDR),
+					"origin_data": [1, 2, 3]
+				}]
 			}))
 			.with_fill_tx_hash(Some(TransactionHash(hex::decode(TEST_ADDR).unwrap())))
 			.build()
@@ -520,6 +744,45 @@ mod tests {
 		));
 
 		// fill tx
+		let fill_tx = resp.fill_transaction.expect("has fill tx");
+		assert_eq!(fill_tx.status, FillTransactionStatus::Executed);
+	}
+
+	#[tokio::test]
+	async fn test_convert_order_to_response_hyperlane7683_ok() {
+		let order = create_test_hyperlane7683_order("order-hyperlane", OrderStatus::Finalized);
+		let resp = convert_order_to_response(order).await.expect("ok");
+
+		assert_eq!(resp.id, "order-hyperlane");
+		assert!(matches!(resp.status, OrderStatus::Finalized));
+		assert_eq!(resp.quote_id, Some("quote-hyperlane".to_string()));
+
+		assert_eq!(resp.input_amounts.len(), 1);
+		assert_eq!(
+			resp.input_amounts[0].amount,
+			U256::from(10_000_000_000_000_000u64)
+		);
+		assert_eq!(
+			resp.input_amounts[0].asset.ethereum_chain_id().unwrap(),
+			358974494
+		);
+		assert_eq!(resp.input_amounts[0].asset.address.len(), 32);
+
+		assert_eq!(resp.output_amounts.len(), 1);
+		assert_eq!(resp.output_amounts[0].amount, U256::from(10_000_000_000u64));
+		assert_eq!(resp.output_amounts[0].asset.ethereum_chain_id().unwrap(), 1);
+		assert_eq!(resp.output_amounts[0].asset.address.len(), 20);
+
+		assert!(matches!(
+			resp.settlement.settlement_type,
+			SettlementType::Escrow
+		));
+		assert_eq!(
+			resp.settlement.data["standard"],
+			serde_json::Value::String(HYPERLANE7683_STANDARD.to_string())
+		);
+		assert!(resp.settlement.data.get("fill_instructions").is_some());
+
 		let fill_tx = resp.fill_transaction.expect("has fill tx");
 		assert_eq!(fill_tx.status, FillTransactionStatus::Executed);
 	}
