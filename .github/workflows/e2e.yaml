@@ -43,10 +43,10 @@ jobs:
           egress-policy: audit
 
       - name: Checkout solver
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Checkout oif-contracts
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: openintentsframework/oif-contracts
           path: oif-contracts
@@ -159,7 +159,7 @@ jobs:
           egress-policy: audit
 
       - name: Checkout solver
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Restore forge build output
         id: forge-cache
@@ -181,7 +181,7 @@ jobs:
       # rebuild oif-contracts in this shard instead of taking down the matrix.
       - name: Checkout oif-contracts (cache miss fallback)
         if: steps.forge-cache.outputs.cache-hit != 'true'
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: openintentsframework/oif-contracts
           path: oif-contracts
