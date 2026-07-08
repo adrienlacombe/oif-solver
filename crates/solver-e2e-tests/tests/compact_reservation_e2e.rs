@@ -80,7 +80,7 @@ async fn compact_deposit_oversubscription_admits_only_one_order() -> anyhow::Res
 		.await?;
 
 	// --- Order 1: fits the deposit (600 ≤ 1000). Must fill. ---
-	let order1 = compact_order(&h, token_id, order1_in, order1_out, 1);
+	let order1 = compact_order(&h, token_id, order1_in, order1_out, next_order_nonce());
 	let request1 = build_compact_request(&h, &order1, lock_tag).await?;
 	let resp1 = h.submit_post_order(&request1).await?;
 	assert_eq!(
@@ -116,7 +116,7 @@ async fn compact_deposit_oversubscription_admits_only_one_order() -> anyhow::Res
 	// The HTTP advisory balanceOf check PASSES for order 2: the on-chain
 	// Compact balance is still 1000 (order 1 has not claimed it yet), so the
 	// stateless check sees enough. The rejection happens later, in the engine.
-	let order2 = compact_order(&h, token_id, order2_in, order2_out, 2);
+	let order2 = compact_order(&h, token_id, order2_in, order2_out, next_order_nonce());
 	let request2 = build_compact_request(&h, &order2, lock_tag).await?;
 	let resp2 = h.submit_post_order(&request2).await?;
 	assert_eq!(
@@ -190,13 +190,13 @@ async fn compact_deposit_partial_reservations_coexist() -> anyhow::Result<()> {
 
 	// Submit both before waiting on either, so their reservations are taken
 	// against the same live deposit (400 + 400 = 800 ≤ 1000 must both fit).
-	let order_a = compact_order(&h, token_id, a_in, a_out, 11);
+	let order_a = compact_order(&h, token_id, a_in, a_out, next_order_nonce());
 	let request_a = build_compact_request(&h, &order_a, lock_tag).await?;
 	let resp_a = h.submit_post_order(&request_a).await?;
 	assert_eq!(resp_a.status, PostOrderResponseStatus::Received);
 	let order_a_id = order_id_b256(&resp_a)?;
 
-	let order_b = compact_order(&h, token_id, b_in, b_out, 12);
+	let order_b = compact_order(&h, token_id, b_in, b_out, next_order_nonce());
 	let request_b = build_compact_request(&h, &order_b, lock_tag).await?;
 	let resp_b = h.submit_post_order(&request_b).await?;
 	assert_eq!(resp_b.status, PostOrderResponseStatus::Received);
@@ -274,6 +274,10 @@ fn compact_order(
 			context: Default::default(),
 		}],
 	}
+}
+
+fn next_order_nonce() -> u64 {
+	uuid::Uuid::new_v4().as_u128() as u64
 }
 
 /// Parse the engine/on-chain order id out of a `PostOrderResponse`.

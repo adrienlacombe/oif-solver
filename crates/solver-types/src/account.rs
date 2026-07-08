@@ -440,6 +440,10 @@ mod tests {
 		Address(bytes.to_vec())
 	}
 
+	fn next_test_nonce() -> u64 {
+		uuid::Uuid::new_v4().as_u128() as u64
+	}
+
 	#[test]
 	fn test_address_creation() {
 		let addr_bytes = vec![
@@ -618,10 +622,11 @@ mod tests {
 
 	#[test]
 	fn test_transaction_creation_with_builder() {
+		let nonce = next_test_nonce();
 		let tx = TransactionBuilder::new()
 			.data(vec![0x12, 0x34])
 			.value_u64(1000)
-			.nonce(42)
+			.nonce(nonce)
 			.gas_limit(21000)
 			.gas_price_gwei(20)
 			.build();
@@ -630,7 +635,7 @@ mod tests {
 		assert_eq!(tx.data, vec![0x12, 0x34]);
 		assert_eq!(tx.value, U256::from(1000));
 		assert_eq!(tx.chain_id, 1);
-		assert_eq!(tx.nonce, Some(42));
+		assert_eq!(tx.nonce, Some(nonce));
 		assert_eq!(tx.gas_limit, Some(21000));
 		assert_eq!(tx.gas_price, Some(20_000_000_000));
 	}
@@ -641,11 +646,12 @@ mod tests {
 		use alloy_rpc_types::{TransactionInput, TransactionRequest};
 
 		let alloy_addr = address!("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B");
+		let nonce = next_test_nonce();
 		let req = TransactionRequest {
 			to: Some(TxKind::Call(alloy_addr)),
 			value: Some(U256::from(500)),
 			chain_id: Some(137),
-			nonce: Some(10),
+			nonce: Some(nonce),
 			gas: Some(50000),
 			gas_price: Some(25_000_000_000),
 			input: TransactionInput {
@@ -661,7 +667,7 @@ mod tests {
 		assert_eq!(tx.to.unwrap().0, alloy_addr.as_slice());
 		assert_eq!(tx.value, U256::from(500));
 		assert_eq!(tx.chain_id, 137);
-		assert_eq!(tx.nonce, Some(10));
+		assert_eq!(tx.nonce, Some(nonce));
 		assert_eq!(tx.gas_limit, Some(50000));
 		assert_eq!(tx.gas_price, Some(25_000_000_000));
 		assert_eq!(tx.data, vec![0xab, 0xcd]);
@@ -684,11 +690,12 @@ mod tests {
 
 	#[test]
 	fn test_transaction_to_alloy_request_with_builder() {
+		let nonce = next_test_nonce();
 		let tx = TransactionBuilder::new()
 			.data_hex("0xffee")
 			.unwrap()
 			.value_u64(750)
-			.nonce(15)
+			.nonce(nonce)
 			.gas_limit(30000)
 			.gas_price_gwei(30)
 			.max_fee_per_gas_gwei(40)
@@ -700,7 +707,7 @@ mod tests {
 		assert!(req.to.is_some());
 		assert_eq!(req.value, Some(U256::from(750)));
 		assert_eq!(req.chain_id, Some(1));
-		assert_eq!(req.nonce, Some(15));
+		assert_eq!(req.nonce, Some(nonce));
 		assert_eq!(req.gas, Some(30000));
 		assert_eq!(req.gas_price, Some(30_000_000_000));
 		assert_eq!(req.max_fee_per_gas, Some(40_000_000_000));
@@ -763,6 +770,7 @@ mod tests {
 
 	#[test]
 	fn test_starknet_invoke_transaction_serialization() {
+		let nonce = U256::from(next_test_nonce());
 		let invoke = StarknetInvokeTransaction {
 			network_id: 11155111,
 			sender_address: Address(vec![0x11; 32]),
@@ -772,7 +780,7 @@ mod tests {
 				calldata: vec![U256::from(1), U256::from(2)],
 			}],
 			account_calldata: Vec::new(),
-			nonce: Some(U256::from(7)),
+			nonce: Some(nonce),
 			resource_bounds: Some(StarknetResourceBoundsMapping::zero()),
 			signature: Vec::new(),
 			tip: U256::ZERO,
@@ -793,15 +801,16 @@ mod tests {
 
 	#[test]
 	fn test_execution_transaction_evm_serializes_like_transaction() {
+		let nonce = next_test_nonce();
 		let tx = TransactionBuilder::new()
 			.chain_id(137)
-			.nonce(12)
+			.nonce(nonce)
 			.gas_price_gwei(20)
 			.build();
 		let envelope = ExecutionTransaction::from(tx.clone());
 
 		assert_eq!(envelope.network_id(), 137);
-		assert_eq!(envelope.nonce(), Some(12));
+		assert_eq!(envelope.nonce(), Some(nonce));
 		assert_eq!(
 			serde_json::to_value(&envelope).unwrap(),
 			serde_json::to_value(&tx).unwrap()
@@ -814,12 +823,14 @@ mod tests {
 
 	#[test]
 	fn test_execution_transaction_starknet_routes_by_network_id() {
+		let nonce_value = next_test_nonce();
+		let nonce = U256::from(nonce_value);
 		let invoke = StarknetInvokeTransaction {
 			network_id: 11155111,
 			sender_address: Address(vec![0x11; 32]),
 			calls: vec![],
 			account_calldata: Vec::new(),
-			nonce: Some(U256::from(7)),
+			nonce: Some(nonce),
 			resource_bounds: None,
 			signature: Vec::new(),
 			tip: U256::ZERO,
@@ -833,7 +844,7 @@ mod tests {
 		let envelope = ExecutionTransaction::from(invoke.clone());
 
 		assert_eq!(envelope.network_id(), 11155111);
-		assert_eq!(envelope.nonce(), Some(7));
+		assert_eq!(envelope.nonce(), Some(nonce_value));
 		assert!(envelope.as_evm().is_none());
 
 		let decoded: ExecutionTransaction =
@@ -862,13 +873,14 @@ mod tests {
 		use alloy_primitives::{address, Bytes, TxKind};
 		use alloy_rpc_types::{TransactionInput, TransactionRequest};
 
+		let nonce = next_test_nonce();
 		let original_req = TransactionRequest {
 			to: Some(TxKind::Call(address!(
 				"A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B"
 			))),
 			value: Some(U256::from(1234)),
 			chain_id: Some(5),
-			nonce: Some(99),
+			nonce: Some(nonce),
 			gas: Some(60000),
 			gas_price: Some(35_000_000_000),
 			input: TransactionInput {
@@ -904,11 +916,12 @@ mod tests {
 
 	#[test]
 	fn test_transaction_clone() {
+		let nonce = next_test_nonce();
 		let original = TransactionBuilder::new()
 			.data(vec![0x11, 0x22])
 			.value_u64(500)
 			.chain_id(10)
-			.nonce(5)
+			.nonce(nonce)
 			.gas_limit(25000)
 			.gas_price_gwei(20)
 			.build();

@@ -233,6 +233,10 @@ mod tests {
 		PrivateKeySigner::from_bytes(&B256::from([0x42u8; 32])).expect("valid secret")
 	}
 
+	fn next_test_nonce() -> String {
+		format!("{:020}", uuid::Uuid::new_v4().as_u128() as u64)
+	}
+
 	fn build_message(
 		domain: &str,
 		address: &str,
@@ -265,11 +269,12 @@ Issued At: {}\n",
 
 	#[test]
 	fn parse_valid_siwe_message() {
+		let nonce = next_test_nonce();
 		let message = build_message(
 			"solver.example.com",
 			"0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B",
 			1,
-			"00000000123456789012",
+			&nonce,
 			Utc::now(),
 			None,
 		);
@@ -277,7 +282,7 @@ Issued At: {}\n",
 
 		assert_eq!(parsed.domain, "solver.example.com");
 		assert_eq!(parsed.chain_id, 1);
-		assert_eq!(parsed.nonce, "00000000123456789012");
+		assert_eq!(parsed.nonce, nonce);
 		assert_eq!(parsed.version, "1");
 		assert_eq!(parsed.uri, "https://solver.example.com");
 		assert!(parsed.statement.is_some());
@@ -287,11 +292,12 @@ Issued At: {}\n",
 	fn verify_siwe_signature_success() {
 		let signer = test_signer();
 		let now = Utc::now();
+		let nonce = next_test_nonce();
 		let message = build_message(
 			"solver.example.com",
 			&signer.address().to_string(),
 			1,
-			"00000000000000012345",
+			&nonce,
 			now,
 			Some(now + Duration::minutes(5)),
 		);
@@ -307,11 +313,12 @@ Issued At: {}\n",
 	fn verify_siwe_signature_domain_mismatch() {
 		let signer = test_signer();
 		let now = Utc::now();
+		let nonce = next_test_nonce();
 		let message = build_message(
 			"solver.example.com",
 			&signer.address().to_string(),
 			1,
-			"00000000000000012345",
+			&nonce,
 			now,
 			Some(now + Duration::minutes(5)),
 		);
@@ -327,11 +334,12 @@ Issued At: {}\n",
 	fn verify_siwe_signature_chain_mismatch() {
 		let signer = test_signer();
 		let now = Utc::now();
+		let nonce = next_test_nonce();
 		let message = build_message(
 			"solver.example.com",
 			&signer.address().to_string(),
 			1,
-			"00000000000000012345",
+			&nonce,
 			now,
 			Some(now + Duration::minutes(5)),
 		);
@@ -347,11 +355,12 @@ Issued At: {}\n",
 	fn verify_siwe_signature_expired_message() {
 		let signer = test_signer();
 		let now = Utc::now();
+		let nonce = next_test_nonce();
 		let message = build_message(
 			"solver.example.com",
 			&signer.address().to_string(),
 			1,
-			"00000000000000012345",
+			&nonce,
 			now - Duration::minutes(10),
 			Some(now - Duration::minutes(5)),
 		);
@@ -372,27 +381,33 @@ Issued At: {}\n",
 
 	#[test]
 	fn parse_rejects_invalid_chain_id_format() {
-		let message = "solver.example.com wants you to sign in with your Ethereum account:\n\
+		let nonce = next_test_nonce();
+		let message = format!(
+			"solver.example.com wants you to sign in with your Ethereum account:\n\
 0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B\n\n\
 Sign in to OIF Solver Admin API\n\n\
 URI: https://solver.example.com\n\
 Version: 1\n\
 Chain ID: not-a-number\n\
-Nonce: 00000000000000012345\n\
-Issued At: 2026-02-18T12:00:00.000Z\n";
-		let err = SiweMessage::parse(message).expect_err("expected invalid chain id");
+Nonce: {nonce}\n\
+Issued At: 2026-02-18T12:00:00.000Z\n"
+		);
+		let err = SiweMessage::parse(&message).expect_err("expected invalid chain id");
 		assert!(matches!(err, SiweError::InvalidFieldFormat { field, .. } if field == "Chain ID"));
 	}
 
 	#[test]
 	fn parse_rejects_missing_required_fields() {
-		let message = "solver.example.com wants you to sign in with your Ethereum account:\n\
+		let nonce = next_test_nonce();
+		let message = format!(
+			"solver.example.com wants you to sign in with your Ethereum account:\n\
 0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B\n\n\
 Version: 1\n\
 Chain ID: 1\n\
-Nonce: 00000000000000012345\n\
-Issued At: 2026-02-18T12:00:00.000Z\n";
-		let err = SiweMessage::parse(message).expect_err("expected missing URI field");
+Nonce: {nonce}\n\
+Issued At: 2026-02-18T12:00:00.000Z\n"
+		);
+		let err = SiweMessage::parse(&message).expect_err("expected missing URI field");
 		assert!(matches!(err, SiweError::MissingField("URI")));
 	}
 
@@ -400,6 +415,7 @@ Issued At: 2026-02-18T12:00:00.000Z\n";
 	fn verify_siwe_signature_rejects_unsupported_version() {
 		let signer = test_signer();
 		let now = Utc::now();
+		let nonce = next_test_nonce();
 		let message = format!(
 			"solver.example.com wants you to sign in with your Ethereum account:\n\
 {}\n\n\
@@ -407,7 +423,7 @@ Sign in to OIF Solver Admin API\n\n\
 URI: https://solver.example.com\n\
 Version: 2\n\
 Chain ID: 1\n\
-Nonce: 00000000000000012345\n\
+Nonce: {nonce}\n\
 Issued At: {}\n\
 Expiration Time: {}\n",
 			signer.address(),
@@ -426,6 +442,7 @@ Expiration Time: {}\n",
 	fn verify_siwe_signature_rejects_not_before_in_future() {
 		let signer = test_signer();
 		let now = Utc::now();
+		let nonce = next_test_nonce();
 		let message = format!(
 			"solver.example.com wants you to sign in with your Ethereum account:\n\
 {}\n\n\
@@ -433,7 +450,7 @@ Sign in to OIF Solver Admin API\n\n\
 URI: https://solver.example.com\n\
 Version: 1\n\
 Chain ID: 1\n\
-Nonce: 00000000000000012345\n\
+Nonce: {nonce}\n\
 Issued At: {}\n\
 Not Before: {}\n\
 Expiration Time: {}\n",
@@ -454,11 +471,12 @@ Expiration Time: {}\n",
 	fn verify_siwe_signature_rejects_invalid_signature_format() {
 		let signer = test_signer();
 		let now = Utc::now();
+		let nonce = next_test_nonce();
 		let message = build_message(
 			"solver.example.com",
 			&signer.address().to_string(),
 			1,
-			"00000000000000012345",
+			&nonce,
 			now,
 			Some(now + Duration::minutes(5)),
 		);
@@ -473,11 +491,12 @@ Expiration Time: {}\n",
 		let signer_a = test_signer();
 		let signer_b = PrivateKeySigner::from_bytes(&B256::from([0x24u8; 32])).unwrap();
 		let now = Utc::now();
+		let nonce = next_test_nonce();
 		let message = build_message(
 			"solver.example.com",
 			&signer_a.address().to_string(),
 			1,
-			"00000000000000012345",
+			&nonce,
 			now,
 			Some(now + Duration::minutes(5)),
 		);

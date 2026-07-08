@@ -46,3 +46,4 @@ async-trait = { workspace = true }
 solver-core = { path = "../solver-core" }
 solver-delivery = { path = "../solver-delivery" }
 solver-settlement = { path = "../solver-settlement", features = ["testing"] }
+uuid = { workspace = true }
