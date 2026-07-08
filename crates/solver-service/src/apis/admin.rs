@@ -1957,6 +1957,8 @@ mod tests {
 	) -> AdminApiState {
 		let admin_alloy = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
 		let admin_solver = solver_types::Address::from(admin_alloy);
+		let runtime_config =
+			build_runtime_config(&operator_config).unwrap_or_else(|_| ConfigBuilder::new().build());
 
 		let config_store =
 			create_config_store::<OperatorConfig>(StoreConfig::Memory, "test-solver".to_string())
@@ -1987,11 +1989,11 @@ mod tests {
 			address: admin_solver,
 		})));
 		let token_manager = Arc::new(TokenManager::new(
-			NetworksConfig::default(),
+			runtime_config.networks.clone(),
 			delivery.clone(),
 			account,
 		));
-		let dynamic_config = Arc::new(RwLock::new(ConfigBuilder::new().build()));
+		let dynamic_config = Arc::new(RwLock::new(runtime_config));
 
 		AdminApiState {
 			verifier: Arc::new(RwLock::new(verifier)),
