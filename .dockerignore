@@ -33,6 +33,11 @@ config/seed-overrides*.json
 .github/
 .gitlab-ci.yml
 
+# Terraform local working files
+**/.terraform/
+*.tfstate
+*.tfstate.*
+
 # Docker
 Dockerfile*
 docker-compose*
