@@ -1167,7 +1167,8 @@ mod tests {
 						symbol: "USDC".to_string(),
 						name: None,
 						address: Address::from_str("0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6")
-							.expect("valid token address"),
+							.expect("valid token address")
+							.into(),
 						decimals: 6,
 					}],
 					rpc_urls: None,
@@ -1186,7 +1187,8 @@ mod tests {
 						symbol: "USDC".to_string(),
 						name: None,
 						address: Address::from_str("0x73c83DAcc74bB8a704717AC09703b959E74b9705")
-							.expect("valid token address"),
+							.expect("valid token address")
+							.into(),
 						decimals: 6,
 					}],
 					rpc_urls: None,

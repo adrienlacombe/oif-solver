@@ -608,7 +608,7 @@ fn build_operator_network_config(
 		.map(|t| OperatorToken {
 			symbol: t.symbol.clone(),
 			name: Some(t.name.clone().unwrap_or_else(|| t.symbol.clone())),
-			address: t.address,
+			address: t.address.clone(),
 			decimals: t.decimals,
 		})
 		.collect();
@@ -627,7 +627,8 @@ fn build_operator_network_config(
 
 	let input_settler_address = override_
 		.input_settler_address
-		.or_else(|| seed.map(|s| s.input_settler))
+		.clone()
+		.or_else(|| seed.map(|s| s.input_settler.into()))
 		.ok_or_else(|| {
 			MergeError::Validation(format!(
 				"Non-seeded chain {} requires input_settler_address",
@@ -637,7 +638,8 @@ fn build_operator_network_config(
 
 	let output_settler_address = override_
 		.output_settler_address
-		.or_else(|| seed.map(|s| s.output_settler))
+		.clone()
+		.or_else(|| seed.map(|s| s.output_settler.into()))
 		.ok_or_else(|| {
 			MergeError::Validation(format!(
 				"Non-seeded chain {} requires output_settler_address",
@@ -817,7 +819,7 @@ fn build_operator_hyperlane_config_from_seed(
 				"Chain {chain_id} is not in seed; provide settlement.hyperlane override"
 			))
 		})?;
-		mailboxes.insert(*chain_id, network.hyperlane_mailbox);
+		mailboxes.insert(*chain_id, network.hyperlane_mailbox.into());
 	}
 
 	// Build IGP addresses map
@@ -828,7 +830,7 @@ fn build_operator_hyperlane_config_from_seed(
 				"Chain {chain_id} is not in seed; provide settlement.hyperlane override"
 			))
 		})?;
-		igp_addresses.insert(*chain_id, network.hyperlane_igp);
+		igp_addresses.insert(*chain_id, network.hyperlane_igp.into());
 	}
 
 	// Build oracles map
@@ -840,8 +842,8 @@ fn build_operator_hyperlane_config_from_seed(
 				"Chain {chain_id} is not in seed; provide settlement.hyperlane override"
 			))
 		})?;
-		input_oracles.insert(*chain_id, vec![network.hyperlane_oracle]);
-		output_oracles.insert(*chain_id, vec![network.hyperlane_oracle]);
+		input_oracles.insert(*chain_id, vec![network.hyperlane_oracle.into()]);
+		output_oracles.insert(*chain_id, vec![network.hyperlane_oracle.into()]);
 	}
 
 	// Build routes - each chain can send to all other chains
@@ -874,7 +876,7 @@ fn build_operator_hyperlane_config_from_seed(
 }
 
 fn ensure_oracle_chain_entries(
-	oracles: &HashMap<u64, Vec<alloy_primitives::Address>>,
+	oracles: &HashMap<u64, Vec<solver_types::Address>>,
 	path: &str,
 	chain_id: u64,
 ) -> Result<(), MergeError> {
@@ -970,8 +972,8 @@ fn validate_routes(
 }
 
 fn validate_broadcaster_route_dependencies(
-	input_oracles: &HashMap<u64, Vec<alloy_primitives::Address>>,
-	output_oracles: &HashMap<u64, Vec<alloy_primitives::Address>>,
+	input_oracles: &HashMap<u64, Vec<solver_types::Address>>,
+	output_oracles: &HashMap<u64, Vec<solver_types::Address>>,
 	routes: &HashMap<u64, Vec<u64>>,
 	broadcaster_addresses: &HashMap<u64, alloy_primitives::Address>,
 	receiver_addresses: &HashMap<u64, alloy_primitives::Address>,
@@ -1255,6 +1257,7 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 		storage: build_storage_config_from_operator(&operator_config.solver_id),
 		delivery: build_delivery_config_from_operator(
 			&operator_config.networks,
+			operator_config.account.as_ref(),
 			operator_config.fee_policy.as_ref(),
 		),
 		account: build_account_config_from_operator(operator_config.account.as_ref()),
@@ -1435,7 +1438,7 @@ fn build_networks_from_operator_config(operator_config: &OperatorConfig) -> Netw
 			.tokens
 			.iter()
 			.map(|t| TokenConfig {
-				address: solver_types::Address(t.address.as_slice().to_vec()),
+				address: t.address.clone(),
 				symbol: t.symbol.clone(),
 				name: t.name.clone(),
 				decimals: t.decimals,
@@ -1447,12 +1450,8 @@ fn build_networks_from_operator_config(operator_config: &OperatorConfig) -> Netw
 			network_type: op_network.network_type,
 			kind: op_network.kind,
 			rpc_urls,
-			input_settler_address: solver_types::Address(
-				op_network.input_settler_address.as_slice().to_vec(),
-			),
-			output_settler_address: solver_types::Address(
-				op_network.output_settler_address.as_slice().to_vec(),
-			),
+			input_settler_address: op_network.input_settler_address.clone(),
+			output_settler_address: op_network.output_settler_address.clone(),
 			tokens,
 			input_settler_compact_address: op_network
 				.input_settler_compact_address
@@ -1563,6 +1562,7 @@ fn build_storage_config_from_operator(solver_id: &str) -> StorageConfig {
 /// replace the defaults, whatever they omit keeps the default.
 fn build_delivery_config_from_operator(
 	networks: &HashMap<u64, OperatorNetworkConfig>,
+	account_config: Option<&OperatorAccountConfig>,
 	override_: Option<&solver_types::FeePolicyOverride>,
 ) -> DeliveryConfig {
 	// Absolute floor — kicks in only if RPC fee history returned all zeros.
@@ -1664,10 +1664,17 @@ fn build_delivery_config_from_operator(
 	]);
 
 	if !evm_chain_ids.is_empty() {
-		let evm_alloy_config = json_object(vec![
+		let mut evm_entries = vec![
 			("network_ids", evm_network_ids_array),
 			("fee_policy", fee_policy),
-		]);
+		];
+		if let Some(account_name) = delivery_account_for_kind(account_config, NetworkKind::Evm) {
+			evm_entries.push((
+				"accounts",
+				network_account_map(&evm_chain_ids, account_name),
+			));
+		}
+		let evm_alloy_config = json_object(evm_entries);
 		implementations.insert("evm_alloy".to_string(), evm_alloy_config);
 	}
 	if !starknet_chain_ids.is_empty() {
@@ -1706,6 +1713,13 @@ fn build_delivery_config_from_operator(
 				serde_json::Value::Object(starknet_rpc_chain_ids),
 			));
 		}
+		if let Some(account_name) = delivery_account_for_kind(account_config, NetworkKind::Starknet)
+		{
+			starknet_entries.push((
+				"accounts",
+				network_account_map(&starknet_chain_ids, account_name),
+			));
+		}
 		let starknet_config = json_object(starknet_entries);
 		implementations.insert("starknet".to_string(), starknet_config);
 	}
@@ -1735,6 +1749,40 @@ fn default_extra_native_fee_for_chain(chain_id: u64) -> Option<serde_json::Value
 	}
 }
 
+fn delivery_account_for_kind(
+	account_config: Option<&OperatorAccountConfig>,
+	kind: NetworkKind,
+) -> Option<&str> {
+	let account_config = account_config?;
+	let desired = match kind {
+		NetworkKind::Evm => ["local", "kms"],
+		NetworkKind::Starknet => ["starknet_local", "starknet-local"],
+	};
+
+	if desired.iter().any(|name| account_config.primary == *name) {
+		return Some(account_config.primary.as_str());
+	}
+
+	desired
+		.iter()
+		.find(|name| account_config.implementations.contains_key(**name))
+		.copied()
+}
+
+fn network_account_map(chain_ids: &[u64], account_name: &str) -> serde_json::Value {
+	serde_json::Value::Object(
+		chain_ids
+			.iter()
+			.map(|chain_id| {
+				(
+					chain_id.to_string(),
+					serde_json::Value::String(account_name.to_string()),
+				)
+			})
+			.collect(),
+	)
+}
+
 /// Builds AccountConfig from operator config.
 ///
 /// If the operator config has an account configuration, uses that.
@@ -1752,7 +1800,7 @@ fn build_account_config_from_operator(
 		let mut implementations = HashMap::new();
 
 		for (name, json_value) in &config.implementations {
-			let impl_value = json_value.clone();
+			let impl_value = expand_account_env_placeholders(json_value);
 			implementations.insert(name.clone(), impl_value);
 		}
 
@@ -1783,6 +1831,38 @@ fn build_account_config_from_operator(
 	}
 }
 
+fn expand_account_env_placeholders(value: &serde_json::Value) -> serde_json::Value {
+	match value {
+		serde_json::Value::String(value) => expand_env_placeholder(value)
+			.map(serde_json::Value::String)
+			.unwrap_or_else(|| serde_json::Value::String(value.clone())),
+		serde_json::Value::Array(values) => {
+			serde_json::Value::Array(values.iter().map(expand_account_env_placeholders).collect())
+		},
+		serde_json::Value::Object(values) => serde_json::Value::Object(
+			values
+				.iter()
+				.map(|(key, value)| (key.clone(), expand_account_env_placeholders(value)))
+				.collect(),
+		),
+		_ => value.clone(),
+	}
+}
+
+fn expand_env_placeholder(value: &str) -> Option<String> {
+	let name = value.strip_prefix("${")?.strip_suffix('}')?;
+	if name.is_empty()
+		|| !name
+			.bytes()
+			.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+	{
+		return None;
+	}
+	std::env::var(name)
+		.ok()
+		.map(|value| value.trim().to_string())
+}
+
 /// Builds DiscoveryConfig from operator config.
 fn build_discovery_config_from_operator(
 	operator_config: &OperatorConfig,
@@ -1790,8 +1870,29 @@ fn build_discovery_config_from_operator(
 ) -> Result<DiscoveryConfig, MergeError> {
 	let mut implementations = HashMap::new();
 
-	let network_ids_array =
-		serde_json::Value::Array(chain_ids.iter().map(|id| int(*id as i64)).collect());
+	let mut evm_chain_ids = chain_ids
+		.iter()
+		.filter_map(|chain_id| {
+			operator_config
+				.networks
+				.get(chain_id)
+				.is_some_and(|network| network.kind == NetworkKind::Evm)
+				.then_some(*chain_id)
+		})
+		.collect::<Vec<_>>();
+	evm_chain_ids.sort_unstable();
+	let mut starknet_chain_ids = chain_ids
+		.iter()
+		.filter_map(|chain_id| {
+			operator_config
+				.networks
+				.get(chain_id)
+				.is_some_and(|network| network.kind == NetworkKind::Starknet)
+				.then_some(*chain_id)
+		})
+		.collect::<Vec<_>>();
+	starknet_chain_ids.sort_unstable();
+
 	let broadcaster = operator_config.settlement.broadcaster.as_ref();
 	let default_finality_blocks = broadcaster
 		.map(|config| config.default_finality_blocks)
@@ -1807,25 +1908,54 @@ fn build_discovery_config_from_operator(
 			)
 		})
 		.unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
-	let source_finality_rules =
-		build_source_finality_rules_for_discovery(operator_config, chain_ids)?;
+	if !evm_chain_ids.is_empty() {
+		let evm_network_ids_array =
+			serde_json::Value::Array(evm_chain_ids.iter().map(|id| int(*id as i64)).collect());
+		let source_finality_rules =
+			build_source_finality_rules_for_discovery(operator_config, &evm_chain_ids)?;
 
-	// Onchain discovery - polls chain for new orders
-	let onchain_config = json_object(vec![
-		("network_ids", network_ids_array.clone()),
-		("polling_interval_secs", int(5)),
-		(
-			"default_finality_blocks",
-			int(default_finality_blocks as i64),
-		),
-		("finality_blocks", finality_blocks),
-		("source_finality_rules", source_finality_rules),
-	]);
-	implementations.insert("onchain_eip7683".to_string(), onchain_config);
+		// EVM onchain discovery - polls chain for new orders.
+		let onchain_config = json_object(vec![
+			("network_ids", evm_network_ids_array.clone()),
+			("polling_interval_secs", int(5)),
+			(
+				"default_finality_blocks",
+				int(default_finality_blocks as i64),
+			),
+			("finality_blocks", finality_blocks.clone()),
+			("source_finality_rules", source_finality_rules),
+		]);
+		implementations.insert("onchain_eip7683".to_string(), onchain_config);
 
-	// Offchain discovery - ingests orders in-process via the public /orders API
-	let offchain_config = json_object(vec![("network_ids", network_ids_array)]);
-	implementations.insert("offchain_eip7683".to_string(), offchain_config);
+		// EVM offchain discovery - ingests orders in-process via the public /orders API.
+		let offchain_config = json_object(vec![("network_ids", evm_network_ids_array)]);
+		implementations.insert("offchain_eip7683".to_string(), offchain_config);
+	}
+
+	if !starknet_chain_ids.is_empty() {
+		let starknet_network_ids_array = serde_json::Value::Array(
+			starknet_chain_ids
+				.iter()
+				.map(|id| int(*id as i64))
+				.collect(),
+		);
+		let source_finality_rules =
+			build_source_finality_rules_for_discovery(operator_config, &starknet_chain_ids)?;
+		let starknet_onchain_config = json_object(vec![
+			("network_ids", starknet_network_ids_array),
+			("polling_interval_secs", int(5)),
+			(
+				"default_finality_blocks",
+				int(default_finality_blocks as i64),
+			),
+			("finality_blocks", finality_blocks),
+			("source_finality_rules", source_finality_rules),
+		]);
+		implementations.insert(
+			"onchain_starknet_hyperlane7683".to_string(),
+			starknet_onchain_config,
+		);
+	}
 
 	Ok(DiscoveryConfig { implementations })
 }
@@ -1984,7 +2114,7 @@ fn build_hyperlane_json_from_operator(
 		let oracle_array = serde_json::Value::Array(
 			oracles
 				.iter()
-				.map(|addr| serde_json::Value::String(format!("0x{}", hex::encode(addr))))
+				.map(|addr| serde_json::Value::String(format!("0x{}", hex::encode(&addr.0))))
 				.collect(),
 		);
 		input_oracles.insert(chain_id.to_string(), oracle_array);
@@ -1994,7 +2124,7 @@ fn build_hyperlane_json_from_operator(
 		let oracle_array = serde_json::Value::Array(
 			oracles
 				.iter()
-				.map(|addr| serde_json::Value::String(format!("0x{}", hex::encode(addr))))
+				.map(|addr| serde_json::Value::String(format!("0x{}", hex::encode(&addr.0))))
 				.collect(),
 		);
 		output_oracles.insert(chain_id.to_string(), oracle_array);
@@ -2025,7 +2155,7 @@ fn build_hyperlane_json_from_operator(
 	for (chain_id, addr) in &hyperlane.mailboxes {
 		mailboxes.insert(
 			chain_id.to_string(),
-			serde_json::Value::String(format!("0x{}", hex::encode(addr))),
+			serde_json::Value::String(format!("0x{}", hex::encode(&addr.0))),
 		);
 	}
 	table.insert(
@@ -2038,7 +2168,7 @@ fn build_hyperlane_json_from_operator(
 	for (chain_id, addr) in &hyperlane.igp_addresses {
 		igp_addresses.insert(
 			chain_id.to_string(),
-			serde_json::Value::String(format!("0x{}", hex::encode(addr))),
+			serde_json::Value::String(format!("0x{}", hex::encode(&addr.0))),
 		);
 	}
 	table.insert(
@@ -2125,7 +2255,7 @@ fn build_direct_toml_from_operator(
 		let oracle_array = serde_json::Value::Array(
 			oracles
 				.iter()
-				.map(|addr| serde_json::Value::String(format!("0x{}", hex::encode(addr))))
+				.map(|addr| serde_json::Value::String(format!("0x{}", hex::encode(&addr.0))))
 				.collect(),
 		);
 		input_oracles.insert(chain_id.to_string(), oracle_array);
@@ -2136,7 +2266,7 @@ fn build_direct_toml_from_operator(
 		let oracle_array = serde_json::Value::Array(
 			oracles
 				.iter()
-				.map(|addr| serde_json::Value::String(format!("0x{}", hex::encode(addr))))
+				.map(|addr| serde_json::Value::String(format!("0x{}", hex::encode(&addr.0))))
 				.collect(),
 		);
 		output_oracles.insert(chain_id.to_string(), oracle_array);
@@ -2221,7 +2351,7 @@ fn build_broadcaster_toml_from_operator(
 		let oracle_array = serde_json::Value::Array(
 			oracles
 				.iter()
-				.map(|addr| serde_json::Value::String(format!("0x{}", hex::encode(addr))))
+				.map(|addr| serde_json::Value::String(format!("0x{}", hex::encode(&addr.0))))
 				.collect(),
 		);
 		input_oracles.insert(chain_id.to_string(), oracle_array);
@@ -2232,7 +2362,7 @@ fn build_broadcaster_toml_from_operator(
 		let oracle_array = serde_json::Value::Array(
 			oracles
 				.iter()
-				.map(|addr| serde_json::Value::String(format!("0x{}", hex::encode(addr))))
+				.map(|addr| serde_json::Value::String(format!("0x{}", hex::encode(&addr.0))))
 				.collect(),
 		);
 		output_oracles.insert(chain_id.to_string(), oracle_array);
@@ -2605,14 +2735,11 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 		let tokens = network_config
 			.tokens
 			.iter()
-			.map(|t| {
-				let addr_bytes: [u8; 20] = t.address.0.as_slice().try_into().unwrap_or([0u8; 20]);
-				OperatorToken {
-					symbol: t.symbol.clone(),
-					name: t.name.clone(),
-					address: Address::from(addr_bytes),
-					decimals: t.decimals,
-				}
+			.map(|t| OperatorToken {
+				symbol: t.symbol.clone(),
+				name: t.name.clone(),
+				address: t.address.clone(),
+				decimals: t.decimals,
 			})
 			.collect();
 
@@ -2626,19 +2753,6 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 				})
 			})
 			.collect();
-
-		let input_settler_bytes: [u8; 20] = network_config
-			.input_settler_address
-			.0
-			.as_slice()
-			.try_into()
-			.unwrap_or([0u8; 20]);
-		let output_settler_bytes: [u8; 20] = network_config
-			.output_settler_address
-			.0
-			.as_slice()
-			.try_into()
-			.unwrap_or([0u8; 20]);
 
 		let input_settler_compact_address = network_config
 			.input_settler_compact_address
@@ -2667,8 +2781,8 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 			kind: network_config.kind,
 			tokens,
 			rpc_urls,
-			input_settler_address: Address::from(input_settler_bytes),
-			output_settler_address: Address::from(output_settler_bytes),
+			input_settler_address: network_config.input_settler_address.clone(),
+			output_settler_address: network_config.output_settler_address.clone(),
 			input_settler_compact_address,
 			the_compact_address,
 			allocator_address,
@@ -3133,16 +3247,17 @@ fn extract_hyperlane_config(
 	settlement: &SettlementConfig,
 	chain_ids: &[u64],
 ) -> Result<OperatorHyperlaneConfig, MergeError> {
-	use alloy_primitives::Address;
-
 	let hyperlane_json = settlement.implementations.get("hyperlane");
 
 	// Helper to parse address from hex string
-	let parse_addr = |s: &str| -> Option<Address> {
+	let parse_addr = |s: &str| -> Option<solver_types::Address> {
 		let s = s.strip_prefix("0x").unwrap_or(s);
 		hex::decode(s).ok().and_then(|bytes| {
-			let arr: [u8; 20] = bytes.as_slice().try_into().ok()?;
-			Some(Address::from(arr))
+			matches!(
+				bytes.len(),
+				solver_types::Address::EVM_LENGTH | solver_types::Address::BYTES32_LENGTH
+			)
+			.then_some(solver_types::Address(bytes))
 		})
 	};
 
@@ -3257,7 +3372,7 @@ fn extract_hyperlane_config(
 				if let (Ok(chain_id), Some(addrs_array)) =
 					(chain_id_str.parse::<u64>(), addrs_val.as_array())
 				{
-					let addrs: Vec<Address> = addrs_array
+					let addrs: Vec<solver_types::Address> = addrs_array
 						.iter()
 						.filter_map(|v| v.as_str().and_then(parse_addr))
 						.collect();
@@ -3272,7 +3387,7 @@ fn extract_hyperlane_config(
 				if let (Ok(chain_id), Some(addrs_array)) =
 					(chain_id_str.parse::<u64>(), addrs_val.as_array())
 				{
-					let addrs: Vec<Address> = addrs_array
+					let addrs: Vec<solver_types::Address> = addrs_array
 						.iter()
 						.filter_map(|v| v.as_str().and_then(parse_addr))
 						.collect();
@@ -3334,16 +3449,17 @@ fn extract_hyperlane_config(
 
 /// Extracts direct settlement config from settlement JSON config.
 fn extract_direct_config(settlement: &SettlementConfig, chain_ids: &[u64]) -> OperatorDirectConfig {
-	use alloy_primitives::Address;
-
 	let direct_json = settlement.implementations.get("direct");
 
 	// Helper to parse address from hex string
-	let parse_addr = |s: &str| -> Option<Address> {
+	let parse_addr = |s: &str| -> Option<solver_types::Address> {
 		let s = s.strip_prefix("0x").unwrap_or(s);
 		hex::decode(s).ok().and_then(|bytes| {
-			let arr: [u8; 20] = bytes.as_slice().try_into().ok()?;
-			Some(Address::from(arr))
+			matches!(
+				bytes.len(),
+				solver_types::Address::EVM_LENGTH | solver_types::Address::BYTES32_LENGTH
+			)
+			.then_some(solver_types::Address(bytes))
 		})
 	};
 
@@ -3380,7 +3496,7 @@ fn extract_direct_config(settlement: &SettlementConfig, chain_ids: &[u64]) -> Op
 				if let (Ok(chain_id), Some(addrs_array)) =
 					(chain_id_str.parse::<u64>(), addrs_val.as_array())
 				{
-					let addrs: Vec<Address> = addrs_array
+					let addrs: Vec<solver_types::Address> = addrs_array
 						.iter()
 						.filter_map(|v| v.as_str().and_then(parse_addr))
 						.collect();
@@ -3396,7 +3512,7 @@ fn extract_direct_config(settlement: &SettlementConfig, chain_ids: &[u64]) -> Op
 				if let (Ok(chain_id), Some(addrs_array)) =
 					(chain_id_str.parse::<u64>(), addrs_val.as_array())
 				{
-					let addrs: Vec<Address> = addrs_array
+					let addrs: Vec<solver_types::Address> = addrs_array
 						.iter()
 						.filter_map(|v| v.as_str().and_then(parse_addr))
 						.collect();
@@ -3465,6 +3581,16 @@ fn extract_broadcaster_config(
 			Some(Address::from(arr))
 		})
 	};
+	let parse_oracle_addr = |s: &str| -> Option<solver_types::Address> {
+		let s = s.strip_prefix("0x").unwrap_or(s);
+		hex::decode(s).ok().and_then(|bytes| {
+			matches!(
+				bytes.len(),
+				solver_types::Address::EVM_LENGTH | solver_types::Address::BYTES32_LENGTH
+			)
+			.then_some(solver_types::Address(bytes))
+		})
+	};
 
 	let parse_b256 = |s: &str| -> Option<B256> { s.parse::<B256>().ok() };
 
@@ -3528,9 +3654,9 @@ fn extract_broadcaster_config(
 				if let (Ok(chain_id), Some(addrs_array)) =
 					(chain_id_str.parse::<u64>(), addrs_val.as_array())
 				{
-					let addrs: Vec<Address> = addrs_array
+					let addrs: Vec<solver_types::Address> = addrs_array
 						.iter()
-						.filter_map(|v| v.as_str().and_then(parse_addr))
+						.filter_map(|v| v.as_str().and_then(parse_oracle_addr))
 						.collect();
 					if !addrs.is_empty() {
 						input_oracles.insert(chain_id, addrs);
@@ -3543,9 +3669,9 @@ fn extract_broadcaster_config(
 				if let (Ok(chain_id), Some(addrs_array)) =
 					(chain_id_str.parse::<u64>(), addrs_val.as_array())
 				{
-					let addrs: Vec<Address> = addrs_array
+					let addrs: Vec<solver_types::Address> = addrs_array
 						.iter()
-						.filter_map(|v| v.as_str().and_then(parse_addr))
+						.filter_map(|v| v.as_str().and_then(parse_oracle_addr))
 						.collect();
 					if !addrs.is_empty() {
 						output_oracles.insert(chain_id, addrs);
@@ -3879,7 +4005,7 @@ mod tests {
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
-						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6").into(),
 						decimals: 6,
 					}],
 					rpc_urls: None,
@@ -3897,7 +4023,7 @@ mod tests {
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
-						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705"),
+						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705").into(),
 						decimals: 6,
 					}],
 					rpc_urls: Some(vec!["https://custom-rpc.example.com".to_string()]),
@@ -4092,9 +4218,9 @@ mod tests {
 			network.network_type = Some(NetworkType::New);
 			network.rpc_urls = Some(vec![format!("https://rpc-{}.example", network.chain_id)]);
 			network.input_settler_address =
-				Some(address!("1111111111111111111111111111111111111111"));
+				Some(address!("1111111111111111111111111111111111111111").into());
 			network.output_settler_address =
-				Some(address!("2222222222222222222222222222222222222222"));
+				Some(address!("2222222222222222222222222222222222222222").into());
 		}
 		overrides.settlement = Some(solver_types::SettlementOverride {
 			settlement_type: SettlementTypeOverride::Direct,
@@ -4105,21 +4231,21 @@ mod tests {
 					input: HashMap::from([
 						(
 							11155420,
-							vec![address!("3333333333333333333333333333333333333333")],
+							vec![address!("3333333333333333333333333333333333333333").into()],
 						),
 						(
 							84532,
-							vec![address!("4444444444444444444444444444444444444444")],
+							vec![address!("4444444444444444444444444444444444444444").into()],
 						),
 					]),
 					output: HashMap::from([
 						(
 							11155420,
-							vec![address!("5555555555555555555555555555555555555555")],
+							vec![address!("5555555555555555555555555555555555555555").into()],
 						),
 						(
 							84532,
-							vec![address!("6666666666666666666666666666666666666666")],
+							vec![address!("6666666666666666666666666666666666666666").into()],
 						),
 					]),
 				},
@@ -4260,7 +4386,7 @@ mod tests {
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "TEST".to_string(),
 						name: None,
-						address: address!("1111111111111111111111111111111111111111"),
+						address: address!("1111111111111111111111111111111111111111").into(),
 						decimals: 18,
 					}],
 					rpc_urls: None,
@@ -4278,7 +4404,7 @@ mod tests {
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
-						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6").into(),
 						decimals: 6,
 					}],
 					rpc_urls: None,
@@ -4344,7 +4470,7 @@ mod tests {
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
-						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705"),
+						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705").into(),
 						decimals: 6,
 					}],
 					rpc_urls: None,
@@ -4455,7 +4581,7 @@ mod tests {
 				tokens: vec![solver_types::seed_overrides::Token {
 					symbol: "USDC".to_string(),
 					name: None,
-					address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+					address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6").into(),
 					decimals: 6,
 				}],
 				rpc_urls: None,
@@ -4533,7 +4659,7 @@ mod tests {
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
-						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6").into(),
 						decimals: 6,
 					}],
 					rpc_urls: None,
@@ -4551,7 +4677,7 @@ mod tests {
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
-						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705"),
+						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705").into(),
 						decimals: 6,
 					}],
 					rpc_urls: None,
@@ -4767,7 +4893,7 @@ mod tests {
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
-						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6").into(),
 						decimals: 6,
 					}],
 					rpc_urls: None,
@@ -4785,7 +4911,7 @@ mod tests {
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "DAI".to_string(),
 						name: None,
-						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6").into(),
 						decimals: 18,
 					}],
 					rpc_urls: None,
@@ -4839,7 +4965,7 @@ mod tests {
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
-						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6").into(),
 						decimals: 6,
 					}],
 					rpc_urls: None,
@@ -4857,7 +4983,7 @@ mod tests {
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
-						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705"),
+						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705").into(),
 						decimals: 6,
 					}],
 					rpc_urls: None,
@@ -4936,7 +5062,7 @@ mod tests {
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
-						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6").into(),
 						decimals: 6,
 					}],
 					rpc_urls: None,
@@ -4954,7 +5080,7 @@ mod tests {
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
-						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705"),
+						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705").into(),
 						decimals: 6,
 					}],
 					rpc_urls: None,
@@ -5008,7 +5134,7 @@ mod tests {
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: Some("USD Coin".to_string()),
-						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6").into(),
 						decimals: 6,
 					}],
 					rpc_urls: None,
@@ -5026,7 +5152,7 @@ mod tests {
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: Some("USD Coin".to_string()),
-						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705"),
+						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705").into(),
 						decimals: 6,
 					}],
 					rpc_urls: None,
@@ -5086,7 +5212,7 @@ mod tests {
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "TEST".to_string(),
 						name: None,
-						address: address!("1111111111111111111111111111111111111111"),
+						address: address!("1111111111111111111111111111111111111111").into(),
 						decimals: 18,
 					}],
 					rpc_urls: None,
@@ -5104,7 +5230,7 @@ mod tests {
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
-						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6").into(),
 						decimals: 6,
 					}],
 					rpc_urls: None,
@@ -5158,7 +5284,7 @@ mod tests {
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
-						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6").into(),
 						decimals: 6,
 					}],
 					rpc_urls: None,
@@ -5175,12 +5301,12 @@ mod tests {
 					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.custom-l2.example".to_string()]),
-					input_settler_address: Some(address!(
-						"1000000000000000000000000000000000000001"
-					)),
-					output_settler_address: Some(address!(
-						"2000000000000000000000000000000000000002"
-					)),
+					input_settler_address: Some(
+						address!("1000000000000000000000000000000000000001").into(),
+					),
+					output_settler_address: Some(
+						address!("2000000000000000000000000000000000000002").into(),
+					),
 					input_settler_compact_address: None,
 					the_compact_address: None,
 					allocator_address: None,
@@ -5193,21 +5319,21 @@ mod tests {
 					mailboxes: HashMap::from([
 						(
 							11155420,
-							address!("3000000000000000000000000000000000000003"),
+							address!("3000000000000000000000000000000000000003").into(),
 						),
 						(
 							non_seed_chain_id,
-							address!("4000000000000000000000000000000000000004"),
+							address!("4000000000000000000000000000000000000004").into(),
 						),
 					]),
 					igp_addresses: HashMap::from([
 						(
 							11155420,
-							address!("5000000000000000000000000000000000000005"),
+							address!("5000000000000000000000000000000000000005").into(),
 						),
 						(
 							non_seed_chain_id,
-							address!("6000000000000000000000000000000000000006"),
+							address!("6000000000000000000000000000000000000006").into(),
 						),
 					]),
 					domains: HashMap::from([(11155420, 11155420), (non_seed_chain_id, 654321)]),
@@ -5216,21 +5342,21 @@ mod tests {
 						input: HashMap::from([
 							(
 								11155420,
-								vec![address!("7000000000000000000000000000000000000007")],
+								vec![address!("7000000000000000000000000000000000000007").into()],
 							),
 							(
 								non_seed_chain_id,
-								vec![address!("8000000000000000000000000000000000000008")],
+								vec![address!("8000000000000000000000000000000000000008").into()],
 							),
 						]),
 						output: HashMap::from([
 							(
 								11155420,
-								vec![address!("7000000000000000000000000000000000000007")],
+								vec![address!("7000000000000000000000000000000000000007").into()],
 							),
 							(
 								non_seed_chain_id,
-								vec![address!("8000000000000000000000000000000000000008")],
+								vec![address!("8000000000000000000000000000000000000008").into()],
 							),
 						]),
 					},
@@ -5271,7 +5397,7 @@ mod tests {
 		assert_eq!(non_seeded.name, "custom-l2");
 		assert_eq!(
 			non_seeded.input_settler_address,
-			address!("1000000000000000000000000000000000000001")
+			address!("1000000000000000000000000000000000000001").into()
 		);
 		assert_eq!(
 			op_config.settlement.settlement_type,
@@ -5301,12 +5427,12 @@ mod tests {
 					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-a.example".to_string()]),
-					input_settler_address: Some(address!(
-						"1111111111111111111111111111111111111111"
-					)),
-					output_settler_address: Some(address!(
-						"2222222222222222222222222222222222222222"
-					)),
+					input_settler_address: Some(
+						address!("1111111111111111111111111111111111111111").into(),
+					),
+					output_settler_address: Some(
+						address!("2222222222222222222222222222222222222222").into(),
+					),
 					input_settler_compact_address: None,
 					the_compact_address: None,
 					allocator_address: None,
@@ -5318,12 +5444,12 @@ mod tests {
 					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-b.example".to_string()]),
-					input_settler_address: Some(address!(
-						"3333333333333333333333333333333333333333"
-					)),
-					output_settler_address: Some(address!(
-						"4444444444444444444444444444444444444444"
-					)),
+					input_settler_address: Some(
+						address!("3333333333333333333333333333333333333333").into(),
+					),
+					output_settler_address: Some(
+						address!("4444444444444444444444444444444444444444").into(),
+					),
 					input_settler_compact_address: None,
 					the_compact_address: None,
 					allocator_address: None,
@@ -5336,21 +5462,21 @@ mod tests {
 					mailboxes: HashMap::from([
 						(
 							chain_a,
-							address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+							address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").into(),
 						),
 						(
 							chain_b,
-							address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+							address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").into(),
 						),
 					]),
 					igp_addresses: HashMap::from([
 						(
 							chain_a,
-							address!("cccccccccccccccccccccccccccccccccccccccc"),
+							address!("cccccccccccccccccccccccccccccccccccccccc").into(),
 						),
 						(
 							chain_b,
-							address!("dddddddddddddddddddddddddddddddddddddddd"),
+							address!("dddddddddddddddddddddddddddddddddddddddd").into(),
 						),
 					]),
 					domains: HashMap::from([(chain_a, 1001), (chain_b, 1002)]),
@@ -5359,21 +5485,21 @@ mod tests {
 						input: HashMap::from([
 							(
 								chain_a,
-								vec![address!("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")],
+								vec![address!("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").into()],
 							),
 							(
 								chain_b,
-								vec![address!("ffffffffffffffffffffffffffffffffffffffff")],
+								vec![address!("ffffffffffffffffffffffffffffffffffffffff").into()],
 							),
 						]),
 						output: HashMap::from([
 							(
 								chain_a,
-								vec![address!("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")],
+								vec![address!("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").into()],
 							),
 							(
 								chain_b,
-								vec![address!("ffffffffffffffffffffffffffffffffffffffff")],
+								vec![address!("ffffffffffffffffffffffffffffffffffffffff").into()],
 							),
 						]),
 					},
@@ -5438,9 +5564,9 @@ mod tests {
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-a.example".to_string()]),
 					input_settler_address: None,
-					output_settler_address: Some(address!(
-						"2222222222222222222222222222222222222222"
-					)),
+					output_settler_address: Some(
+						address!("2222222222222222222222222222222222222222").into(),
+					),
 					input_settler_compact_address: None,
 					the_compact_address: None,
 					allocator_address: None,
@@ -5452,12 +5578,12 @@ mod tests {
 					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-b.example".to_string()]),
-					input_settler_address: Some(address!(
-						"3333333333333333333333333333333333333333"
-					)),
-					output_settler_address: Some(address!(
-						"4444444444444444444444444444444444444444"
-					)),
+					input_settler_address: Some(
+						address!("3333333333333333333333333333333333333333").into(),
+					),
+					output_settler_address: Some(
+						address!("4444444444444444444444444444444444444444").into(),
+					),
 					input_settler_compact_address: None,
 					the_compact_address: None,
 					allocator_address: None,
@@ -5505,12 +5631,12 @@ mod tests {
 					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-a.example".to_string()]),
-					input_settler_address: Some(address!(
-						"1111111111111111111111111111111111111111"
-					)),
-					output_settler_address: Some(address!(
-						"2222222222222222222222222222222222222222"
-					)),
+					input_settler_address: Some(
+						address!("1111111111111111111111111111111111111111").into(),
+					),
+					output_settler_address: Some(
+						address!("2222222222222222222222222222222222222222").into(),
+					),
 					input_settler_compact_address: None,
 					the_compact_address: None,
 					allocator_address: None,
@@ -5522,12 +5648,12 @@ mod tests {
 					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-b.example".to_string()]),
-					input_settler_address: Some(address!(
-						"3333333333333333333333333333333333333333"
-					)),
-					output_settler_address: Some(address!(
-						"4444444444444444444444444444444444444444"
-					)),
+					input_settler_address: Some(
+						address!("3333333333333333333333333333333333333333").into(),
+					),
+					output_settler_address: Some(
+						address!("4444444444444444444444444444444444444444").into(),
+					),
 					input_settler_compact_address: None,
 					the_compact_address: None,
 					allocator_address: None,
@@ -5577,12 +5703,12 @@ mod tests {
 					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-a.example".to_string()]),
-					input_settler_address: Some(address!(
-						"1111111111111111111111111111111111111111"
-					)),
-					output_settler_address: Some(address!(
-						"2222222222222222222222222222222222222222"
-					)),
+					input_settler_address: Some(
+						address!("1111111111111111111111111111111111111111").into(),
+					),
+					output_settler_address: Some(
+						address!("2222222222222222222222222222222222222222").into(),
+					),
 					input_settler_compact_address: None,
 					the_compact_address: None,
 					allocator_address: None,
@@ -5594,12 +5720,12 @@ mod tests {
 					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-b.example".to_string()]),
-					input_settler_address: Some(address!(
-						"3333333333333333333333333333333333333333"
-					)),
-					output_settler_address: Some(address!(
-						"4444444444444444444444444444444444444444"
-					)),
+					input_settler_address: Some(
+						address!("3333333333333333333333333333333333333333").into(),
+					),
+					output_settler_address: Some(
+						address!("4444444444444444444444444444444444444444").into(),
+					),
 					input_settler_compact_address: None,
 					the_compact_address: None,
 					allocator_address: None,
@@ -5614,21 +5740,21 @@ mod tests {
 						input: HashMap::from([
 							(
 								chain_a,
-								vec![address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")],
+								vec![address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").into()],
 							),
 							(
 								chain_b,
-								vec![address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")],
+								vec![address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").into()],
 							),
 						]),
 						output: HashMap::from([
 							(
 								chain_a,
-								vec![address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")],
+								vec![address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").into()],
 							),
 							(
 								chain_b,
-								vec![address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")],
+								vec![address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").into()],
 							),
 						]),
 					},
@@ -5684,12 +5810,12 @@ mod tests {
 					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-a.example".to_string()]),
-					input_settler_address: Some(address!(
-						"1111111111111111111111111111111111111111"
-					)),
-					output_settler_address: Some(address!(
-						"2222222222222222222222222222222222222222"
-					)),
+					input_settler_address: Some(
+						address!("1111111111111111111111111111111111111111").into(),
+					),
+					output_settler_address: Some(
+						address!("2222222222222222222222222222222222222222").into(),
+					),
 					input_settler_compact_address: None,
 					the_compact_address: None,
 					allocator_address: None,
@@ -5701,12 +5827,12 @@ mod tests {
 					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-b.example".to_string()]),
-					input_settler_address: Some(address!(
-						"3333333333333333333333333333333333333333"
-					)),
-					output_settler_address: Some(address!(
-						"4444444444444444444444444444444444444444"
-					)),
+					input_settler_address: Some(
+						address!("3333333333333333333333333333333333333333").into(),
+					),
+					output_settler_address: Some(
+						address!("4444444444444444444444444444444444444444").into(),
+					),
 					input_settler_compact_address: None,
 					the_compact_address: None,
 					allocator_address: None,
@@ -5721,11 +5847,11 @@ mod tests {
 					oracles: solver_types::OracleOverrides {
 						input: HashMap::from([(
 							chain_a,
-							vec![address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")],
+							vec![address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").into()],
 						)]),
 						output: HashMap::from([(
 							chain_b,
-							vec![address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")],
+							vec![address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").into()],
 						)]),
 					},
 					routes: HashMap::from([(chain_a, vec![chain_b])]),
@@ -5806,12 +5932,12 @@ mod tests {
 					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-a.example".to_string()]),
-					input_settler_address: Some(address!(
-						"1111111111111111111111111111111111111111"
-					)),
-					output_settler_address: Some(address!(
-						"2222222222222222222222222222222222222222"
-					)),
+					input_settler_address: Some(
+						address!("1111111111111111111111111111111111111111").into(),
+					),
+					output_settler_address: Some(
+						address!("2222222222222222222222222222222222222222").into(),
+					),
 					input_settler_compact_address: None,
 					the_compact_address: None,
 					allocator_address: None,
@@ -5823,12 +5949,12 @@ mod tests {
 					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-b.example".to_string()]),
-					input_settler_address: Some(address!(
-						"3333333333333333333333333333333333333333"
-					)),
-					output_settler_address: Some(address!(
-						"4444444444444444444444444444444444444444"
-					)),
+					input_settler_address: Some(
+						address!("3333333333333333333333333333333333333333").into(),
+					),
+					output_settler_address: Some(
+						address!("4444444444444444444444444444444444444444").into(),
+					),
 					input_settler_compact_address: None,
 					the_compact_address: None,
 					allocator_address: None,
@@ -5844,21 +5970,21 @@ mod tests {
 					mailboxes: HashMap::from([
 						(
 							chain_a,
-							address!("5555555555555555555555555555555555555555"),
+							address!("5555555555555555555555555555555555555555").into(),
 						),
 						(
 							chain_b,
-							address!("6666666666666666666666666666666666666666"),
+							address!("6666666666666666666666666666666666666666").into(),
 						),
 					]),
 					igp_addresses: HashMap::from([
 						(
 							chain_a,
-							address!("7777777777777777777777777777777777777777"),
+							address!("7777777777777777777777777777777777777777").into(),
 						),
 						(
 							chain_b,
-							address!("8888888888888888888888888888888888888888"),
+							address!("8888888888888888888888888888888888888888").into(),
 						),
 					]),
 					domains: HashMap::from([(chain_a, chain_a as u32), (chain_b, chain_b as u32)]),
@@ -5867,21 +5993,21 @@ mod tests {
 						input: HashMap::from([
 							(
 								chain_a,
-								vec![address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")],
+								vec![address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").into()],
 							),
 							(
 								chain_b,
-								vec![address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")],
+								vec![address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").into()],
 							),
 						]),
 						output: HashMap::from([
 							(
 								chain_a,
-								vec![address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")],
+								vec![address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").into()],
 							),
 							(
 								chain_b,
-								vec![address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")],
+								vec![address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").into()],
 							),
 						]),
 					},
@@ -5896,11 +6022,11 @@ mod tests {
 					oracles: solver_types::OracleOverrides {
 						input: HashMap::from([(
 							chain_a,
-							vec![address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")],
+							vec![address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").into()],
 						)]),
 						output: HashMap::from([(
 							chain_b,
-							vec![address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")],
+							vec![address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").into()],
 						)]),
 					},
 					routes: HashMap::from([(chain_a, vec![chain_b])]),
@@ -5987,12 +6113,12 @@ mod tests {
 					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-a.example".to_string()]),
-					input_settler_address: Some(address!(
-						"1111111111111111111111111111111111111111"
-					)),
-					output_settler_address: Some(address!(
-						"2222222222222222222222222222222222222222"
-					)),
+					input_settler_address: Some(
+						address!("1111111111111111111111111111111111111111").into(),
+					),
+					output_settler_address: Some(
+						address!("2222222222222222222222222222222222222222").into(),
+					),
 					input_settler_compact_address: None,
 					the_compact_address: None,
 					allocator_address: None,
@@ -6004,12 +6130,12 @@ mod tests {
 					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-b.example".to_string()]),
-					input_settler_address: Some(address!(
-						"3333333333333333333333333333333333333333"
-					)),
-					output_settler_address: Some(address!(
-						"4444444444444444444444444444444444444444"
-					)),
+					input_settler_address: Some(
+						address!("3333333333333333333333333333333333333333").into(),
+					),
+					output_settler_address: Some(
+						address!("4444444444444444444444444444444444444444").into(),
+					),
 					input_settler_compact_address: None,
 					the_compact_address: None,
 					allocator_address: None,
@@ -6025,21 +6151,21 @@ mod tests {
 					mailboxes: HashMap::from([
 						(
 							chain_a,
-							address!("5555555555555555555555555555555555555555"),
+							address!("5555555555555555555555555555555555555555").into(),
 						),
 						(
 							chain_b,
-							address!("6666666666666666666666666666666666666666"),
+							address!("6666666666666666666666666666666666666666").into(),
 						),
 					]),
 					igp_addresses: HashMap::from([
 						(
 							chain_a,
-							address!("7777777777777777777777777777777777777777"),
+							address!("7777777777777777777777777777777777777777").into(),
 						),
 						(
 							chain_b,
-							address!("8888888888888888888888888888888888888888"),
+							address!("8888888888888888888888888888888888888888").into(),
 						),
 					]),
 					domains: HashMap::from([(chain_a, chain_a as u32), (chain_b, chain_b as u32)]),
@@ -6048,21 +6174,21 @@ mod tests {
 						input: HashMap::from([
 							(
 								chain_a,
-								vec![address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")],
+								vec![address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").into()],
 							),
 							(
 								chain_b,
-								vec![address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")],
+								vec![address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").into()],
 							),
 						]),
 						output: HashMap::from([
 							(
 								chain_a,
-								vec![address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")],
+								vec![address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").into()],
 							),
 							(
 								chain_b,
-								vec![address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")],
+								vec![address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").into()],
 							),
 						]),
 					},
@@ -6118,12 +6244,12 @@ mod tests {
 					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-a.example".to_string()]),
-					input_settler_address: Some(address!(
-						"1111111111111111111111111111111111111111"
-					)),
-					output_settler_address: Some(address!(
-						"2222222222222222222222222222222222222222"
-					)),
+					input_settler_address: Some(
+						address!("1111111111111111111111111111111111111111").into(),
+					),
+					output_settler_address: Some(
+						address!("2222222222222222222222222222222222222222").into(),
+					),
 					input_settler_compact_address: None,
 					the_compact_address: None,
 					allocator_address: None,
@@ -6135,12 +6261,12 @@ mod tests {
 					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-b.example".to_string()]),
-					input_settler_address: Some(address!(
-						"3333333333333333333333333333333333333333"
-					)),
-					output_settler_address: Some(address!(
-						"4444444444444444444444444444444444444444"
-					)),
+					input_settler_address: Some(
+						address!("3333333333333333333333333333333333333333").into(),
+					),
+					output_settler_address: Some(
+						address!("4444444444444444444444444444444444444444").into(),
+					),
 					input_settler_compact_address: None,
 					the_compact_address: None,
 					allocator_address: None,
@@ -6155,11 +6281,11 @@ mod tests {
 					oracles: solver_types::OracleOverrides {
 						input: HashMap::from([(
 							chain_a,
-							vec![address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")],
+							vec![address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").into()],
 						)]),
 						output: HashMap::from([(
 							chain_b,
-							vec![address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")],
+							vec![address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").into()],
 						)]),
 					},
 					routes: HashMap::from([(chain_a, vec![chain_b])]),
@@ -6229,12 +6355,12 @@ mod tests {
 					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-a.example".to_string()]),
-					input_settler_address: Some(address!(
-						"1111111111111111111111111111111111111111"
-					)),
-					output_settler_address: Some(address!(
-						"2222222222222222222222222222222222222222"
-					)),
+					input_settler_address: Some(
+						address!("1111111111111111111111111111111111111111").into(),
+					),
+					output_settler_address: Some(
+						address!("2222222222222222222222222222222222222222").into(),
+					),
 					input_settler_compact_address: None,
 					the_compact_address: None,
 					allocator_address: None,
@@ -6246,12 +6372,12 @@ mod tests {
 					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-b.example".to_string()]),
-					input_settler_address: Some(address!(
-						"3333333333333333333333333333333333333333"
-					)),
-					output_settler_address: Some(address!(
-						"4444444444444444444444444444444444444444"
-					)),
+					input_settler_address: Some(
+						address!("3333333333333333333333333333333333333333").into(),
+					),
+					output_settler_address: Some(
+						address!("4444444444444444444444444444444444444444").into(),
+					),
 					input_settler_compact_address: None,
 					the_compact_address: None,
 					allocator_address: None,
@@ -6264,21 +6390,21 @@ mod tests {
 					mailboxes: HashMap::from([
 						(
 							chain_a,
-							address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+							address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").into(),
 						),
 						(
 							chain_b,
-							address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+							address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").into(),
 						),
 					]),
 					igp_addresses: HashMap::from([
 						(
 							chain_a,
-							address!("cccccccccccccccccccccccccccccccccccccccc"),
+							address!("cccccccccccccccccccccccccccccccccccccccc").into(),
 						),
 						(
 							chain_b,
-							address!("dddddddddddddddddddddddddddddddddddddddd"),
+							address!("dddddddddddddddddddddddddddddddddddddddd").into(),
 						),
 					]),
 					domains: HashMap::from([(chain_a, chain_a as u32), (chain_b, chain_b as u32)]),
@@ -6287,21 +6413,21 @@ mod tests {
 						input: HashMap::from([
 							(
 								chain_a,
-								vec![address!("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")],
+								vec![address!("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").into()],
 							),
 							(
 								chain_b,
-								vec![address!("ffffffffffffffffffffffffffffffffffffffff")],
+								vec![address!("ffffffffffffffffffffffffffffffffffffffff").into()],
 							),
 						]),
 						output: HashMap::from([
 							(
 								chain_a,
-								vec![address!("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")],
+								vec![address!("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").into()],
 							),
 							(
 								chain_b,
-								vec![address!("ffffffffffffffffffffffffffffffffffffffff")],
+								vec![address!("ffffffffffffffffffffffffffffffffffffffff").into()],
 							),
 						]),
 					},
@@ -6374,21 +6500,21 @@ mod tests {
 					input: HashMap::from([
 						(
 							11155420,
-							vec![address!("7100000000000000000000000000000000000007")],
+							vec![address!("7100000000000000000000000000000000000007").into()],
 						),
 						(
 							84532,
-							vec![address!("8200000000000000000000000000000000000008")],
+							vec![address!("8200000000000000000000000000000000000008").into()],
 						),
 					]),
 					output: HashMap::from([
 						(
 							11155420,
-							vec![address!("7100000000000000000000000000000000000007")],
+							vec![address!("7100000000000000000000000000000000000007").into()],
 						),
 						(
 							84532,
-							vec![address!("8200000000000000000000000000000000000008")],
+							vec![address!("8200000000000000000000000000000000000008").into()],
 						),
 					]),
 				},
@@ -6449,7 +6575,7 @@ mod tests {
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
-						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6").into(),
 						decimals: 6,
 					}],
 					rpc_urls: None,
@@ -6467,7 +6593,7 @@ mod tests {
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "DAI".to_string(),
 						name: None,
-						address: address!("1111111111111111111111111111111111111111"),
+						address: address!("1111111111111111111111111111111111111111").into(),
 						decimals: 18,
 					}],
 					rpc_urls: None,
@@ -6520,7 +6646,7 @@ mod tests {
 				tokens: vec![solver_types::seed_overrides::Token {
 					symbol: "USDC".to_string(),
 					name: None,
-					address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+					address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6").into(),
 					decimals: 6,
 				}],
 				rpc_urls: None,
@@ -6586,7 +6712,7 @@ mod tests {
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
-						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705"),
+						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705").into(),
 						decimals: 6,
 					}],
 					rpc_urls: None,
@@ -6698,7 +6824,7 @@ mod tests {
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
-						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6").into(),
 						decimals: 6,
 					}],
 					rpc_urls: None,
@@ -6716,7 +6842,7 @@ mod tests {
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
-						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705"),
+						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705").into(),
 						decimals: 6,
 					}],
 					rpc_urls: None,
@@ -6863,16 +6989,22 @@ mod tests {
 				mailboxes: HashMap::from([
 					(
 						11155420,
-						address!("3000000000000000000000000000000000000003"),
+						address!("3000000000000000000000000000000000000003").into(),
 					),
-					(84532, address!("4000000000000000000000000000000000000004")),
+					(
+						84532,
+						address!("4000000000000000000000000000000000000004").into(),
+					),
 				]),
 				igp_addresses: HashMap::from([
 					(
 						11155420,
-						address!("5000000000000000000000000000000000000005"),
+						address!("5000000000000000000000000000000000000005").into(),
 					),
-					(84532, address!("6000000000000000000000000000000000000006")),
+					(
+						84532,
+						address!("6000000000000000000000000000000000000006").into(),
+					),
 				]),
 				domains: HashMap::new(),
 				starknet_fee_token_addresses: HashMap::new(),
@@ -6880,21 +7012,21 @@ mod tests {
 					input: HashMap::from([
 						(
 							11155420,
-							vec![address!("7000000000000000000000000000000000000007")],
+							vec![address!("7000000000000000000000000000000000000007").into()],
 						),
 						(
 							84532,
-							vec![address!("8000000000000000000000000000000000000008")],
+							vec![address!("8000000000000000000000000000000000000008").into()],
 						),
 					]),
 					output: HashMap::from([
 						(
 							11155420,
-							vec![address!("7000000000000000000000000000000000000007")],
+							vec![address!("7000000000000000000000000000000000000007").into()],
 						),
 						(
 							84532,
-							vec![address!("8000000000000000000000000000000000000008")],
+							vec![address!("8000000000000000000000000000000000000008").into()],
 						),
 					]),
 				},
@@ -6984,6 +7116,141 @@ mod tests {
 				.get(&11155420)
 				.map(String::as_str),
 			Some(fee_token)
+		);
+	}
+
+	#[test]
+	fn seedless_bootstrap_preserves_starknet_32_byte_addresses() {
+		let bootstrap = serde_json::json!({
+			"solver_id": "test-ethereum-starknet-mainnet",
+			"networks": [
+				{
+					"chain_id": 1,
+					"name": "ethereum",
+					"type": "parent",
+					"kind": "evm",
+					"tokens": [{
+						"symbol": "STRK",
+						"name": "Starknet Token",
+						"address": "0xca14007eff0db1f8135f4c25b34de49ab0d42766",
+						"decimals": 18
+					}],
+					"rpc_urls": ["https://ethereum.example"],
+					"input_settler_address": "0xd1519b8eA6B0571aEe55D6A8c055220d9C7f386C",
+					"output_settler_address": "0xd1519b8eA6B0571aEe55D6A8c055220d9C7f386C"
+				},
+				{
+					"chain_id": 358974494,
+					"name": "starknet",
+					"type": "new",
+					"kind": "starknet",
+					"tokens": [{
+						"symbol": "ETH",
+						"name": "Ether",
+						"address": "0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7",
+						"decimals": 18
+					}],
+					"rpc_urls": ["https://starknet.example"],
+					"input_settler_address": "0x2361657076c480fece1dbd9f8b03921f25d7d629fc110f6154d22ac27806ba2",
+					"output_settler_address": "0x2361657076c480fece1dbd9f8b03921f25d7d629fc110f6154d22ac27806ba2"
+				}
+			],
+			"settlement": {
+				"type": "hyperlane",
+				"priority": ["hyperlane"],
+				"hyperlane": {
+					"mailboxes": {
+						"1": "0xc005dc82818d67AF737725bD4bf75435d065D239",
+						"358974494": "0x05520a179658bd81e19d4e41abce2bc397bab5af302dadea70d8918c3cbdcea8"
+					},
+					"igp_addresses": {
+						"1": "0x9e6B1022bE9BBF5aFd152483DAD9b88911bC8611",
+						"358974494": "0x2361657076c480fece1dbd9f8b03921f25d7d629fc110f6154d22ac27806ba2"
+					},
+					"domains": {
+						"1": 1,
+						"358974494": 358974494
+					},
+					"starknet_fee_token_addresses": {
+						"358974494": "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d"
+					},
+					"oracles": {
+						"input": {
+							"1": ["0xd1519b8eA6B0571aEe55D6A8c055220d9C7f386C"],
+							"358974494": ["0x2361657076c480fece1dbd9f8b03921f25d7d629fc110f6154d22ac27806ba2"]
+						},
+						"output": {
+							"1": ["0xd1519b8eA6B0571aEe55D6A8c055220d9C7f386C"],
+							"358974494": ["0x2361657076c480fece1dbd9f8b03921f25d7d629fc110f6154d22ac27806ba2"]
+						}
+					},
+					"routes": {
+						"1": [358974494],
+						"358974494": [1]
+					}
+				}
+			}
+		});
+
+		let overrides: SeedOverrides = serde_json::from_value(bootstrap).unwrap();
+		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
+		let starknet = op_config.networks.get(&358974494).unwrap();
+		assert!(starknet.input_settler_address.is_bytes32_address());
+		assert!(starknet.tokens[0].address.is_bytes32_address());
+
+		let runtime = build_runtime_config(&op_config).unwrap();
+		let runtime_starknet = runtime.networks.get(&358974494).unwrap();
+		assert!(runtime_starknet.input_settler_address.is_bytes32_address());
+		assert!(runtime_starknet.tokens[0].address.is_bytes32_address());
+		assert_eq!(
+			runtime_starknet.input_settler_address.0.len(),
+			solver_types::Address::BYTES32_LENGTH
+		);
+
+		let hyperlane = runtime.settlement.implementations.get("hyperlane").unwrap();
+		assert_eq!(
+			hyperlane
+				.get("mailboxes")
+				.and_then(|mailboxes| mailboxes.get("358974494"))
+				.and_then(|address| address.as_str())
+				.unwrap()
+				.trim_start_matches("0x")
+				.len(),
+			64
+		);
+
+		let evm_onchain = runtime
+			.discovery
+			.implementations
+			.get("onchain_eip7683")
+			.unwrap();
+		assert_eq!(
+			evm_onchain
+				.get("network_ids")
+				.and_then(|value| value.as_array()),
+			Some(&vec![int(1)])
+		);
+		let evm_offchain = runtime
+			.discovery
+			.implementations
+			.get("offchain_eip7683")
+			.unwrap();
+		assert_eq!(
+			evm_offchain
+				.get("network_ids")
+				.and_then(|value| value.as_array()),
+			Some(&vec![int(1)])
+		);
+		let starknet_onchain = runtime
+			.discovery
+			.implementations
+			.get("onchain_starknet_hyperlane7683")
+			.unwrap();
+		assert_eq!(
+			starknet_onchain
+				.get("network_ids")
+				.and_then(|value| value.as_array()),
+			Some(&vec![int(358974494)])
 		);
 	}
 
@@ -7081,8 +7348,8 @@ mod tests {
 				kind: NetworkKind::Evm,
 				tokens: vec![],
 				rpc_urls: vec![],
-				input_settler_address: address!("0000000000000000000000000000000000000001"),
-				output_settler_address: address!("0000000000000000000000000000000000000002"),
+				input_settler_address: address!("0000000000000000000000000000000000000001").into(),
+				output_settler_address: address!("0000000000000000000000000000000000000002").into(),
 				input_settler_compact_address: None,
 				the_compact_address: None,
 				allocator_address: None,
@@ -7373,10 +7640,12 @@ mod tests {
 						},
 						tokens: Vec::new(),
 						rpc_urls: Vec::new(),
-						input_settler_address: address!("1111111111111111111111111111111111111111"),
+						input_settler_address: address!("1111111111111111111111111111111111111111")
+							.into(),
 						output_settler_address: address!(
 							"2222222222222222222222222222222222222222"
-						),
+						)
+						.into(),
 						input_settler_compact_address: None,
 						the_compact_address: None,
 						allocator_address: None,
@@ -7389,7 +7658,8 @@ mod tests {
 	#[test]
 	fn test_build_delivery_config_from_operator() {
 		let chain_ids = vec![1, 10, 137];
-		let delivery = build_delivery_config_from_operator(&delivery_networks(&chain_ids), None);
+		let delivery =
+			build_delivery_config_from_operator(&delivery_networks(&chain_ids), None, None);
 
 		assert!(delivery.implementations.contains_key("evm_alloy"));
 		let evm_config = delivery.implementations.get("evm_alloy").unwrap();
@@ -7465,6 +7735,7 @@ mod tests {
 		let delivery = build_delivery_config_from_operator(
 			&delivery_networks_with_starknet(&chain_ids, &[11155111]),
 			None,
+			None,
 		);
 
 		let evm = delivery.implementations.get("evm_alloy").unwrap();
@@ -7489,10 +7760,52 @@ mod tests {
 	}
 
 	#[test]
+	fn build_delivery_config_routes_mixed_signers_by_network_kind() {
+		let chain_ids = vec![1, 358974494];
+		let account_config = OperatorAccountConfig {
+			primary: "local".to_string(),
+			implementations: HashMap::from([
+				("local".to_string(), serde_json::json!({})),
+				("starknet_local".to_string(), serde_json::json!({})),
+			]),
+		};
+		let delivery = build_delivery_config_from_operator(
+			&delivery_networks_with_starknet(&chain_ids, &[358974494]),
+			Some(&account_config),
+			None,
+		);
+
+		let evm_accounts = delivery
+			.implementations
+			.get("evm_alloy")
+			.and_then(|config| config.get("accounts"))
+			.and_then(|value| value.as_object())
+			.expect("EVM delivery should include account routing");
+		assert_eq!(
+			evm_accounts.get("1").and_then(|value| value.as_str()),
+			Some("local")
+		);
+
+		let starknet_accounts = delivery
+			.implementations
+			.get("starknet")
+			.and_then(|config| config.get("accounts"))
+			.and_then(|value| value.as_object())
+			.expect("Starknet delivery should include account routing");
+		assert_eq!(
+			starknet_accounts
+				.get("358974494")
+				.and_then(|value| value.as_str()),
+			Some("starknet_local")
+		);
+	}
+
+	#[test]
 	fn test_build_delivery_config_emits_public_starknet_chain_ids() {
 		let chain_ids = vec![23448591, 358974494];
 		let delivery = build_delivery_config_from_operator(
 			&delivery_networks_with_starknet(&chain_ids, &chain_ids),
+			None,
 			None,
 		);
 
@@ -7512,9 +7825,64 @@ mod tests {
 	}
 
 	#[test]
+	#[serial]
+	fn account_config_expands_env_placeholders() {
+		let _private_key = EnvVarGuard::capture("TEST_SOLVER_PRIVATE_KEY");
+		let _starknet_private_key = EnvVarGuard::capture("TEST_STARKNET_PRIVATE_KEY");
+		let _starknet_address = EnvVarGuard::capture("TEST_STARKNET_ADDRESS");
+		std::env::set_var("TEST_SOLVER_PRIVATE_KEY", "  0xabc  ");
+		std::env::set_var("TEST_STARKNET_PRIVATE_KEY", "0x123");
+		std::env::set_var("TEST_STARKNET_ADDRESS", "0x456");
+
+		let account_config = OperatorAccountConfig {
+			primary: "local".to_string(),
+			implementations: HashMap::from([
+				(
+					"local".to_string(),
+					serde_json::json!({ "private_key": "${TEST_SOLVER_PRIVATE_KEY}" }),
+				),
+				(
+					"starknet_local".to_string(),
+					serde_json::json!({
+						"private_key": "${TEST_STARKNET_PRIVATE_KEY}",
+						"account_address": "${TEST_STARKNET_ADDRESS}"
+					}),
+				),
+			]),
+		};
+
+		let runtime = build_account_config_from_operator(Some(&account_config));
+		assert_eq!(
+			runtime
+				.implementations
+				.get("local")
+				.and_then(|config| config.get("private_key"))
+				.and_then(|value| value.as_str()),
+			Some("0xabc")
+		);
+		assert_eq!(
+			runtime
+				.implementations
+				.get("starknet_local")
+				.and_then(|config| config.get("private_key"))
+				.and_then(|value| value.as_str()),
+			Some("0x123")
+		);
+		assert_eq!(
+			runtime
+				.implementations
+				.get("starknet_local")
+				.and_then(|config| config.get("account_address"))
+				.and_then(|value| value.as_str()),
+			Some("0x456")
+		);
+	}
+
+	#[test]
 	fn test_build_delivery_config_defaults_extra_native_fee_for_known_op_stack_chains() {
 		let chain_ids = vec![10, 8453, 11155420, 84532, 747474, 1, 137, 42161];
-		let delivery = build_delivery_config_from_operator(&delivery_networks(&chain_ids), None);
+		let delivery =
+			build_delivery_config_from_operator(&delivery_networks(&chain_ids), None, None);
 		let evm = delivery.implementations.get("evm_alloy").unwrap();
 		let chains = evm
 			.get("fee_policy")
@@ -7582,8 +7950,11 @@ mod tests {
 		};
 
 		let chain_ids = vec![1, 10, 747474];
-		let delivery =
-			build_delivery_config_from_operator(&delivery_networks(&chain_ids), Some(&override_));
+		let delivery = build_delivery_config_from_operator(
+			&delivery_networks(&chain_ids),
+			None,
+			Some(&override_),
+		);
 		let evm = delivery.implementations.get("evm_alloy").unwrap();
 		let fee_policy = evm.get("fee_policy").unwrap();
 
@@ -7659,12 +8030,15 @@ mod tests {
 
 	#[test]
 	fn test_build_discovery_config_from_operator() {
-		let chain_ids = vec![1, 10];
 		let op_config = merge_to_operator_config(test_seed_overrides(), &TESTNET_SEED).unwrap();
+		let chain_ids = op_config.chain_ids();
 		let discovery = build_discovery_config_from_operator(&op_config, &chain_ids).unwrap();
 
 		assert!(discovery.implementations.contains_key("onchain_eip7683"));
 		assert!(discovery.implementations.contains_key("offchain_eip7683"));
+		assert!(!discovery
+			.implementations
+			.contains_key("onchain_starknet_hyperlane7683"));
 
 		let onchain = discovery.implementations.get("onchain_eip7683").unwrap();
 		assert!(onchain.get("polling_interval_secs").is_some());
@@ -7740,11 +8114,15 @@ mod tests {
 		let mut overrides = test_seed_overrides();
 		let chain_a = 11155420;
 		let chain_b = 84532;
-		let oracle = address!("1111111111111111111111111111111111111111");
+		let oracle: solver_types::Address =
+			address!("1111111111111111111111111111111111111111").into();
 		let routes = HashMap::from([(chain_a, vec![chain_b]), (chain_b, vec![chain_a])]);
 		let oracles = solver_types::seed_overrides::OracleOverrides {
-			input: HashMap::from([(chain_a, vec![oracle]), (chain_b, vec![oracle])]),
-			output: HashMap::from([(chain_a, vec![oracle]), (chain_b, vec![oracle])]),
+			input: HashMap::from([
+				(chain_a, vec![oracle.clone()]),
+				(chain_b, vec![oracle.clone()]),
+			]),
+			output: HashMap::from([(chain_a, vec![oracle.clone()]), (chain_b, vec![oracle])]),
 		};
 		overrides.settlement = Some(solver_types::seed_overrides::SettlementOverride {
 			settlement_type: solver_types::seed_overrides::SettlementTypeOverride::Direct,
@@ -8267,7 +8645,7 @@ mod tests {
 			tokens: vec![solver_types::seed_overrides::Token {
 				symbol: "USDC".to_string(),
 				name: None,
-				address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+				address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6").into(),
 				decimals: 6,
 			}],
 			rpc_urls: Some(vec![]),
@@ -8503,7 +8881,7 @@ mod tests {
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
-						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6"),
+						address: address!("191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6").into(),
 						decimals: 6,
 					}],
 					rpc_urls: None,
@@ -8521,7 +8899,7 @@ mod tests {
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
-						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705"),
+						address: address!("73c83DAcc74bB8a704717AC09703b959E74b9705").into(),
 						decimals: 6,
 					}],
 					rpc_urls: None,

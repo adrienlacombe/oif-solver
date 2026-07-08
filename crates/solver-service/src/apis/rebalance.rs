@@ -992,10 +992,12 @@ mod tests {
 						)],
 						input_settler_address: alloy_address(
 							"0x1111111111111111111111111111111111111111",
-						),
+						)
+						.into(),
 						output_settler_address: alloy_address(
 							"0x2222222222222222222222222222222222222222",
-						),
+						)
+						.into(),
 						input_settler_compact_address: None,
 						the_compact_address: None,
 						allocator_address: None,
@@ -1014,10 +1016,12 @@ mod tests {
 						)],
 						input_settler_address: alloy_address(
 							"0x3333333333333333333333333333333333333333",
-						),
+						)
+						.into(),
 						output_settler_address: alloy_address(
 							"0x4444444444444444444444444444444444444444",
-						),
+						)
+						.into(),
 						input_settler_compact_address: None,
 						the_compact_address: None,
 						allocator_address: None,

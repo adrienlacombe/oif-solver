@@ -278,16 +278,12 @@ pub async fn handle_get_config(
 					.map(|t| AdminTokenResponse {
 						symbol: t.symbol.clone(),
 						name: t.name.clone(),
-						address: with_0x_prefix(&hex::encode(t.address.as_slice())),
+						address: with_0x_prefix(&hex::encode(&t.address.0)),
 						decimals: t.decimals,
 					})
 					.collect(),
-				input_settler: with_0x_prefix(&hex::encode(
-					network.input_settler_address.as_slice(),
-				)),
-				output_settler: with_0x_prefix(&hex::encode(
-					network.output_settler_address.as_slice(),
-				)),
+				input_settler: with_0x_prefix(&hex::encode(&network.input_settler_address.0)),
+				output_settler: with_0x_prefix(&hex::encode(&network.output_settler_address.0)),
 			}
 		})
 		.collect();
@@ -733,7 +729,8 @@ fn validate_and_apply_token_additions(
 			.ok_or_else(|| {
 				AdminAuthError::InvalidMessage(format!("Network {} not found", addition.chain_id))
 			})?;
-		if network.has_token(&addition.token_address) {
+		let token_address = solver_types::Address::from(addition.token_address);
+		if network.has_token(&token_address) {
 			return Err(AdminAuthError::InvalidMessage(format!(
 				"Token {} already exists on chain {}",
 				addition.symbol, addition.chain_id
@@ -756,7 +753,7 @@ fn validate_and_apply_token_additions(
 					.clone()
 					.unwrap_or_else(|| addition.symbol.clone()),
 			),
-			address: addition.token_address,
+			address: addition.token_address.into(),
 			decimals: addition.decimals,
 		});
 	}
@@ -1121,9 +1118,8 @@ pub async fn handle_remove_token(
 
 	// 4. Find and remove the token
 	let initial_len = network.tokens.len();
-	network
-		.tokens
-		.retain(|t| t.address != contents.token_address);
+	let token_address = solver_types::Address::from(contents.token_address);
+	network.tokens.retain(|t| t.address != token_address);
 
 	if network.tokens.len() == initial_len {
 		return Err(AdminAuthError::InvalidMessage(format!(
@@ -2064,8 +2060,10 @@ mod tests {
 					http: "http://localhost:8545".to_string(),
 					ws: None,
 				}],
-				input_settler_address: alloy_address("0x1111111111111111111111111111111111111111"),
-				output_settler_address: alloy_address("0x2222222222222222222222222222222222222222"),
+				input_settler_address: solver_address("0x1111111111111111111111111111111111111111"),
+				output_settler_address: solver_address(
+					"0x2222222222222222222222222222222222222222",
+				),
 				input_settler_compact_address: None,
 				the_compact_address: None,
 				allocator_address: None,
@@ -2083,8 +2081,10 @@ mod tests {
 					http: "http://localhost:8546".to_string(),
 					ws: None,
 				}],
-				input_settler_address: alloy_address("0x3333333333333333333333333333333333333333"),
-				output_settler_address: alloy_address("0x4444444444444444444444444444444444444444"),
+				input_settler_address: solver_address("0x3333333333333333333333333333333333333333"),
+				output_settler_address: solver_address(
+					"0x4444444444444444444444444444444444444444",
+				),
 				input_settler_compact_address: None,
 				the_compact_address: None,
 				allocator_address: None,
@@ -2160,8 +2160,10 @@ mod tests {
 					http: "http://localhost:8545".to_string(),
 					ws: None,
 				}],
-				input_settler_address: alloy_address("0x1111111111111111111111111111111111111111"),
-				output_settler_address: alloy_address("0x2222222222222222222222222222222222222222"),
+				input_settler_address: solver_address("0x1111111111111111111111111111111111111111"),
+				output_settler_address: solver_address(
+					"0x2222222222222222222222222222222222222222",
+				),
 				input_settler_compact_address: None,
 				the_compact_address: None,
 				allocator_address: None,
@@ -2179,8 +2181,10 @@ mod tests {
 					http: "http://localhost:8546".to_string(),
 					ws: None,
 				}],
-				input_settler_address: alloy_address("0x3333333333333333333333333333333333333333"),
-				output_settler_address: alloy_address("0x4444444444444444444444444444444444444444"),
+				input_settler_address: solver_address("0x3333333333333333333333333333333333333333"),
+				output_settler_address: solver_address(
+					"0x4444444444444444444444444444444444444444",
+				),
 				input_settler_compact_address: None,
 				the_compact_address: None,
 				allocator_address: None,
@@ -2268,8 +2272,10 @@ mod tests {
 					http: "http://localhost:8545".to_string(),
 					ws: None,
 				}],
-				input_settler_address: alloy_address("0x1111111111111111111111111111111111111111"),
-				output_settler_address: alloy_address("0x2222222222222222222222222222222222222222"),
+				input_settler_address: solver_address("0x1111111111111111111111111111111111111111"),
+				output_settler_address: solver_address(
+					"0x2222222222222222222222222222222222222222",
+				),
 				input_settler_compact_address: None,
 				the_compact_address: None,
 				allocator_address: None,
@@ -2287,8 +2293,10 @@ mod tests {
 					http: "http://localhost:8546".to_string(),
 					ws: None,
 				}],
-				input_settler_address: alloy_address("0x3333333333333333333333333333333333333333"),
-				output_settler_address: alloy_address("0x4444444444444444444444444444444444444444"),
+				input_settler_address: solver_address("0x3333333333333333333333333333333333333333"),
+				output_settler_address: solver_address(
+					"0x4444444444444444444444444444444444444444",
+				),
 				input_settler_compact_address: None,
 				the_compact_address: None,
 				allocator_address: None,
@@ -2378,8 +2386,10 @@ mod tests {
 					http: "http://localhost:8545".to_string(),
 					ws: None,
 				}],
-				input_settler_address: alloy_address("0x1111111111111111111111111111111111111111"),
-				output_settler_address: alloy_address("0x2222222222222222222222222222222222222222"),
+				input_settler_address: solver_address("0x1111111111111111111111111111111111111111"),
+				output_settler_address: solver_address(
+					"0x2222222222222222222222222222222222222222",
+				),
 				input_settler_compact_address: None,
 				the_compact_address: None,
 				allocator_address: None,
@@ -2397,8 +2407,10 @@ mod tests {
 					http: "http://localhost:8546".to_string(),
 					ws: None,
 				}],
-				input_settler_address: alloy_address("0x3333333333333333333333333333333333333333"),
-				output_settler_address: alloy_address("0x4444444444444444444444444444444444444444"),
+				input_settler_address: solver_address("0x3333333333333333333333333333333333333333"),
+				output_settler_address: solver_address(
+					"0x4444444444444444444444444444444444444444",
+				),
 				input_settler_compact_address: None,
 				the_compact_address: None,
 				allocator_address: None,
@@ -2487,8 +2499,10 @@ mod tests {
 					http: "http://localhost:8545".to_string(),
 					ws: None,
 				}],
-				input_settler_address: alloy_address("0x1111111111111111111111111111111111111111"),
-				output_settler_address: alloy_address("0x2222222222222222222222222222222222222222"),
+				input_settler_address: solver_address("0x1111111111111111111111111111111111111111"),
+				output_settler_address: solver_address(
+					"0x2222222222222222222222222222222222222222",
+				),
 				input_settler_compact_address: None,
 				the_compact_address: None,
 				allocator_address: None,
@@ -2545,8 +2559,10 @@ mod tests {
 					http: "http://localhost:8545".to_string(),
 					ws: None,
 				}],
-				input_settler_address: alloy_address("0x1111111111111111111111111111111111111111"),
-				output_settler_address: alloy_address("0x2222222222222222222222222222222222222222"),
+				input_settler_address: solver_address("0x1111111111111111111111111111111111111111"),
+				output_settler_address: solver_address(
+					"0x2222222222222222222222222222222222222222",
+				),
 				input_settler_compact_address: None,
 				the_compact_address: None,
 				allocator_address: None,
@@ -2617,8 +2633,10 @@ mod tests {
 					http: "http://localhost:8545".to_string(),
 					ws: None,
 				}],
-				input_settler_address: alloy_address("0x1111111111111111111111111111111111111111"),
-				output_settler_address: alloy_address("0x2222222222222222222222222222222222222222"),
+				input_settler_address: solver_address("0x1111111111111111111111111111111111111111"),
+				output_settler_address: solver_address(
+					"0x2222222222222222222222222222222222222222",
+				),
 				input_settler_compact_address: None,
 				the_compact_address: None,
 				allocator_address: None,
@@ -2885,8 +2903,10 @@ mod tests {
 					http: "http://localhost:8545".to_string(),
 					ws: None,
 				}],
-				input_settler_address: alloy_address("0x1111111111111111111111111111111111111111"),
-				output_settler_address: alloy_address("0x2222222222222222222222222222222222222222"),
+				input_settler_address: solver_address("0x1111111111111111111111111111111111111111"),
+				output_settler_address: solver_address(
+					"0x2222222222222222222222222222222222222222",
+				),
 				input_settler_compact_address: None,
 				the_compact_address: None,
 				allocator_address: None,
@@ -2904,8 +2924,10 @@ mod tests {
 					http: "http://localhost:8546".to_string(),
 					ws: None,
 				}],
-				input_settler_address: alloy_address("0x3333333333333333333333333333333333333333"),
-				output_settler_address: alloy_address("0x4444444444444444444444444444444444444444"),
+				input_settler_address: solver_address("0x3333333333333333333333333333333333333333"),
+				output_settler_address: solver_address(
+					"0x4444444444444444444444444444444444444444",
+				),
 				input_settler_compact_address: None,
 				the_compact_address: None,
 				allocator_address: None,
@@ -3038,8 +3060,10 @@ mod tests {
 					http: "http://localhost:8545".to_string(),
 					ws: None,
 				}],
-				input_settler_address: alloy_address("0x1111111111111111111111111111111111111111"),
-				output_settler_address: alloy_address("0x2222222222222222222222222222222222222222"),
+				input_settler_address: solver_address("0x1111111111111111111111111111111111111111"),
+				output_settler_address: solver_address(
+					"0x2222222222222222222222222222222222222222",
+				),
 				input_settler_compact_address: None,
 				the_compact_address: None,
 				allocator_address: None,
@@ -3057,8 +3081,10 @@ mod tests {
 					http: "http://localhost:8546".to_string(),
 					ws: None,
 				}],
-				input_settler_address: alloy_address("0x3333333333333333333333333333333333333333"),
-				output_settler_address: alloy_address("0x4444444444444444444444444444444444444444"),
+				input_settler_address: solver_address("0x3333333333333333333333333333333333333333"),
+				output_settler_address: solver_address(
+					"0x4444444444444444444444444444444444444444",
+				),
 				input_settler_compact_address: None,
 				the_compact_address: None,
 				allocator_address: None,

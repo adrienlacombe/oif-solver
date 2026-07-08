@@ -36,6 +36,7 @@
 
 use crate::auth::AdminWhitelistEntry;
 use crate::networks::{NetworkKind, NetworkType};
+use crate::Address as SolverAddress;
 use alloy_primitives::{Address, B256};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -274,11 +275,11 @@ pub struct SettlementOverride {
 pub struct OracleOverrides {
 	/// Input oracle addresses by chain ID.
 	#[serde(default)]
-	pub input: HashMap<u64, Vec<Address>>,
+	pub input: HashMap<u64, Vec<SolverAddress>>,
 
 	/// Output oracle addresses by chain ID.
 	#[serde(default)]
-	pub output: HashMap<u64, Vec<Address>>,
+	pub output: HashMap<u64, Vec<SolverAddress>>,
 }
 
 /// Hyperlane settlement override payload.
@@ -286,11 +287,11 @@ pub struct OracleOverrides {
 pub struct HyperlaneSettlementOverride {
 	/// Mailbox addresses by chain ID.
 	#[serde(default)]
-	pub mailboxes: HashMap<u64, Address>,
+	pub mailboxes: HashMap<u64, SolverAddress>,
 
 	/// IGP addresses by chain ID.
 	#[serde(default)]
-	pub igp_addresses: HashMap<u64, Address>,
+	pub igp_addresses: HashMap<u64, SolverAddress>,
 
 	/// Hyperlane domains by canonical chain ID.
 	#[serde(default)]
@@ -575,11 +576,11 @@ pub struct NetworkOverride {
 
 	/// Optional input settler override.
 	#[serde(default)]
-	pub input_settler_address: Option<Address>,
+	pub input_settler_address: Option<SolverAddress>,
 
 	/// Optional output settler override.
 	#[serde(default)]
-	pub output_settler_address: Option<Address>,
+	pub output_settler_address: Option<SolverAddress>,
 
 	/// Optional compact input settler override.
 	#[serde(default)]
@@ -605,7 +606,7 @@ pub struct Token {
 	pub name: Option<String>,
 
 	/// Token contract address on this network.
-	pub address: Address,
+	pub address: SolverAddress,
 
 	/// Number of decimals for this token (e.g., 6 for USDC, 18 for ETH).
 	pub decimals: u8,
@@ -668,8 +669,8 @@ mod tests {
 	use rust_decimal::Decimal;
 	use std::str::FromStr;
 
-	fn test_address() -> Address {
-		Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap()
+	fn test_address() -> SolverAddress {
+		serde_json::from_str("\"0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85\"").unwrap()
 	}
 
 	#[test]

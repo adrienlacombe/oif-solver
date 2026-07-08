@@ -25,8 +25,8 @@ use solver_delivery::{
 	DeliveryService, TransactionAttemptRecorder, TransactionMonitoringEvent, TransactionTracking,
 };
 use solver_types::{
-	with_0x_prefix, Address, NetworksConfig, TokenConfig, Transaction, TransactionHash,
-	TransactionType,
+	with_0x_prefix, Address, NetworkKind, NetworksConfig, TokenConfig, Transaction,
+	TransactionHash, TransactionType,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -82,6 +82,10 @@ pub struct TokenManager {
 }
 
 impl TokenManager {
+	fn is_zero_address(address: &Address) -> bool {
+		address.0.iter().all(|byte| *byte == 0)
+	}
+
 	/// Creates a new `TokenManager` instance.
 	///
 	/// # Arguments
@@ -230,9 +234,18 @@ impl TokenManager {
 
 		let networks = self.networks.read().await;
 		for (chain_id, network) in networks.iter() {
+			if network.kind != NetworkKind::Evm {
+				tracing::debug!(
+					chain_id,
+					kind = ?network.kind,
+					"Skipping ERC20 approval setup for non-EVM network"
+				);
+				continue;
+			}
+
 			for token in &network.tokens {
 				// Process input settler if not zero address
-				if network.input_settler_address.0 != [0u8; 20] {
+				if !Self::is_zero_address(&network.input_settler_address) {
 					// Check allowance for input settler
 					let current_allowance_input = self
 						.delivery
@@ -261,7 +274,7 @@ impl TokenManager {
 				}
 
 				// Process output settler if not zero address
-				if network.output_settler_address.0 != [0u8; 20] {
+				if !Self::is_zero_address(&network.output_settler_address) {
 					// Check allowance for output settler
 					let current_allowance_output = self
 						.delivery
@@ -314,34 +327,47 @@ impl TokenManager {
 		spender: Address,
 		amount: U256,
 	) -> Result<(usize, Vec<u64>), TokenManagerError> {
-		let networks = self.networks.read().await;
 		let mut approved_count = 0usize;
 		let mut chains_processed = Vec::new();
+		let approval_targets = {
+			let networks = self.networks.read().await;
+			let mut targets = Vec::new();
 
-		for (cid, network) in networks.iter() {
-			// Skip if chain filter is set and doesn't match
-			if let Some(filter_chain) = chain_id {
-				if *cid != filter_chain {
-					continue;
-				}
-			}
-
-			chains_processed.push(*cid);
-
-			for token in &network.tokens {
-				// Skip if token filter is set and doesn't match
-				if let Some(ref filter_token) = token_address {
-					if token.address != *filter_token {
+			for (cid, network) in networks.iter() {
+				// Skip if chain filter is set and doesn't match
+				if let Some(filter_chain) = chain_id {
+					if *cid != filter_chain {
 						continue;
 					}
 				}
 
-				if self
-					.ensure_token_approval(*cid, &token.address, &spender, amount)
-					.await?
-				{
-					approved_count += 1;
+				if network.kind != NetworkKind::Evm {
+					continue;
 				}
+
+				chains_processed.push(*cid);
+
+				for token in &network.tokens {
+					// Skip if token filter is set and doesn't match
+					if let Some(ref filter_token) = token_address {
+						if token.address != *filter_token {
+							continue;
+						}
+					}
+
+					targets.push((*cid, token.address.clone()));
+				}
+			}
+
+			targets
+		};
+
+		for (cid, token) in approval_targets {
+			if self
+				.ensure_token_approval(cid, &token, &spender, amount)
+				.await?
+			{
+				approved_count += 1;
 			}
 		}
 
@@ -361,6 +387,22 @@ impl TokenManager {
 		spender: &Address,
 		amount: U256,
 	) -> Result<bool, TokenManagerError> {
+		let networks = self.networks.read().await;
+		let network = networks
+			.get(&chain_id)
+			.ok_or(TokenManagerError::NetworkNotConfigured(chain_id))?;
+		if network.kind != NetworkKind::Evm {
+			tracing::debug!(
+				chain_id,
+				kind = ?network.kind,
+				token = %with_0x_prefix(&hex::encode(&token_address.0)),
+				spender = %with_0x_prefix(&hex::encode(&spender.0)),
+				"Skipping ERC20 token approval for non-EVM network"
+			);
+			return Ok(false);
+		}
+		drop(networks);
+
 		let solver_address = self.account.get_address().await?;
 		let solver_address_str = with_0x_prefix(&hex::encode(&solver_address.0));
 
@@ -703,6 +745,7 @@ mod tests {
 	use solver_types::{
 		parse_address,
 		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder, TokenConfigBuilder},
+		NetworkKind,
 	};
 	use std::collections::HashMap;
 
@@ -1003,6 +1046,80 @@ mod tests {
 
 		let result = token_manager.ensure_approvals().await;
 		assert!(result.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_ensure_approvals_skips_non_evm_networks() {
+		let max_allowance = U256::MAX.to_string();
+		let mut networks = NetworksConfig::new();
+		networks.insert(
+			1,
+			solver_types::NetworkConfig {
+				name: Some("ethereum".to_string()),
+				network_type: solver_types::NetworkType::New,
+				kind: NetworkKind::Evm,
+				rpc_urls: vec![],
+				input_settler_address: parse_address("0x1111111111111111111111111111111111111111")
+					.unwrap(),
+				output_settler_address: parse_address("0x2222222222222222222222222222222222222222")
+					.unwrap(),
+				tokens: vec![TokenConfig {
+					address: parse_address("0x5555555555555555555555555555555555555555").unwrap(),
+					symbol: "USDC".to_string(),
+					name: Some("USD Coin".to_string()),
+					decimals: 6,
+				}],
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+		networks.insert(
+			358974494,
+			solver_types::NetworkConfig {
+				name: Some("starknet".to_string()),
+				network_type: solver_types::NetworkType::New,
+				kind: NetworkKind::Starknet,
+				rpc_urls: vec![],
+				input_settler_address: Address(vec![0x11; 32]),
+				output_settler_address: Address(vec![0x22; 32]),
+				tokens: vec![TokenConfig {
+					address: Address(vec![0x33; 32]),
+					symbol: "STRK".to_string(),
+					name: Some("Starknet Token".to_string()),
+					decimals: 18,
+				}],
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_get_allowance()
+			.times(2)
+			.returning(move |_, _, _, chain_id| {
+				assert_eq!(chain_id, 1);
+				let max_allowance = max_allowance.clone();
+				Box::pin(async move { Ok(max_allowance) })
+			});
+		mock_delivery.expect_submit().times(0);
+		mock_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let mut implementations = HashMap::new();
+		implementations.insert(
+			1,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+		let delivery = Arc::new(DeliveryService::new(implementations, 1, 20, 60));
+
+		let account = create_mock_account_service();
+		let token_manager = TokenManager::new(networks, delivery, account);
+
+		token_manager.ensure_approvals().await.unwrap();
 	}
 
 	#[tokio::test]

@@ -4,14 +4,12 @@
 //! from JSON config files, used by all settlement implementations.
 
 use crate::{OracleConfig, OracleSelectionStrategy, SettlementError};
-use alloy_primitives::{FixedBytes, B256, U256};
+use alloy_primitives::{hex, FixedBytes, B256, U256};
 use alloy_provider::{DynProvider, Provider};
 use alloy_sol_types::{sol, SolCall};
 use serde::{de::DeserializeOwned, Serialize};
 use solver_storage::{StorageError, StorageService};
-use solver_types::{
-	create_http_provider, utils::parse_address, Address, NetworksConfig, ProviderError, StorageKey,
-};
+use solver_types::{create_http_provider, Address, NetworksConfig, ProviderError, StorageKey};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,7 +58,7 @@ pub fn parse_oracle_table(
 								))
 							})
 							.and_then(|s| {
-								parse_address(s).map_err(|e| {
+								parse_config_address(s).map_err(|e| {
 									SettlementError::ValidationFailed(format!(
 										"Invalid oracle address for chain {chain_id}: {e}"
 									))
@@ -222,7 +220,7 @@ pub fn parse_address_table(
 				))
 			})?;
 
-			let address = parse_address(address_str).map_err(|e| {
+			let address = parse_config_address(address_str).map_err(|e| {
 				SettlementError::ValidationFailed(format!(
 					"Invalid address for chain {chain_id}: {e}"
 				))
@@ -233,6 +231,30 @@ pub fn parse_address_table(
 	}
 
 	Ok(result)
+}
+
+fn parse_config_address(hex_str: &str) -> Result<Address, String> {
+	let clean = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+	if clean.is_empty() {
+		return Err("Address cannot be empty".to_string());
+	}
+	let padded = match clean.len() {
+		len if len <= Address::EVM_LENGTH * 2 => format!("{clean:0>40}"),
+		len if len <= Address::BYTES32_LENGTH * 2 => format!("{clean:0>64}"),
+		len => {
+			return Err(format!(
+				"Invalid address length: expected up to 32 bytes, got {len} hex characters"
+			));
+		},
+	};
+	let bytes = hex::decode(padded).map_err(|e| format!("Invalid hex: {e}"))?;
+	if !matches!(bytes.len(), Address::EVM_LENGTH | Address::BYTES32_LENGTH) {
+		return Err(format!(
+			"Invalid address length: expected 20 or 32 bytes, got {}",
+			bytes.len()
+		));
+	}
+	Ok(Address(bytes))
 }
 
 /// Parse a table mapping chain IDs to bytes32 values.
@@ -447,7 +469,7 @@ fn validate_routes(
 mod tests {
 	use super::*;
 	use async_trait::async_trait;
-	use solver_types::ConfigSchema;
+	use solver_types::{parse_address, ConfigSchema};
 
 	#[derive(Clone, Copy)]
 	enum FailingStorageMode {
@@ -690,6 +712,20 @@ mod tests {
 			result[&2][0],
 			parse_address("0x3333333333333333333333333333333333333333").unwrap()
 		);
+	}
+
+	#[test]
+	fn test_parse_oracle_table_preserves_short_starknet_address_as_bytes32() {
+		let config = serde_json::json!({
+			"358974494": [
+				"0x2361657076c480fece1dbd9f8b03921f25d7d629fc110f6154d22ac27806ba2"
+			]
+		});
+
+		let result = parse_oracle_table(&config).unwrap();
+		let address = &result[&358974494][0];
+		assert!(address.is_bytes32_address());
+		assert_eq!(address.0.len(), Address::BYTES32_LENGTH);
 	}
 
 	#[test]

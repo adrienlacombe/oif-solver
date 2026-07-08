@@ -28,6 +28,7 @@
 use crate::{
 	auth::{normalize_admin_whitelist, upsert_admin_role, AdminRole, AdminWhitelistEntry},
 	networks::{NetworkKind, NetworkType},
+	Address as SolverAddress,
 };
 use alloy_primitives::{Address, B256};
 use rust_decimal::Decimal;
@@ -141,10 +142,10 @@ pub struct OperatorNetworkConfig {
 	pub rpc_urls: Vec<OperatorRpcEndpoint>,
 
 	/// Input settler contract address (permit2/EIP-3009 escrow).
-	pub input_settler_address: Address,
+	pub input_settler_address: SolverAddress,
 
 	/// Output settler contract address.
-	pub output_settler_address: Address,
+	pub output_settler_address: SolverAddress,
 
 	/// Input settler address for compact/resource-lock flow.
 	pub input_settler_compact_address: Option<Address>,
@@ -171,7 +172,7 @@ pub struct OperatorToken {
 	pub name: Option<String>,
 
 	/// Token contract address.
-	pub address: Address,
+	pub address: SolverAddress,
 
 	/// Number of decimals (e.g., 6 for USDC, 18 for ETH).
 	pub decimals: u8,
@@ -257,10 +258,10 @@ pub struct OperatorHyperlaneConfig {
 	pub finalization_required: bool,
 
 	/// Mailbox contract address per chain.
-	pub mailboxes: HashMap<u64, Address>,
+	pub mailboxes: HashMap<u64, SolverAddress>,
 
 	/// IGP (Interchain Gas Paymaster) address per chain.
-	pub igp_addresses: HashMap<u64, Address>,
+	pub igp_addresses: HashMap<u64, SolverAddress>,
 
 	/// Hyperlane domain per canonical chain ID.
 	#[serde(default)]
@@ -288,10 +289,10 @@ pub struct OperatorHyperlaneConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperatorOracleConfig {
 	/// Input oracle addresses per chain.
-	pub input: HashMap<u64, Vec<Address>>,
+	pub input: HashMap<u64, Vec<SolverAddress>>,
 
 	/// Output oracle addresses per chain.
-	pub output: HashMap<u64, Vec<Address>>,
+	pub output: HashMap<u64, Vec<SolverAddress>>,
 }
 
 /// Oracle selection strategy for direct settlement.
@@ -848,12 +849,12 @@ impl OperatorNetworkConfig {
 	}
 
 	/// Find a token by address.
-	pub fn get_token_by_address(&self, address: &Address) -> Option<&OperatorToken> {
+	pub fn get_token_by_address(&self, address: &SolverAddress) -> Option<&OperatorToken> {
 		self.tokens.iter().find(|t| &t.address == address)
 	}
 
 	/// Check if a token exists by address.
-	pub fn has_token(&self, address: &Address) -> bool {
+	pub fn has_token(&self, address: &SolverAddress) -> bool {
 		self.tokens.iter().any(|t| &t.address == address)
 	}
 
@@ -988,8 +989,8 @@ mod tests {
 		Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap()
 	}
 
-	fn test_token_address() -> Address {
-		Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap()
+	fn test_token_address() -> SolverAddress {
+		serde_json::from_str("\"0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85\"").unwrap()
 	}
 
 	#[test]
@@ -999,7 +1000,9 @@ mod tests {
 			recipient_allowlist: vec![],
 		};
 		assert!(policy.recipient_allowed(&test_address()));
-		assert!(policy.recipient_allowed(&test_token_address()));
+		assert!(policy.recipient_allowed(
+			&Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap()
+		));
 	}
 
 	#[test]
@@ -1010,7 +1013,9 @@ mod tests {
 			recipient_allowlist: vec![approved],
 		};
 		assert!(policy.recipient_allowed(&approved));
-		assert!(!policy.recipient_allowed(&test_token_address()));
+		assert!(!policy.recipient_allowed(
+			&Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap()
+		));
 	}
 
 	#[test]
@@ -1082,15 +1087,15 @@ mod tests {
 				OperatorToken {
 					symbol: "WETH".to_string(),
 					name: Some("Wrapped Ether".to_string()),
-					address: test_address(),
+					address: test_address().into(),
 					decimals: 18,
 				},
 			],
 			rpc_urls: vec![OperatorRpcEndpoint::http_only(
 				"https://rpc.example.com".to_string(),
 			)],
-			input_settler_address: test_address(),
-			output_settler_address: test_address(),
+			input_settler_address: test_address().into(),
+			output_settler_address: test_address().into(),
 			input_settler_compact_address: None,
 			the_compact_address: None,
 			allocator_address: None,
@@ -1100,8 +1105,11 @@ mod tests {
 		assert!(network.get_token_by_symbol("DAI").is_none());
 
 		assert!(network.has_token(&test_token_address()));
-		assert!(!network
-			.has_token(&Address::from_str("0x1111111111111111111111111111111111111111").unwrap()));
+		assert!(!network.has_token(
+			&Address::from_str("0x1111111111111111111111111111111111111111")
+				.unwrap()
+				.into()
+		));
 
 		assert_eq!(network.get_http_url(), Some("https://rpc.example.com"));
 		assert_eq!(network.get_ws_url(), None);
@@ -1144,8 +1152,8 @@ mod tests {
 						rpc_urls: vec![OperatorRpcEndpoint::http_only(
 							"https://rpc.example.com".to_string(),
 						)],
-						input_settler_address: test_address(),
-						output_settler_address: test_address(),
+						input_settler_address: test_address().into(),
+						output_settler_address: test_address().into(),
 						input_settler_compact_address: Some(test_address()),
 						the_compact_address: Some(test_address()),
 						allocator_address: Some(test_address()),

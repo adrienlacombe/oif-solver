@@ -68,7 +68,19 @@ impl<'de> Deserialize<'de> for Address {
 	{
 		let s = String::deserialize(deserializer)?;
 		let hex_str = s.trim_start_matches("0x");
-		let bytes = hex::decode(hex_str)
+		if hex_str.is_empty() {
+			return Err(serde::de::Error::custom("Address cannot be empty"));
+		}
+		let padded_hex = match hex_str.len() {
+			len if len <= Address::EVM_LENGTH * 2 => format!("{hex_str:0>40}"),
+			len if len <= Address::BYTES32_LENGTH * 2 => format!("{hex_str:0>64}"),
+			len => {
+				return Err(serde::de::Error::custom(format!(
+					"Invalid address length: expected up to 32 bytes, got {len} hex characters"
+				)));
+			},
+		};
+		let bytes = hex::decode(&padded_hex)
 			.map_err(|e| serde::de::Error::custom(format!("Invalid hex address: {e}")))?;
 
 		// Accept 20-byte EVM addresses and 32-byte cross-chain/Starknet addresses.
@@ -501,18 +513,22 @@ mod tests {
 	}
 
 	#[test]
-	fn test_address_deserialization_invalid_length() {
-		// Too short (19 bytes)
-		let too_short = "\"0xa0b86a33e6776fb78b3e1e6b2d0d2e8f0c1d2a\"";
-		let result: Result<Address, _> = serde_json::from_str(too_short);
-		assert!(result.is_err());
-		assert!(result
-			.unwrap_err()
-			.to_string()
-			.contains("Invalid address length"));
+	fn test_address_deserialization_pads_short_hex() {
+		let short_evm = "\"0xa0b86a33e6776fb78b3e1e6b2d0d2e8f0c1d2a\"";
+		let address: Address = serde_json::from_str(short_evm).unwrap();
+		assert!(address.is_evm_address());
+		assert_eq!(address.0[0], 0);
 
-		// Too long (21 bytes)
-		let too_long = "\"0xa0b86a33e6776fb78b3e1e6b2d0d2e8f0c1d2a3bff\"";
+		let short_starknet =
+			"\"0x2361657076c480fece1dbd9f8b03921f25d7d629fc110f6154d22ac27806ba2\"";
+		let address: Address = serde_json::from_str(short_starknet).unwrap();
+		assert!(address.is_bytes32_address());
+		assert_eq!(address.0.len(), Address::BYTES32_LENGTH);
+	}
+
+	#[test]
+	fn test_address_deserialization_invalid_length() {
+		let too_long = "\"0x123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef000\"";
 		let result: Result<Address, _> = serde_json::from_str(too_long);
 		assert!(result.is_err());
 		assert!(result
