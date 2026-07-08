@@ -39,7 +39,7 @@ alloy-network = "1.0.37"
 alloy-primitives = "1.0.37"
 alloy-provider = "1.0.37"
 alloy-rpc-client = "1.0.37"
-alloy-rpc-types = "1.0.37"
+alloy-rpc-types = { version = "1.0.37", default-features = false, features = ["eth"] }
 alloy-signer = "1.0.37"
 alloy-signer-aws = "1.0.37"
 alloy-signer-local = "1.0.37"
@@ -54,7 +54,10 @@ async-trait = "0.1"
 # AWS dependencies (for KMS signer)
 # Minimum versions that fix CVE GHSA-g59m-gf8j-gjf5 (region validation flaw)
 aws-config = "1.8"
-aws-sdk-kms = "1.93"
+aws-sdk-kms = { version = "1.93", default-features = false, features = [
+	"default-https-client",
+	"rt-tokio",
+] }
 axum = "0.8.4"
 backoff = { version = "0.4", features = ["tokio"] }
 bytes = "1.8"
