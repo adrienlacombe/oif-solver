@@ -26,8 +26,8 @@ use solver_storage::{
 };
 use solver_types::{
 	networks::RpcEndpoint, utils::tests::builders::OrderBuilder, validation::ValidationError,
-	with_0x_prefix, Address, ChainSettlerInfo, ConfigSchema, NetworkConfig, NetworkType,
-	NetworksConfig, Order, OrderStatus, TransactionHash, TransactionReceipt,
+	with_0x_prefix, Address, ChainSettlerInfo, ConfigSchema, NetworkConfig, NetworkKind,
+	NetworkType, NetworksConfig, Order, OrderStatus, TransactionHash, TransactionReceipt,
 };
 
 use solver_e2e_tests::{
@@ -115,6 +115,7 @@ fn network_config(input_settler: AlloyAddress, output_settler: AlloyAddress) -> 
 	NetworkConfig {
 		name: None,
 		network_type: NetworkType::default(),
+		kind: NetworkKind::Evm,
 		rpc_urls: Vec::<RpcEndpoint>::new(),
 		input_settler_address: Address(input_settler.as_slice().to_vec()),
 		output_settler_address: Address(output_settler.as_slice().to_vec()),

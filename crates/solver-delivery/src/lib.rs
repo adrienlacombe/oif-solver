@@ -4,14 +4,14 @@
 //! It provides abstractions for different delivery mechanisms across multiple
 //! blockchain networks, managing transaction signing, submission, and confirmation.
 
-use alloy_primitives::Bytes;
+use alloy_primitives::{Bytes, U256};
 use alloy_rpc_types::BlockNumberOrTag;
 use async_trait::async_trait;
 use solver_types::events::TransactionType;
 use solver_types::{
-	Address, ChainData, ConfigSchema, ImplementationRegistry, Log, LogFilter, NetworksConfig,
-	Transaction, TransactionAttempt, TransactionAttemptScope, TransactionAttemptStatus,
-	TransactionHash, TransactionReceipt,
+	Address, ChainData, ConfigSchema, ExecutionTransaction, Hyperlane7683OrderStatus,
+	ImplementationRegistry, Log, LogFilter, NetworksConfig, Transaction, TransactionAttempt,
+	TransactionAttemptScope, TransactionAttemptStatus, TransactionHash, TransactionReceipt,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,6 +25,7 @@ pub mod implementations {
 		pub mod nonce;
 		pub mod op_stack;
 	}
+	pub mod starknet;
 }
 
 pub mod compact;
@@ -62,7 +63,7 @@ mod transaction_attempt_recorder_tests {
 				scope: TransactionAttemptScope::order("order-1"),
 				signer: Some(Address(vec![9; 20])),
 				tx_type: TransactionType::Fill,
-				tx: sample_tx(),
+				tx: sample_tx().into(),
 				attempt_id_override: None,
 				replacement_of: None,
 			})
@@ -101,7 +102,7 @@ mod transaction_attempt_recorder_tests {
 				scope: TransactionAttemptScope::order("order-1"),
 				signer: Some(Address(vec![9; 20])),
 				tx_type: TransactionType::Fill,
-				tx: sample_tx(),
+				tx: sample_tx().into(),
 				attempt_id_override: None,
 				replacement_of: None,
 			})
@@ -210,7 +211,7 @@ pub struct PlannedAttemptInit {
 	pub scope: TransactionAttemptScope,
 	pub signer: Option<Address>,
 	pub tx_type: TransactionType,
-	pub tx: Transaction,
+	pub tx: ExecutionTransaction,
 	/// When `Some`, the recorder uses this id verbatim; when `None`,
 	/// the recorder generates a fresh id (default behavior).
 	pub attempt_id_override: Option<String>,
@@ -276,6 +277,7 @@ impl TransactionAttemptRecorder for NoopTransactionAttemptRecorder {
 pub enum FeeModel {
 	Legacy,
 	Eip1559,
+	StarknetFixed,
 }
 
 /// Speed target for EIP-1559 priority fee selection.
@@ -324,6 +326,9 @@ pub struct FeeParams {
 	pub max_fee_per_gas: Option<u128>,
 	pub max_priority_fee_per_gas: Option<u128>,
 	pub cost_per_gas: u128,
+	pub fixed_tx_fee: Option<U256>,
+	pub native_asset_symbol: &'static str,
+	pub native_asset_decimals: u8,
 }
 
 impl FeeParams {
@@ -337,6 +342,9 @@ impl FeeParams {
 			max_fee_per_gas: None,
 			max_priority_fee_per_gas: None,
 			cost_per_gas: gas_price,
+			fixed_tx_fee: None,
+			native_asset_symbol: "ETH",
+			native_asset_decimals: 18,
 		}
 	}
 
@@ -370,6 +378,25 @@ impl FeeParams {
 			max_fee_per_gas: Some(max_fee_per_gas),
 			max_priority_fee_per_gas: Some(max_priority_fee_per_gas),
 			cost_per_gas,
+			fixed_tx_fee: None,
+			native_asset_symbol: "ETH",
+			native_asset_decimals: 18,
+		}
+	}
+
+	pub fn starknet_fixed(chain_id: u64, max_fee_fri: U256) -> Self {
+		Self {
+			chain_id,
+			model: FeeModel::StarknetFixed,
+			gas_price: None,
+			base_fee_per_gas: None,
+			estimated_effective_fee_per_gas: None,
+			max_fee_per_gas: None,
+			max_priority_fee_per_gas: None,
+			cost_per_gas: 0,
+			fixed_tx_fee: Some(max_fee_fri),
+			native_asset_symbol: "STRK",
+			native_asset_decimals: 18,
 		}
 	}
 
@@ -392,6 +419,7 @@ impl FeeParams {
 						.or(self.max_priority_fee_per_gas);
 				}
 			},
+			FeeModel::StarknetFixed => {},
 		}
 	}
 }
@@ -754,6 +782,23 @@ pub trait DeliveryInterface: Send + Sync {
 		tracking: Option<TransactionTrackingWithConfig>,
 	) -> Result<TransactionHash, DeliveryError>;
 
+	/// Signs and submits a chain-specific execution transaction.
+	///
+	/// The default preserves existing EVM behavior. Non-EVM backends override this
+	/// to consume their native transaction payloads without overloading EVM fields.
+	async fn submit_execution(
+		&self,
+		tx: ExecutionTransaction,
+		tracking: Option<TransactionTrackingWithConfig>,
+	) -> Result<TransactionHash, DeliveryError> {
+		match tx {
+			ExecutionTransaction::Evm(tx) => self.submit(*tx, tracking).await,
+			ExecutionTransaction::StarknetInvoke(_) => {
+				Err(DeliveryError::NoImplementationAvailable)
+			},
+		}
+	}
+
 	/// Retrieves the receipt for a transaction if available.
 	///
 	/// Returns immediately with the current transaction receipt, or an error
@@ -859,6 +904,19 @@ pub trait DeliveryInterface: Send + Sync {
 	/// or simulate transaction execution without submitting to the blockchain.
 	async fn eth_call(&self, tx: Transaction) -> Result<Bytes, DeliveryError>;
 
+	/// Reads Hyperlane7683 destination settler `orderStatus(orderId)`.
+	///
+	/// Backends implement this with their native RPC call path. The default
+	/// fails closed so callers never confuse an unsupported chain with UNKNOWN.
+	async fn get_hyperlane7683_order_status(
+		&self,
+		_chain_id: u64,
+		_destination_settler: &Address,
+		_order_id: [u8; 32],
+	) -> Result<Hyperlane7683OrderStatus, DeliveryError> {
+		Err(DeliveryError::NoImplementationAvailable)
+	}
+
 	/// Executes a contract call at a specific block number.
 	///
 	/// Backends must override this when they support historical reads. The
@@ -937,9 +995,12 @@ pub trait DeliveryRegistry: ImplementationRegistry<Factory = DeliveryFactory> {}
 /// Returns a vector of (name, factory) tuples for all available delivery implementations.
 /// This is used by the factory registry to automatically register all implementations.
 pub fn get_all_implementations() -> Vec<(&'static str, DeliveryFactory)> {
-	use implementations::evm::alloy;
+	use implementations::{evm::alloy, starknet};
 
-	vec![(alloy::Registry::NAME, alloy::Registry::factory())]
+	vec![
+		(alloy::Registry::NAME, alloy::Registry::factory()),
+		(starknet::Registry::NAME, starknet::Registry::factory()),
+	]
 }
 
 /// Service that manages transaction delivery across multiple blockchain networks.
@@ -1108,6 +1169,38 @@ impl DeliveryService {
 		implementation.submit(tx, enhanced_tracking).await
 	}
 
+	/// Delivers a typed execution transaction to the appropriate network backend.
+	///
+	/// This is the non-EVM extension point. Existing EVM callers can continue to
+	/// use `deliver(Transaction)`, while Starknet execution can route native invoke
+	/// payloads by `StarknetInvokeTransaction::network_id`.
+	pub async fn deliver_execution(
+		&self,
+		tx: ExecutionTransaction,
+		tracking: Option<TransactionTracking>,
+	) -> Result<TransactionHash, DeliveryError> {
+		let network_id = tx.network_id();
+		let implementation = self
+			.implementations
+			.get(&network_id)
+			.ok_or(DeliveryError::NoImplementationAvailable)?;
+
+		let enhanced_tracking = tracking.map(|t| TransactionTrackingWithConfig {
+			tracking: t,
+			min_confirmations: self.min_confirmations,
+			monitoring_timeout_seconds: self.monitoring_timeout_seconds,
+			tx_confirmation_timeout_seconds: self.tx_confirmation_timeout_seconds,
+		});
+		match tx {
+			ExecutionTransaction::Evm(tx) => implementation.submit(*tx, enhanced_tracking).await,
+			ExecutionTransaction::StarknetInvoke(tx) => {
+				implementation
+					.submit_execution(ExecutionTransaction::StarknetInvoke(tx), enhanced_tracking)
+					.await
+			},
+		}
+	}
+
 	/// Gets the transaction receipt for a given transaction hash.
 	///
 	/// Returns the full transaction receipt including status, block number, logs, etc.
@@ -1122,6 +1215,23 @@ impl DeliveryService {
 			.ok_or(DeliveryError::NoImplementationAvailable)?;
 
 		implementation.get_receipt(hash, chain_id).await
+	}
+
+	/// Reads Hyperlane7683 destination settler `orderStatus(orderId)`.
+	pub async fn get_hyperlane7683_order_status(
+		&self,
+		chain_id: u64,
+		destination_settler: &Address,
+		order_id: [u8; 32],
+	) -> Result<Hyperlane7683OrderStatus, DeliveryError> {
+		let implementation = self
+			.implementations
+			.get(&chain_id)
+			.ok_or(DeliveryError::NoImplementationAvailable)?;
+
+		implementation
+			.get_hyperlane7683_order_status(chain_id, destination_settler, order_id)
+			.await
 	}
 
 	/// Checks the current status of a transaction on a specific chain.

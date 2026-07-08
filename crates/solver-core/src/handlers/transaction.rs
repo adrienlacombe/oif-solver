@@ -5,13 +5,13 @@
 //! tasks for pending transactions and emits events for settlement processing.
 
 use crate::engine::event_bus::EventBus;
-use crate::state::OrderStateMachine;
+use crate::state::{transaction_attempt::TransactionAttemptStore, OrderStateMachine};
 use alloy_primitives::hex;
 use solver_settlement::SettlementService;
 use solver_storage::StorageService;
 use solver_types::{
 	truncate_id, DeliveryEvent, Order, OrderEvent, OrderStatus, SettlementEvent, SolverEvent,
-	StorageKey, TransactionHash, TransactionReceipt, TransactionType,
+	StorageKey, TransactionAttemptStatus, TransactionHash, TransactionReceipt, TransactionType,
 };
 use std::sync::Arc;
 use thiserror::Error;
@@ -54,10 +54,20 @@ fn stage_hash(order: &Order, tx_type: TransactionType) -> Option<&TransactionHas
 fn set_stage_hash(order: &mut Order, tx_type: TransactionType, tx_hash: TransactionHash) {
 	match tx_type {
 		TransactionType::Prepare => order.prepare_tx_hash = Some(tx_hash),
-		TransactionType::Fill => order.fill_tx_hash = Some(tx_hash),
+		TransactionType::Fill => {
+			order.fill_tx_hash = Some(tx_hash.clone());
+			if !order.fill_tx_hashes.contains(&tx_hash) {
+				order.fill_tx_hashes.push(tx_hash);
+			}
+		},
 		TransactionType::PostFill => order.post_fill_tx_hash = Some(tx_hash),
 		TransactionType::PreClaim => order.pre_claim_tx_hash = Some(tx_hash),
-		TransactionType::Claim => order.claim_tx_hash = Some(tx_hash),
+		TransactionType::Claim => {
+			order.claim_tx_hash = Some(tx_hash.clone());
+			if !order.claim_tx_hashes.contains(&tx_hash) {
+				order.claim_tx_hashes.push(tx_hash);
+			}
+		},
 		TransactionType::Approval
 		| TransactionType::Withdrawal
 		| TransactionType::Bridge
@@ -100,6 +110,23 @@ impl TransactionHandler {
 		observed_hash: &TransactionHash,
 		order: &Order,
 	) -> Result<(), TransactionError> {
+		if tx_type == TransactionType::Fill
+			&& order
+				.fill_transaction_hashes()
+				.iter()
+				.any(|hash| hash == observed_hash)
+		{
+			return Ok(());
+		}
+		if tx_type == TransactionType::Claim
+			&& order
+				.claim_transaction_hashes()
+				.iter()
+				.any(|hash| hash == observed_hash)
+		{
+			return Ok(());
+		}
+
 		match stage_hash(order, tx_type) {
 			Some(stored_hash) if stored_hash == observed_hash => Ok(()),
 			Some(stored_hash) => {
@@ -178,6 +205,75 @@ impl TransactionHandler {
 				Ok(())
 			},
 		}
+	}
+
+	async fn all_expected_stage_hashes_confirmed(
+		&self,
+		order_id: &str,
+		tx_type: TransactionType,
+		expected_count: usize,
+		expected_hashes: &[TransactionHash],
+		current_hash: &TransactionHash,
+	) -> Result<bool, TransactionError> {
+		if expected_count <= 1 && expected_hashes.len() <= 1 {
+			return Ok(true);
+		}
+
+		let attempt_store = TransactionAttemptStore::new(self.storage.clone());
+		let attempts = attempt_store
+			.attempts_for_order(order_id)
+			.await
+			.map_err(|e| TransactionError::State(e.to_string()))?;
+
+		let mut confirmed_hashes = vec![current_hash.clone()];
+		for attempt in attempts {
+			if attempt.tx_type == tx_type && attempt.status == TransactionAttemptStatus::Confirmed {
+				if let Some(tx_hash) = attempt.tx_hash {
+					if !confirmed_hashes.contains(&tx_hash) {
+						confirmed_hashes.push(tx_hash);
+					}
+				}
+			}
+		}
+
+		Ok(confirmed_hashes.len() >= expected_count
+			&& expected_hashes
+				.iter()
+				.all(|expected_hash| confirmed_hashes.contains(expected_hash)))
+	}
+
+	async fn all_expected_fill_hashes_confirmed(
+		&self,
+		order_id: &str,
+		expected_count: usize,
+		expected_hashes: &[TransactionHash],
+		current_hash: &TransactionHash,
+	) -> Result<bool, TransactionError> {
+		self.all_expected_stage_hashes_confirmed(
+			order_id,
+			TransactionType::Fill,
+			expected_count,
+			expected_hashes,
+			current_hash,
+		)
+		.await
+	}
+
+	async fn all_expected_claim_hashes_confirmed(
+		&self,
+		order_id: &str,
+		expected_count: usize,
+		expected_hashes: &[TransactionHash],
+		current_hash: &TransactionHash,
+	) -> Result<bool, TransactionError> {
+		self.all_expected_stage_hashes_confirmed(
+			order_id,
+			TransactionType::Claim,
+			expected_count,
+			expected_hashes,
+			current_hash,
+		)
+		.await
 	}
 
 	/// Handles confirmed transactions based on their type.
@@ -359,14 +455,51 @@ impl TransactionHandler {
 		tx_hash: TransactionHash,
 		order: Order,
 	) -> Result<(), TransactionError> {
-		let order_id = order.id;
+		let order_id = order.id.clone();
+		let legacy_single_fill =
+			order.expected_fill_tx_count.is_none() && order.fill_tx_hashes.len() <= 1;
+		let mut expected_hashes = if legacy_single_fill {
+			Vec::new()
+		} else {
+			order.fill_transaction_hashes()
+		};
+		if !expected_hashes.contains(&tx_hash) {
+			expected_hashes.push(tx_hash.clone());
+		}
+		let expected_count = order
+			.expected_fill_transaction_count()
+			.max(expected_hashes.len());
 
-		// Update status from Executing to Executed (fill completed).
+		if !self
+			.all_expected_fill_hashes_confirmed(
+				&order_id,
+				expected_count,
+				&expected_hashes,
+				&tx_hash,
+			)
+			.await?
+		{
+			let tx_hash_for_update = tx_hash.clone();
+			self.state_machine
+				.update_order_with(&order_id, move |o| {
+					o.add_fill_transaction_hash(tx_hash_for_update.clone());
+				})
+				.await
+				.map_err(|e| TransactionError::State(e.to_string()))?;
+			tracing::info!(
+				order_id = %truncate_id(&order_id),
+				expected_fill_hashes = expected_count,
+				"Fill leg confirmed; waiting for remaining fill legs before advancing order"
+			);
+			return Ok(());
+		}
+
+		// Update status from Executing to Executed once all fill legs completed.
 		let tx_hash_for_update = tx_hash.clone();
 		let outcome = self
 			.state_machine
 			.try_transition_order_status(&order_id, OrderStatus::Executed, move |o| {
-				o.fill_tx_hash = Some(tx_hash_for_update.clone());
+				set_stage_hash(o, TransactionType::Fill, tx_hash_for_update.clone());
 			})
 			.await
 			.map_err(|e| TransactionError::State(e.to_string()))?;
@@ -505,7 +638,44 @@ impl TransactionHandler {
 		tx_hash: TransactionHash,
 		order: Order,
 	) -> Result<(), TransactionError> {
-		let order_id = order.id;
+		let order_id = order.id.clone();
+		let legacy_single_claim =
+			order.expected_claim_tx_count.is_none() && order.claim_tx_hashes.len() <= 1;
+		let mut expected_hashes = if legacy_single_claim {
+			Vec::new()
+		} else {
+			order.claim_transaction_hashes()
+		};
+		if !expected_hashes.contains(&tx_hash) {
+			expected_hashes.push(tx_hash.clone());
+		}
+		let expected_count = order
+			.expected_claim_transaction_count()
+			.max(expected_hashes.len());
+
+		if !self
+			.all_expected_claim_hashes_confirmed(
+				&order_id,
+				expected_count,
+				&expected_hashes,
+				&tx_hash,
+			)
+			.await?
+		{
+			let tx_hash_for_update = tx_hash.clone();
+			self.state_machine
+				.update_order_with(&order_id, move |o| {
+					o.add_claim_transaction_hash(tx_hash_for_update.clone());
+				})
+				.await
+				.map_err(|e| TransactionError::State(e.to_string()))?;
+			tracing::info!(
+				order_id = %truncate_id(&order_id),
+				expected_claim_hashes = expected_count,
+				"Claim leg confirmed; waiting for remaining claim legs before finalizing order"
+			);
+			return Ok(());
+		}
 
 		// Transition to Finalized first; the outcome tells us whether this
 		// confirmation actually advanced the order's status. We do the
@@ -516,7 +686,7 @@ impl TransactionHandler {
 		let outcome = self
 			.state_machine
 			.try_transition_order_status(&order_id, OrderStatus::Finalized, move |o| {
-				o.claim_tx_hash = Some(tx_hash_for_update.clone());
+				set_stage_hash(o, TransactionType::Claim, tx_hash_for_update.clone());
 			})
 			.await
 			.map_err(|e| TransactionError::State(e.to_string()))?;
@@ -553,11 +723,13 @@ mod tests {
 	use crate::state::OrderStateMachine;
 	use alloy_primitives::U256;
 	use mockall::predicate::*;
+	use solver_delivery::{PlannedAttemptInit, TransactionAttemptRecorder};
 	use solver_settlement::{MockSettlementInterface, SettlementError, SettlementService};
 	use solver_storage::{MockStorageInterface, StorageService};
 	use solver_types::utils::tests::builders::{OrderBuilder, TransactionReceiptBuilder};
 	use solver_types::{
-		ExecutionParams, Order, OrderStatus, SolverEvent, TransactionHash, TransactionReceipt,
+		Address, ExecutionParams, Order, OrderStatus, SolverEvent, Transaction,
+		TransactionAttemptScope, TransactionAttemptStatus, TransactionHash, TransactionReceipt,
 		TransactionType,
 	};
 	use std::collections::HashMap;
@@ -586,6 +758,20 @@ mod tests {
 		TransactionReceiptBuilder::new()
 			.with_success(success)
 			.build()
+	}
+
+	fn create_attempt_tx(chain_id: u64) -> Transaction {
+		Transaction {
+			to: Some(Address(vec![0x42; 20])),
+			data: vec![0xab],
+			value: U256::ZERO,
+			chain_id,
+			nonce: Some(1),
+			gas_limit: Some(21_000),
+			gas_price: None,
+			max_fee_per_gas: Some(1_000),
+			max_priority_fee_per_gas: Some(10),
+		}
 	}
 
 	async fn create_test_handler_with_mocks<F1>(
@@ -818,7 +1004,7 @@ mod tests {
 			}))
 			.with_fill_tx_hash(Some(TransactionHash(vec![0xab; 32])))
 			.build();
-		let tx_hash = create_test_receipt(true).hash;
+		let tx_hash = TransactionHash(vec![0xab; 32]);
 		let receipt = create_test_receipt(true);
 		let (handler, mut receiver, state_machine) =
 			create_memory_handler_with_order(order.clone()).await;
@@ -1400,7 +1586,7 @@ mod tests {
 
 		// First confirmation: Executing → Executed. Should publish PostFillReady.
 		handler
-			.handle_fill_confirmed(TransactionHash(vec![0xaa; 32]), order_at_executing.clone())
+			.handle_fill_confirmed(TransactionHash(vec![0xab; 32]), order_at_executing.clone())
 			.await
 			.unwrap();
 		let first = drain_count(&mut subscriber, |e| {
@@ -1428,6 +1614,174 @@ mod tests {
 		assert_eq!(
 			second, 0,
 			"duplicate Confirmed must not double-publish PostFillReady"
+		);
+	}
+
+	#[tokio::test]
+	async fn handle_fill_confirmed_waits_for_all_expected_fill_hashes() {
+		let first_hash = TransactionHash(vec![0xa1; 32]);
+		let second_hash = TransactionHash(vec![0xb2; 32]);
+		let order = OrderBuilder::new()
+			.with_id("test_order_multi_fill")
+			.with_status(OrderStatus::Executing)
+			.with_execution_params(Some(ExecutionParams {
+				gas_price: U256::from(20_000_000_000u64),
+				priority_fee: Some(U256::from(1_000_000_000u64)),
+			}))
+			.with_fill_tx_hashes(vec![first_hash.clone(), second_hash.clone()])
+			.build();
+
+		let (handler, mut receiver, state_machine) =
+			create_memory_handler_with_order(order.clone()).await;
+		let attempt_store = TransactionAttemptStore::new(handler.storage.clone());
+		let first_attempt = attempt_store
+			.record_planned_attempt(PlannedAttemptInit {
+				scope: TransactionAttemptScope::order(order.id.clone()),
+				signer: None,
+				tx_type: TransactionType::Fill,
+				tx: create_attempt_tx(137).into(),
+				attempt_id_override: None,
+				replacement_of: None,
+			})
+			.await
+			.unwrap();
+		attempt_store
+			.record_attempt_update(
+				&first_attempt.id,
+				TransactionAttemptStatus::Confirmed,
+				Some(first_hash.clone()),
+				None,
+				None,
+			)
+			.await
+			.unwrap();
+
+		handler
+			.handle_confirmed(
+				order.id.clone(),
+				first_hash.clone(),
+				TransactionType::Fill,
+				create_test_receipt(true),
+			)
+			.await
+			.unwrap();
+
+		let updated_order = state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(updated_order.status, OrderStatus::Executing);
+		assert_eq!(
+			updated_order.fill_transaction_hashes(),
+			vec![first_hash.clone(), second_hash.clone()]
+		);
+		let no_event =
+			tokio::time::timeout(std::time::Duration::from_millis(50), receiver.recv()).await;
+		assert!(
+			no_event.is_err(),
+			"partial fill must not emit PostFillReady"
+		);
+
+		handler
+			.handle_confirmed(
+				order.id.clone(),
+				second_hash.clone(),
+				TransactionType::Fill,
+				create_test_receipt(true),
+			)
+			.await
+			.unwrap();
+
+		let event = receiver.recv().await.unwrap();
+		match event {
+			SolverEvent::Settlement(SettlementEvent::PostFillReady { order_id }) => {
+				assert_eq!(order_id, order.id);
+			},
+			_ => panic!("Expected PostFillReady event, got {event:?}"),
+		}
+		let updated_order = state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(updated_order.status, OrderStatus::Executed);
+		assert_eq!(
+			updated_order.fill_transaction_hashes(),
+			vec![first_hash, second_hash]
+		);
+	}
+
+	#[tokio::test]
+	async fn handle_claim_confirmed_waits_for_all_expected_claim_hashes() {
+		let first_hash = TransactionHash(vec![0xc1; 32]);
+		let second_hash = TransactionHash(vec![0xd2; 32]);
+		let order = OrderBuilder::new()
+			.with_id("test_order_multi_claim")
+			.with_status(OrderStatus::Settled)
+			.with_claim_tx_hashes(vec![first_hash.clone(), second_hash.clone()])
+			.with_expected_claim_tx_count(Some(2))
+			.build();
+
+		let (handler, mut receiver, state_machine) =
+			create_memory_handler_with_order(order.clone()).await;
+		let attempt_store = TransactionAttemptStore::new(handler.storage.clone());
+		let first_attempt = attempt_store
+			.record_planned_attempt(PlannedAttemptInit {
+				scope: TransactionAttemptScope::order(order.id.clone()),
+				signer: None,
+				tx_type: TransactionType::Claim,
+				tx: create_attempt_tx(1).into(),
+				attempt_id_override: None,
+				replacement_of: None,
+			})
+			.await
+			.unwrap();
+		attempt_store
+			.record_attempt_update(
+				&first_attempt.id,
+				TransactionAttemptStatus::Confirmed,
+				Some(first_hash.clone()),
+				None,
+				None,
+			)
+			.await
+			.unwrap();
+
+		handler
+			.handle_confirmed(
+				order.id.clone(),
+				first_hash.clone(),
+				TransactionType::Claim,
+				create_test_receipt(true),
+			)
+			.await
+			.unwrap();
+
+		let updated_order = state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(updated_order.status, OrderStatus::Settled);
+		assert_eq!(
+			updated_order.claim_transaction_hashes(),
+			vec![first_hash.clone(), second_hash.clone()]
+		);
+		let no_event =
+			tokio::time::timeout(std::time::Duration::from_millis(50), receiver.recv()).await;
+		assert!(no_event.is_err(), "partial claim must not emit Completed");
+
+		handler
+			.handle_confirmed(
+				order.id.clone(),
+				second_hash.clone(),
+				TransactionType::Claim,
+				create_test_receipt(true),
+			)
+			.await
+			.unwrap();
+
+		let event = receiver.recv().await.unwrap();
+		match event {
+			SolverEvent::Settlement(SettlementEvent::Completed { order_id }) => {
+				assert_eq!(order_id, order.id);
+			},
+			_ => panic!("Expected Completed event, got {event:?}"),
+		}
+		let updated_order = state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(updated_order.status, OrderStatus::Finalized);
+		assert_eq!(
+			updated_order.claim_transaction_hashes(),
+			vec![first_hash, second_hash]
 		);
 	}
 

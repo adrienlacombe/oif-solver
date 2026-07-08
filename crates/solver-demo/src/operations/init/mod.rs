@@ -1162,6 +1162,7 @@ mod tests {
 					chain_id: 11155420,
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![Token {
 						symbol: "USDC".to_string(),
 						name: None,
@@ -1180,6 +1181,7 @@ mod tests {
 					chain_id: 84532,
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![Token {
 						symbol: "USDC".to_string(),
 						name: None,

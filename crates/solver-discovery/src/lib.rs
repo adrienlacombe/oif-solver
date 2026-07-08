@@ -146,6 +146,14 @@ pub fn get_all_implementations() -> Vec<(&'static str, DiscoveryFactory)> {
 			onchain::_7683::Registry::factory(),
 		),
 		(
+			onchain::_7683::Hyperlane7683Registry::NAME,
+			onchain::_7683::Hyperlane7683Registry::factory(),
+		),
+		(
+			onchain::_7683::StarknetHyperlane7683Registry::NAME,
+			onchain::_7683::StarknetHyperlane7683Registry::factory(),
+		),
+		(
 			offchain::_7683::Registry::NAME,
 			offchain::_7683::Registry::factory(),
 		),
@@ -246,5 +254,19 @@ mod tests {
 			.submit_order("offchain_eip7683", &sample_request())
 			.await;
 		assert!(matches!(result, Err(IntentSubmissionError::NotSupported)));
+	}
+
+	#[test]
+	fn get_all_implementations_includes_onchain_hyperlane7683() {
+		let implementations = get_all_implementations();
+		let names = implementations
+			.iter()
+			.map(|(name, _)| *name)
+			.collect::<Vec<_>>();
+
+		assert!(names.contains(&"onchain_eip7683"));
+		assert!(names.contains(&"onchain_hyperlane7683"));
+		assert!(names.contains(&"onchain_starknet_hyperlane7683"));
+		assert!(names.contains(&"offchain_eip7683"));
 	}
 }

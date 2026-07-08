@@ -780,7 +780,16 @@ impl SolverEngine {
 							};
 
 							// Spawn monitor directly (it handles its own tokio::spawn internally)
-							self.settlement_handler.spawn_settlement_monitor(order, fill_tx_hash);
+							if let Err(e) = self.settlement_handler.spawn_settlement_monitor(order, fill_tx_hash) {
+								if let Err(e) = self.handle_settlement_stage_error(
+									&order_id,
+									TransactionType::Claim,
+									"StartMonitoring",
+									e,
+								).await {
+									tracing::error!("Failed to handle StartMonitoring error for order {}: {}", order_id, e);
+								}
+							}
 						}
 
 						SolverEvent::Settlement(SettlementEvent::ClaimReady { order_id }) => {

@@ -7,7 +7,7 @@
 
 use crate::engine::{event_bus::EventBus, SolverEngine};
 use alloy_primitives::U256;
-use solver_account::{AccountError, AccountInterface, AccountService};
+use solver_account::{AccountError, AccountInterface, AccountService, AccountSigner};
 use solver_config::Config;
 use solver_delivery::{DeliveryError, DeliveryInterface, DeliveryService};
 use solver_discovery::{DiscoveryError, DiscoveryInterface, DiscoveryService};
@@ -15,6 +15,7 @@ use solver_order::{ExecutionStrategy, OrderError, OrderInterface, OrderService, 
 use solver_pricing::PricingService;
 use solver_settlement::{SettlementError, SettlementInterface, SettlementService};
 use solver_storage::{StorageError, StorageInterface, StorageService};
+use solver_types::SolverIdentityAddresses;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -91,6 +92,47 @@ fn merge_blocked_signers(
 	}
 
 	result
+}
+
+fn apply_signer_identity(signer: &AccountSigner, identities: &mut SolverIdentityAddresses) {
+	if identities.evm.is_none() {
+		if let Some(address) = signer.evm_address() {
+			identities.evm = Some(solver_types::Address::from(address));
+		}
+	}
+	if identities.starknet.is_none() {
+		if let Some(signer) = signer.starknet_local() {
+			identities.starknet = Some(signer.account_address().clone());
+		}
+	}
+}
+
+fn solver_identity_addresses(
+	primary_account: &str,
+	account_services: &HashMap<String, Arc<AccountService>>,
+) -> SolverIdentityAddresses {
+	let mut identities = SolverIdentityAddresses::default();
+
+	if let Some(account) = account_services.get(primary_account) {
+		apply_signer_identity(&account.signer(), &mut identities);
+	}
+
+	let mut account_names = account_services
+		.keys()
+		.filter(|name| name.as_str() != primary_account)
+		.cloned()
+		.collect::<Vec<_>>();
+	account_names.sort();
+	for account_name in account_names {
+		if identities.evm.is_some() && identities.starknet.is_some() {
+			break;
+		}
+		if let Some(account) = account_services.get(&account_name) {
+			apply_signer_identity(&account.signer(), &mut identities);
+		}
+	}
+
+	identities
 }
 
 /// Reads native balances on every configured chain for `solver_address`
@@ -196,6 +238,7 @@ impl SolverBuilder {
 			&serde_json::Value,
 			&solver_types::NetworksConfig,
 			&solver_types::oracle::OracleRoutes,
+			&solver_types::SolverIdentityAddresses,
 		) -> Result<Box<dyn OrderInterface>, OrderError>,
 		PF: Fn(
 			&serde_json::Value,
@@ -204,6 +247,7 @@ impl SolverBuilder {
 			&serde_json::Value,
 			&solver_types::NetworksConfig,
 			Arc<StorageService>,
+			&solver_types::SolverIdentityAddresses,
 		) -> Result<Box<dyn SettlementInterface>, SettlementError>,
 		STF: Fn(&serde_json::Value) -> Result<Box<dyn ExecutionStrategy>, StrategyError>,
 	{
@@ -300,6 +344,21 @@ impl SolverBuilder {
 				))
 			})?
 			.clone();
+		let solver_identities = solver_identity_addresses(primary_account, &account_services);
+		tracing::info!(
+			component = "account",
+			evm_identity = %solver_identities
+				.evm
+				.as_ref()
+				.map(ToString::to_string)
+				.unwrap_or_else(|| "none".to_string()),
+			starknet_identity = %solver_identities
+				.starknet
+				.as_ref()
+				.map(ToString::to_string)
+				.unwrap_or_else(|| "none".to_string()),
+			"Solver identity address book initialized"
+		);
 
 		// Fetch the solver address once during initialization
 		let solver_address = match account.get_address().await {
@@ -453,7 +512,12 @@ impl SolverBuilder {
 
 		for (name, config) in &self.static_config.settlement.implementations {
 			if let Some(factory) = factories.settlement_factories.get(name) {
-				match factory(config, &self.static_config.networks, storage.clone()) {
+				match factory(
+					config,
+					&self.static_config.networks,
+					storage.clone(),
+					&solver_identities,
+				) {
 					Ok(implementation) => {
 						settlement_impls.insert(name.clone(), implementation);
 						tracing::info!(component = "settlement", implementation = %name, "Loaded");
@@ -569,7 +633,12 @@ impl SolverBuilder {
 		let mut order_impls = HashMap::new();
 		for (name, config) in &self.static_config.order.implementations {
 			if let Some(factory) = factories.order_factories.get(name) {
-				match factory(config, &self.static_config.networks, &oracle_routes) {
+				match factory(
+					config,
+					&self.static_config.networks,
+					&oracle_routes,
+					&solver_identities,
+				) {
 					Ok(implementation) => {
 						// Validation already happened in the factory
 						order_impls.insert(name.clone(), implementation);

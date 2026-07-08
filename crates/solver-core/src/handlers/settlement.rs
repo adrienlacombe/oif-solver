@@ -14,11 +14,12 @@ use solver_delivery::{
 	TransactionTracking,
 };
 use solver_order::OrderService;
-use solver_settlement::SettlementService;
+use solver_settlement::{ensure_scalar_settlement_supported, SettlementService};
 use solver_storage::StorageService;
 use solver_types::{
-	truncate_id, DeliveryEvent, NetworksConfig, Order, SettlementEvent, SolverEvent, StorageKey,
-	TransactionHash, TransactionType,
+	current_timestamp, truncate_id, DeliveryEvent, FillProof, NetworksConfig, Order, OrderStatus,
+	SettlementEvent, SolverEvent, StorageKey, TransactionHash, TransactionType,
+	HYPERLANE7683_STANDARD,
 };
 use std::sync::Arc;
 use thiserror::Error;
@@ -61,6 +62,14 @@ fn map_delivery_error(error: solver_delivery::DeliveryError) -> SettlementError 
 
 fn map_settlement_service_error(error: solver_settlement::SettlementError) -> SettlementError {
 	SettlementError::SettlementService(error)
+}
+
+fn ensure_scalar_settlement_order(order: &Order) -> Result<(), SettlementError> {
+	ensure_scalar_settlement_supported(order).map_err(map_settlement_service_error)
+}
+
+fn is_hyperlane7683_order(order: &Order) -> bool {
+	order.standard == HYPERLANE7683_STANDARD
 }
 
 #[derive(Debug, Error)]
@@ -126,7 +135,12 @@ impl SettlementHandler {
 	}
 
 	/// Helper method to spawn settlement monitoring task.
-	pub fn spawn_settlement_monitor(&self, order: Order, fill_tx_hash: TransactionHash) {
+	pub fn spawn_settlement_monitor(
+		&self,
+		order: Order,
+		fill_tx_hash: TransactionHash,
+	) -> Result<(), SettlementError> {
+		ensure_scalar_settlement_order(&order)?;
 		let monitor = SettlementMonitor::new(
 			self.settlement.clone(),
 			self.state_machine.clone(),
@@ -139,6 +153,7 @@ impl SettlementHandler {
 		tokio::spawn(async move {
 			monitor.monitor_claim_readiness(order, fill_tx_hash).await;
 		});
+		Ok(())
 	}
 
 	/// Handles PostFillReady event by generating and submitting PostFill transaction if needed.
@@ -150,6 +165,37 @@ impl SettlementHandler {
 			.retrieve(StorageKey::Orders.as_str(), &order_id)
 			.await
 			.map_err(|e| SettlementError::Storage(e.to_string()))?;
+		if is_hyperlane7683_order(&order) {
+			let fill_tx_hash = order
+				.fill_transaction_hashes()
+				.first()
+				.cloned()
+				.ok_or_else(|| {
+					SettlementError::Service("Order missing fill transaction hash".to_string())
+				})?;
+			let fill_proof = FillProof {
+				tx_hash: fill_tx_hash,
+				block_number: 0,
+				attestation_data: None,
+				filled_timestamp: current_timestamp(),
+				oracle_address: "0x0000000000000000000000000000000000000000".to_string(),
+			};
+			self.state_machine
+				.set_fill_proof(&order_id, fill_proof)
+				.await
+				.map_err(|e| SettlementError::State(e.to_string()))?;
+			self.state_machine
+				.try_transition_order_status(&order_id, OrderStatus::Settled, |_| {})
+				.await
+				.map_err(|e| SettlementError::State(e.to_string()))?;
+			self.event_bus
+				.publish(SolverEvent::Settlement(SettlementEvent::ClaimReady {
+					order_id,
+				}))
+				.ok();
+			return Ok(());
+		}
+		ensure_scalar_settlement_order(&order)?;
 
 		// Get the fill transaction hash
 		let fill_tx_hash = order.fill_tx_hash.clone().ok_or_else(|| {
@@ -194,7 +240,7 @@ impl SettlementHandler {
 		// Generate post-fill transaction
 		let post_fill_tx = self
 			.settlement
-			.generate_post_fill_transaction(&order, &receipt)
+			.generate_post_fill_execution_transaction(&order, &receipt)
 			.await
 			.map_err(map_settlement_service_error)?;
 
@@ -295,7 +341,7 @@ impl SettlementHandler {
 
 				let tx_hash = self
 					.delivery
-					.deliver(post_fill_tx.clone(), Some(tracking))
+					.deliver_execution(post_fill_tx.clone(), Some(tracking))
 					.await
 					.map_err(map_delivery_error)?;
 
@@ -347,7 +393,7 @@ impl SettlementHandler {
 						order_id,
 						tx_hash,
 						tx_type: TransactionType::PostFill,
-						tx_chain_id: post_fill_tx.chain_id,
+						tx_chain_id: post_fill_tx.network_id(),
 					}))
 					.ok();
 			},
@@ -364,6 +410,7 @@ impl SettlementHandler {
 					.retrieve(StorageKey::Orders.as_str(), &order_id)
 					.await
 					.map_err(|e| SettlementError::Storage(e.to_string()))?;
+				ensure_scalar_settlement_order(&order)?;
 
 				let fill_tx_hash = order.fill_tx_hash.clone().ok_or_else(|| {
 					SettlementError::Service(
@@ -391,6 +438,7 @@ impl SettlementHandler {
 			.retrieve(StorageKey::Orders.as_str(), &order_id)
 			.await
 			.map_err(|e| SettlementError::Storage(e.to_string()))?;
+		ensure_scalar_settlement_order(&order)?;
 
 		// Get the fill proof
 		let fill_proof = order
@@ -401,7 +449,7 @@ impl SettlementHandler {
 		// Generate pre-claim transaction
 		let pre_claim_tx = self
 			.settlement
-			.generate_pre_claim_transaction(&order, &fill_proof)
+			.generate_pre_claim_execution_transaction(&order, &fill_proof)
 			.await
 			.map_err(map_settlement_service_error)?;
 
@@ -502,7 +550,7 @@ impl SettlementHandler {
 
 				let tx_hash = self
 					.delivery
-					.deliver(pre_claim_tx.clone(), Some(tracking))
+					.deliver_execution(pre_claim_tx.clone(), Some(tracking))
 					.await
 					.map_err(map_delivery_error)?;
 
@@ -554,7 +602,7 @@ impl SettlementHandler {
 						order_id,
 						tx_hash,
 						tx_type: TransactionType::PreClaim,
-						tx_chain_id: pre_claim_tx.chain_id,
+						tx_chain_id: pre_claim_tx.network_id(),
 					}))
 					.ok();
 			},
@@ -591,6 +639,10 @@ impl SettlementHandler {
 				.map_err(|e| {
 					ClaimBatchError::new(&order_id, SettlementError::Storage(e.to_string()))
 				})?;
+			if order.standard != HYPERLANE7683_STANDARD {
+				ensure_scalar_settlement_order(&order)
+					.map_err(|e| ClaimBatchError::new(&order_id, e))?;
+			}
 
 			// Retrieve fill proof (already validated when ClaimReady was emitted)
 			let fill_proof = order.fill_proof.clone().ok_or_else(|| {
@@ -600,163 +652,207 @@ impl SettlementHandler {
 				)
 			})?;
 
-			// Generate claim transaction
-			let claim_tx = self
-				.order_service
-				.generate_claim_transaction(&order, &fill_proof)
-				.await
-				.map_err(|e| {
-					ClaimBatchError::new(&order_id, SettlementError::Service(e.to_string()))
-				})?;
+			// Generate claim transaction(s). Hyperlane7683 settlement needs a live
+			// quoteGasPayment(originDomain) value, which belongs to the settlement
+			// backend rather than the order-only calldata layer.
+			let claim_txs = if order.standard == HYPERLANE7683_STANDARD {
+				self.settlement
+					.generate_claim_execution_transactions(&order, &fill_proof)
+					.await
+					.map_err(|e| {
+						ClaimBatchError::new(&order_id, SettlementError::SettlementService(e))
+					})?
+			} else {
+				vec![self
+					.order_service
+					.generate_claim_execution_transaction(&order, &fill_proof)
+					.await
+					.map_err(|e| {
+						ClaimBatchError::new(&order_id, SettlementError::Service(e.to_string()))
+					})?]
+			};
 
-			// Submit claim transaction through delivery service with monitoring
-			let event_bus = self.event_bus.clone();
-			let callback = Box::new(move |event: TransactionMonitoringEvent| match event {
-				TransactionMonitoringEvent::Confirmed {
-					id,
-					tx_hash,
-					tx_type,
-					receipt,
-				} => {
-					event_bus
-						.publish(SolverEvent::Delivery(DeliveryEvent::TransactionConfirmed {
-							order_id: id,
-							tx_hash,
-							tx_type,
-							receipt,
-						}))
-						.ok();
-				},
-				TransactionMonitoringEvent::Failed {
-					id,
-					tx_hash,
-					tx_type,
-					error,
-					classification,
-				} => match classification {
-					RevertClassification::StageComplete { reason } => {
-						tracing::info!(
-							order_id = %id,
-							?tx_type,
-							?reason,
-							?tx_hash,
-							"Revert classified as stage-complete; deferring to recovery for chain confirmation"
-						);
-					},
-					RevertClassification::Terminal { .. } | RevertClassification::Unknown => {
+			if claim_txs.is_empty() {
+				tracing::info!(
+					order_id = %truncate_id(&order_id),
+					"Settlement returned no claim transactions; finalizing order"
+				);
+				self.state_machine
+					.try_transition_order_status(&order_id, OrderStatus::Finalized, |_| {})
+					.await
+					.map_err(|e| {
+						ClaimBatchError::new(&order_id, SettlementError::State(e.to_string()))
+					})?;
+				self.event_bus
+					.publish(SolverEvent::Settlement(SettlementEvent::Completed {
+						order_id,
+					}))
+					.ok();
+				continue;
+			}
+
+			if order.standard == HYPERLANE7683_STANDARD || claim_txs.len() > 1 {
+				let expected_claim_count = claim_txs.len();
+				self.state_machine
+					.update_order_with(&order_id, move |order| {
+						order.expected_claim_tx_count = Some(expected_claim_count);
+					})
+					.await
+					.map_err(|e| {
+						ClaimBatchError::new(&order_id, SettlementError::State(e.to_string()))
+					})?;
+			}
+
+			for claim_tx in claim_txs {
+				// Submit claim transaction through delivery service with monitoring
+				let event_bus = self.event_bus.clone();
+				let callback = Box::new(move |event: TransactionMonitoringEvent| match event {
+					TransactionMonitoringEvent::Confirmed {
+						id,
+						tx_hash,
+						tx_type,
+						receipt,
+					} => {
 						event_bus
-							.publish(SolverEvent::Delivery(DeliveryEvent::TransactionFailed {
+							.publish(SolverEvent::Delivery(DeliveryEvent::TransactionConfirmed {
 								order_id: id,
 								tx_hash,
 								tx_type,
-								error,
+								receipt,
 							}))
 							.ok();
 					},
-				},
-				TransactionMonitoringEvent::Indeterminate {
-					id: order_id_inner,
-					tx_hash,
-					tx_type,
-					reason,
-				} => {
-					tracing::warn!(
-						%order_id_inner,
-						?tx_hash,
-						?tx_type,
-						%reason,
-						"Live tx monitor indeterminate; order left in current status"
-					);
-				},
-				TransactionMonitoringEvent::AttemptLedgerConflict {
-					id,
-					attempt_id,
-					tx_type,
-					tx_hash,
-					attempted_status,
-					error,
-					context,
-				} => {
-					event_bus
-						.publish(SolverEvent::Delivery(
-							DeliveryEvent::TransactionAttemptLedgerConflict {
-								order_id: id,
-								attempt_id,
-								tx_type,
-								tx_hash,
-								attempted_status,
-								error,
-								context: context.to_string(),
-							},
-						))
-						.ok();
-				},
-			});
+					TransactionMonitoringEvent::Failed {
+						id,
+						tx_hash,
+						tx_type,
+						error,
+						classification,
+					} => match classification {
+						RevertClassification::StageComplete { reason } => {
+							tracing::info!(
+								order_id = %id,
+								?tx_type,
+								?reason,
+								?tx_hash,
+								"Revert classified as stage-complete; deferring to recovery for chain confirmation"
+							);
+						},
+						RevertClassification::Terminal { .. } | RevertClassification::Unknown => {
+							event_bus
+								.publish(SolverEvent::Delivery(DeliveryEvent::TransactionFailed {
+									order_id: id,
+									tx_hash,
+									tx_type,
+									error,
+								}))
+								.ok();
+						},
+					},
+					TransactionMonitoringEvent::Indeterminate {
+						id: order_id_inner,
+						tx_hash,
+						tx_type,
+						reason,
+					} => {
+						tracing::warn!(
+							%order_id_inner,
+							?tx_hash,
+							?tx_type,
+							%reason,
+							"Live tx monitor indeterminate; order left in current status"
+						);
+					},
+					TransactionMonitoringEvent::AttemptLedgerConflict {
+						id,
+						attempt_id,
+						tx_type,
+						tx_hash,
+						attempted_status,
+						error,
+						context,
+					} => {
+						event_bus
+							.publish(SolverEvent::Delivery(
+								DeliveryEvent::TransactionAttemptLedgerConflict {
+									order_id: id,
+									attempt_id,
+									tx_type,
+									tx_hash,
+									attempted_status,
+									error,
+									context: context.to_string(),
+								},
+							))
+							.ok();
+					},
+				});
 
-			let tracking = TransactionTracking {
-				id: order.id.clone(),
-				tx_type: TransactionType::Claim,
-				attempt_recorder: self.transaction_attempt_recorder(),
-				callback,
-				attempt_id: None,
-				replacement_of: None,
-			};
-
-			let claim_tx_hash = self
-				.delivery
-				.deliver(claim_tx.clone(), Some(tracking))
-				.await
-				.map_err(|e| ClaimBatchError::new(&order_id, map_delivery_error(e)))?;
-
-			self.event_bus
-				.publish(SolverEvent::Delivery(DeliveryEvent::TransactionPending {
-					order_id: order.id.clone(),
-					tx_hash: claim_tx_hash.clone(),
+				let tracking = TransactionTracking {
+					id: order.id.clone(),
 					tx_type: TransactionType::Claim,
-					tx_chain_id: claim_tx.chain_id,
-				}))
-				.ok();
+					attempt_recorder: self.transaction_attempt_recorder(),
+					callback,
+					attempt_id: None,
+					replacement_of: None,
+				};
 
-			// The claim transaction is now on-chain. The following metadata writes are
-			// best-effort: a failure here must NOT terminally fail the order, otherwise
-			// a transient storage hiccup would strand the submitted transaction outside
-			// recovery. Recovery reconstructs the stage tx hash from the transaction
-			// attempt ledger (which delivery persists before broadcast) and re-drives
-			// the order while it remains non-terminal.
+				let claim_tx_hash = self
+					.delivery
+					.deliver_execution(claim_tx.clone(), Some(tracking))
+					.await
+					.map_err(|e| ClaimBatchError::new(&order_id, map_delivery_error(e)))?;
 
-			// Update order with claim transaction hash (best-effort)
-			if let Err(e) = self
-				.state_machine
-				.set_transaction_hash(&order.id, claim_tx_hash.clone(), TransactionType::Claim)
-				.await
-			{
-				tracing::warn!(
-					order_id = %truncate_id(&order.id),
-					tx_type = ?TransactionType::Claim,
-					tx_hash = %truncate_id(&hex::encode(&claim_tx_hash.0)),
-					error = %e,
-					"claim transaction submitted but tx hash persistence failed; recovery will use attempt ledger"
-				);
-			}
+				self.event_bus
+					.publish(SolverEvent::Delivery(DeliveryEvent::TransactionPending {
+						order_id: order.id.clone(),
+						tx_hash: claim_tx_hash.clone(),
+						tx_type: TransactionType::Claim,
+						tx_chain_id: claim_tx.network_id(),
+					}))
+					.ok();
 
-			// Store reverse mapping: tx_hash -> order_id (best-effort)
-			if let Err(e) = self
-				.storage
-				.store(
-					StorageKey::OrderByTxHash.as_str(),
-					&hex::encode(&claim_tx_hash.0),
-					&order.id,
-					None,
-				)
-				.await
-			{
-				tracing::warn!(
-					order_id = %truncate_id(&order.id),
-					tx_type = ?TransactionType::Claim,
-					tx_hash = %truncate_id(&hex::encode(&claim_tx_hash.0)),
-					error = %e,
-					"claim transaction submitted but reverse tx index persistence failed"
-				);
+				// The claim transaction is now on-chain. The following metadata writes are
+				// best-effort: a failure here must NOT terminally fail the order, otherwise
+				// a transient storage hiccup would strand the submitted transaction outside
+				// recovery. Recovery reconstructs the stage tx hash from the transaction
+				// attempt ledger (which delivery persists before broadcast) and re-drives
+				// the order while it remains non-terminal.
+
+				// Update order with claim transaction hash (best-effort)
+				if let Err(e) = self
+					.state_machine
+					.set_transaction_hash(&order.id, claim_tx_hash.clone(), TransactionType::Claim)
+					.await
+				{
+					tracing::warn!(
+						order_id = %truncate_id(&order.id),
+						tx_type = ?TransactionType::Claim,
+						tx_hash = %truncate_id(&hex::encode(&claim_tx_hash.0)),
+						error = %e,
+						"claim transaction submitted but tx hash persistence failed; recovery will use attempt ledger"
+					);
+				}
+
+				// Store reverse mapping: tx_hash -> order_id (best-effort)
+				if let Err(e) = self
+					.storage
+					.store(
+						StorageKey::OrderByTxHash.as_str(),
+						&hex::encode(&claim_tx_hash.0),
+						&order.id,
+						None,
+					)
+					.await
+				{
+					tracing::warn!(
+						order_id = %truncate_id(&order.id),
+						tx_type = ?TransactionType::Claim,
+						tx_hash = %truncate_id(&hex::encode(&claim_tx_hash.0)),
+						error = %e,
+						"claim transaction submitted but reverse tx index persistence failed"
+					);
+				}
 			}
 		}
 		Ok(())
@@ -774,7 +870,9 @@ mod tests {
 	use solver_types::utils::tests::builders::{
 		OrderBuilder, TransactionBuilder, TransactionReceiptBuilder,
 	};
-	use solver_types::{FillProof, Order, Transaction, TransactionHash, TransactionReceipt};
+	use solver_types::{
+		FillProof, Order, Transaction, TransactionHash, TransactionReceipt, HYPERLANE7683_STANDARD,
+	};
 	use std::collections::HashMap;
 	use std::sync::Arc;
 	use tokio::sync::broadcast;
@@ -873,6 +971,15 @@ mod tests {
 		(handler, event_rx)
 	}
 
+	fn assert_multi_fill_settlement_error(error: SettlementError) {
+		match error {
+			SettlementError::SettlementService(
+				solver_settlement::SettlementError::ValidationFailed(message),
+			) => assert!(message.contains("multi-fill settlement is not supported")),
+			other => panic!("Expected multi-fill settlement validation error, got {other:?}"),
+		}
+	}
+
 	#[tokio::test]
 	async fn test_handle_post_fill_ready_storage_error() {
 		let (handler, _) = create_test_handler_with_mocks(
@@ -948,6 +1055,284 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn handle_post_fill_ready_rejects_expected_multi_fill_before_settlement_calls() {
+		let (handler, _) = create_test_handler_with_mocks(
+			|mock_storage| {
+				mock_storage
+					.expect_get_bytes()
+					.with(eq("orders:test_order_123"))
+					.times(1)
+					.returning(|_| {
+						let order = OrderBuilder::new()
+							.with_standard("eip7683")
+							.with_fill_tx_hash(Some(TransactionHash(vec![0x11; 32])))
+							.with_expected_fill_tx_count(Some(2))
+							.build();
+						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+					});
+			},
+			|mock_settlement| {
+				mock_settlement.expect_recover_post_fill_state().times(0);
+				mock_settlement
+					.expect_generate_post_fill_execution_transaction()
+					.times(0);
+			},
+			|mock_delivery| {
+				mock_delivery.expect_get_receipt().times(0);
+				mock_delivery.expect_submit().times(0);
+			},
+			|_| {},
+		)
+		.await;
+
+		let error = handler
+			.handle_post_fill_ready("test_order_123".to_string())
+			.await
+			.unwrap_err();
+		assert_multi_fill_settlement_error(error);
+	}
+
+	#[tokio::test]
+	async fn handle_post_fill_ready_rejects_multiple_fill_hashes_before_recovery() {
+		let first_hash = TransactionHash(vec![0x11; 32]);
+		let second_hash = TransactionHash(vec![0x22; 32]);
+		let (handler, _) = create_test_handler_with_mocks(
+			|mock_storage| {
+				let first_hash = first_hash.clone();
+				let second_hash = second_hash.clone();
+				mock_storage
+					.expect_get_bytes()
+					.with(eq("orders:test_order_123"))
+					.times(1)
+					.returning(move |_| {
+						let order = OrderBuilder::new()
+							.with_standard("eip7683")
+							.with_fill_tx_hash(Some(first_hash.clone()))
+							.with_fill_tx_hashes(vec![first_hash.clone(), second_hash.clone()])
+							.build();
+						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+					});
+			},
+			|mock_settlement| {
+				mock_settlement.expect_recover_post_fill_state().times(0);
+				mock_settlement
+					.expect_generate_post_fill_execution_transaction()
+					.times(0);
+			},
+			|mock_delivery| {
+				mock_delivery.expect_get_receipt().times(0);
+				mock_delivery.expect_submit().times(0);
+			},
+			|_| {},
+		)
+		.await;
+
+		let error = handler
+			.handle_post_fill_ready("test_order_123".to_string())
+			.await
+			.unwrap_err();
+		assert_multi_fill_settlement_error(error);
+	}
+
+	#[tokio::test]
+	async fn handle_post_fill_ready_advances_hyperlane7683_scalar_fill_to_claim_ready() {
+		let order = OrderBuilder::new()
+			.with_id("test_order_hyperlane_scalar_fill")
+			.with_standard(HYPERLANE7683_STANDARD)
+			.with_status(OrderStatus::Executed)
+			.with_fill_tx_hash(Some(TransactionHash(vec![0x11; 32])))
+			.build();
+
+		let storage = Arc::new(StorageService::new(Box::new(
+			solver_storage::implementations::memory::MemoryStorage::new(),
+		)));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		state_machine.store_order(&order).await.unwrap();
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
+		let order_service = Arc::new(OrderService::new(
+			HashMap::new(),
+			Box::new(solver_order::MockExecutionStrategy::new()),
+		));
+		let event_bus = EventBus::new(100);
+		let mut receiver = event_bus.subscribe();
+		let handler = SettlementHandler::new(
+			settlement,
+			order_service,
+			delivery,
+			storage,
+			state_machine.clone(),
+			event_bus,
+			30,
+			HashMap::new(),
+		);
+
+		handler
+			.handle_post_fill_ready(order.id.clone())
+			.await
+			.unwrap();
+
+		let stored = state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(stored.status, OrderStatus::Settled);
+		assert!(stored.fill_proof.is_some());
+
+		let event = receiver.recv().await.unwrap();
+		match event {
+			SolverEvent::Settlement(SettlementEvent::ClaimReady { order_id }) => {
+				assert_eq!(order_id, order.id);
+			},
+			_ => panic!("Expected ClaimReady event, got {event:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn handle_post_fill_ready_advances_hyperlane7683_multi_fill_to_claim_ready() {
+		let order = OrderBuilder::new()
+			.with_id("test_order_hyperlane_multi_fill")
+			.with_standard(HYPERLANE7683_STANDARD)
+			.with_status(OrderStatus::Executed)
+			.with_fill_tx_hashes(vec![
+				TransactionHash(vec![0x11; 32]),
+				TransactionHash(vec![0x22; 32]),
+			])
+			.with_expected_fill_tx_count(Some(2))
+			.build();
+
+		let storage = Arc::new(StorageService::new(Box::new(
+			solver_storage::implementations::memory::MemoryStorage::new(),
+		)));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		state_machine.store_order(&order).await.unwrap();
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
+		let order_service = Arc::new(OrderService::new(
+			HashMap::new(),
+			Box::new(solver_order::MockExecutionStrategy::new()),
+		));
+		let event_bus = EventBus::new(100);
+		let mut receiver = event_bus.subscribe();
+		let handler = SettlementHandler::new(
+			settlement,
+			order_service,
+			delivery,
+			storage,
+			state_machine.clone(),
+			event_bus,
+			30,
+			HashMap::new(),
+		);
+
+		handler
+			.handle_post_fill_ready(order.id.clone())
+			.await
+			.unwrap();
+
+		let stored = state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(stored.status, OrderStatus::Settled);
+		assert!(stored.fill_proof.is_some());
+
+		let event = receiver.recv().await.unwrap();
+		match event {
+			SolverEvent::Settlement(SettlementEvent::ClaimReady { order_id }) => {
+				assert_eq!(order_id, order.id);
+			},
+			_ => panic!("Expected ClaimReady event, got {event:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn spawn_settlement_monitor_rejects_multi_fill_order() {
+		let (handler, _) = create_test_handler_with_mocks(|_| {}, |_| {}, |_| {}, |_| {}).await;
+		let order = OrderBuilder::new()
+			.with_standard("eip7683")
+			.with_fill_tx_hash(Some(TransactionHash(vec![0x11; 32])))
+			.with_expected_fill_tx_count(Some(2))
+			.build();
+
+		let error = handler
+			.spawn_settlement_monitor(order, TransactionHash(vec![0x11; 32]))
+			.unwrap_err();
+
+		assert_multi_fill_settlement_error(error);
+	}
+
+	#[tokio::test]
+	async fn handle_pre_claim_ready_rejects_multi_fill_before_preclaim_generation() {
+		let (handler, _) = create_test_handler_with_mocks(
+			|mock_storage| {
+				mock_storage
+					.expect_get_bytes()
+					.with(eq("orders:test_order_123"))
+					.times(1)
+					.returning(|_| {
+						let order = OrderBuilder::new()
+							.with_standard("eip7683")
+							.with_fill_proof(Some(create_test_fill_proof()))
+							.with_expected_fill_tx_count(Some(2))
+							.build();
+						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+					});
+			},
+			|mock_settlement| {
+				mock_settlement
+					.expect_generate_pre_claim_execution_transaction()
+					.times(0);
+			},
+			|mock_delivery| {
+				mock_delivery.expect_submit().times(0);
+			},
+			|_| {},
+		)
+		.await;
+
+		let error = handler
+			.handle_pre_claim_ready("test_order_123".to_string())
+			.await
+			.unwrap_err();
+		assert_multi_fill_settlement_error(error);
+	}
+
+	#[tokio::test]
+	async fn process_claim_batch_rejects_multi_fill_before_claim_generation() {
+		let (handler, _) = create_test_handler_with_mocks(
+			|mock_storage| {
+				mock_storage
+					.expect_get_bytes()
+					.with(eq("orders:test_order_123"))
+					.times(1)
+					.returning(|_| {
+						let order = OrderBuilder::new()
+							.with_standard("eip7683")
+							.with_fill_proof(Some(create_test_fill_proof()))
+							.with_expected_fill_tx_count(Some(2))
+							.build();
+						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+					});
+			},
+			|mock_settlement| {
+				mock_settlement
+					.expect_generate_claim_execution_transaction()
+					.times(0);
+			},
+			|mock_delivery| {
+				mock_delivery.expect_submit().times(0);
+			},
+			|mock_order| {
+				mock_order
+					.expect_generate_claim_execution_transaction()
+					.times(0);
+			},
+		)
+		.await;
+
+		let mut batch = vec!["test_order_123".to_string()];
+		let error = handler.process_claim_batch(&mut batch).await.unwrap_err();
+
+		assert_eq!(error.order_id, "test_order_123");
+		assert_multi_fill_settlement_error(error.error);
+	}
+
+	#[tokio::test]
 	async fn pre_claim_ready_preserves_insufficient_native_gas_as_transient() {
 		let (handler, _) = create_test_handler_with_mocks(
 			|mock_storage| {
@@ -965,9 +1350,11 @@ mod tests {
 			},
 			|mock_settlement| {
 				mock_settlement
-					.expect_generate_pre_claim_transaction()
+					.expect_generate_pre_claim_execution_transaction()
 					.times(1)
-					.returning(|_, _| Box::pin(async move { Ok(Some(create_test_transaction())) }));
+					.returning(|_, _| {
+						Box::pin(async move { Ok(Some(create_test_transaction().into())) })
+					});
 			},
 			|mock_delivery| {
 				mock_delivery.expect_submit().times(1).returning(|_, _| {
@@ -1066,7 +1453,7 @@ mod tests {
 			},
 			|mock_settlement| {
 				mock_settlement
-					.expect_generate_pre_claim_transaction()
+					.expect_generate_pre_claim_execution_transaction()
 					.times(1)
 					.returning(|_, _| {
 						Box::pin(async move {
@@ -1132,11 +1519,11 @@ mod tests {
 
 				// Mock settlement service methods
 				mock_settlement
-					.expect_generate_post_fill_transaction()
+					.expect_generate_post_fill_execution_transaction()
 					.times(1)
 					.returning(|_, _| {
 						let tx = create_test_transaction();
-						Box::pin(async move { Ok(Some(tx)) })
+						Box::pin(async move { Ok(Some(tx.into())) })
 					});
 			},
 			|mock_delivery| {
@@ -1188,7 +1575,7 @@ mod tests {
 					.returning(|_| Box::pin(async move { Ok(false) }));
 
 				mock_settlement
-						.expect_generate_post_fill_transaction()
+						.expect_generate_post_fill_execution_transaction()
 						.times(1)
 						// Return None to indicate no transaction needed
 						.returning(|_, _| Box::pin(async move { Ok(None) }));
@@ -1375,6 +1762,22 @@ mod tests {
 		found
 	}
 
+	fn drained_transaction_pending_count(
+		receiver: &mut broadcast::Receiver<SolverEvent>,
+		expected_type: TransactionType,
+	) -> usize {
+		let mut count = 0;
+		while let Ok(event) = receiver.try_recv() {
+			if let SolverEvent::Delivery(DeliveryEvent::TransactionPending { tx_type, .. }) = event
+			{
+				if tx_type == expected_type {
+					count += 1;
+				}
+			}
+		}
+		count
+	}
+
 	// M-24: After delivery succeeds, the stage tx-hash persistence
 	// (`set_transaction_hash`) is best-effort. A failure there must NOT terminally
 	// fail the order, because the transaction is already on-chain and recovery can
@@ -1416,11 +1819,11 @@ mod tests {
 					.times(1)
 					.returning(|_| Box::pin(async move { Ok(false) }));
 				mock_settlement
-					.expect_generate_post_fill_transaction()
+					.expect_generate_post_fill_execution_transaction()
 					.times(1)
 					.returning(|_, _| {
 						let tx = create_test_transaction();
-						Box::pin(async move { Ok(Some(tx)) })
+						Box::pin(async move { Ok(Some(tx.into())) })
 					});
 			},
 			|mock_delivery| {
@@ -1493,11 +1896,11 @@ mod tests {
 					.times(1)
 					.returning(|_| Box::pin(async move { Ok(false) }));
 				mock_settlement
-					.expect_generate_post_fill_transaction()
+					.expect_generate_post_fill_execution_transaction()
 					.times(1)
 					.returning(|_, _| {
 						let tx = create_test_transaction();
-						Box::pin(async move { Ok(Some(tx)) })
+						Box::pin(async move { Ok(Some(tx.into())) })
 					});
 			},
 			|mock_delivery| {
@@ -1564,9 +1967,11 @@ mod tests {
 			},
 			|mock_settlement| {
 				mock_settlement
-					.expect_generate_pre_claim_transaction()
+					.expect_generate_pre_claim_execution_transaction()
 					.times(1)
-					.returning(|_, _| Box::pin(async move { Ok(Some(create_test_transaction())) }));
+					.returning(|_, _| {
+						Box::pin(async move { Ok(Some(create_test_transaction().into())) })
+					});
 			},
 			|mock_delivery| {
 				mock_delivery.expect_submit().times(1).returning(|_, _| {
@@ -1623,9 +2028,11 @@ mod tests {
 			},
 			|mock_settlement| {
 				mock_settlement
-					.expect_generate_pre_claim_transaction()
+					.expect_generate_pre_claim_execution_transaction()
 					.times(1)
-					.returning(|_, _| Box::pin(async move { Ok(Some(create_test_transaction())) }));
+					.returning(|_, _| {
+						Box::pin(async move { Ok(Some(create_test_transaction().into())) })
+					});
 			},
 			|mock_delivery| {
 				mock_delivery.expect_submit().times(1).returning(|_, _| {
@@ -1653,6 +2060,170 @@ mod tests {
 
 	// M-24: Claim stage tx-hash persistence is best-effort after submit. The batch
 	// handler must return Ok(()) rather than wrapping the failure in ClaimBatchError.
+	#[tokio::test]
+	async fn test_process_claim_batch_uses_settlement_claim_tx_for_hyperlane7683() {
+		let (handler, mut receiver) = create_test_handler_with_mocks(
+			|mock_storage| {
+				mock_storage
+					.expect_get_bytes()
+					.with(eq("orders:test_order_123"))
+					.returning(|_| {
+						let order = OrderBuilder::new()
+							.with_id("test_order_123".to_string())
+							.with_standard(HYPERLANE7683_STANDARD)
+							.with_fill_proof(Some(create_test_fill_proof()))
+							.build();
+						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+					});
+				mock_storage
+					.expect_compare_and_swap_with_indexes()
+					.times(2)
+					.returning(|_, _, _, _, _| Box::pin(async move { Ok(true) }));
+				mock_storage
+					.expect_set_bytes()
+					.times(1)
+					.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+			},
+			|mock_settlement| {
+				mock_settlement
+					.expect_generate_claim_execution_transactions()
+					.times(1)
+					.returning(|_, _| {
+						let mut tx = create_test_transaction();
+						tx.data = vec![0x99];
+						Box::pin(async move { Ok(vec![tx.into()]) })
+					});
+			},
+			|mock_delivery| {
+				mock_delivery
+					.expect_submit()
+					.times(1)
+					.withf(|tx, _| tx.data == vec![0x99])
+					.returning(|_, _| {
+						let hash = TransactionHash(vec![0x33; 32]);
+						Box::pin(async move { Ok(hash) })
+					});
+			},
+			|mock_order| {
+				mock_order
+					.expect_generate_claim_execution_transaction()
+					.times(0);
+			},
+		)
+		.await;
+
+		let mut batch = vec!["test_order_123".to_string()];
+		let result = handler.process_claim_batch(&mut batch).await;
+
+		assert!(
+			result.is_ok(),
+			"Hyperlane7683 claim should use settlement-owned transaction, got: {result:?}"
+		);
+		assert!(
+			drained_has_transaction_pending(&mut receiver, TransactionType::Claim),
+			"TransactionPending should be published for the claim"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_process_claim_batch_submits_all_hyperlane7683_claim_txs() {
+		let order = OrderBuilder::new()
+			.with_id("test_order_123".to_string())
+			.with_standard(HYPERLANE7683_STANDARD)
+			.with_fill_proof(Some(create_test_fill_proof()))
+			.build();
+		let first_hash = TransactionHash(vec![0x33; 32]);
+		let second_hash = TransactionHash(vec![0x44; 32]);
+
+		let storage = Arc::new(StorageService::new(Box::new(
+			solver_storage::implementations::memory::MemoryStorage::new(),
+		)));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		state_machine.store_order(&order).await.unwrap();
+
+		let mut mock_settlement = MockSettlementInterface::new();
+		mock_settlement
+			.expect_generate_claim_execution_transactions()
+			.times(1)
+			.returning(|_, _| {
+				let mut first = create_test_transaction();
+				first.data = vec![0x99, 0x01];
+				let mut second = create_test_transaction();
+				second.data = vec![0x99, 0x02];
+				Box::pin(async move { Ok(vec![first.into(), second.into()]) })
+			});
+		let settlement = Arc::new(SettlementService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_settlement) as Box<dyn solver_settlement::SettlementInterface>,
+			)]),
+			"eip7683".to_string(),
+			20,
+		));
+
+		let submit_count = Arc::new(std::sync::Mutex::new(0usize));
+		let submit_count_for_mock = submit_count.clone();
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_submit()
+			.times(2)
+			.returning(move |_, _| {
+				let mut count = submit_count_for_mock.lock().unwrap();
+				*count += 1;
+				let hash = if *count == 1 {
+					first_hash.clone()
+				} else {
+					second_hash.clone()
+				};
+				Box::pin(async move { Ok(hash) })
+			});
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([(
+				137u64,
+				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]),
+			1,
+			20,
+			60,
+		));
+
+		let mut mock_order = MockOrderInterface::new();
+		mock_order
+			.expect_generate_claim_execution_transaction()
+			.times(0);
+		let order_service = Arc::new(OrderService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_order) as Box<dyn solver_order::OrderInterface>,
+			)]),
+			Box::new(solver_order::MockExecutionStrategy::new()),
+		));
+
+		let event_bus = EventBus::new(100);
+		let mut receiver = event_bus.subscribe();
+		let handler = SettlementHandler::new(
+			settlement,
+			order_service,
+			delivery,
+			storage,
+			state_machine.clone(),
+			event_bus,
+			30,
+			HashMap::new(),
+		);
+
+		let mut batch = vec![order.id.clone()];
+		handler.process_claim_batch(&mut batch).await.unwrap();
+
+		assert_eq!(
+			drained_transaction_pending_count(&mut receiver, TransactionType::Claim),
+			2
+		);
+		let stored = state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(stored.expected_claim_tx_count, Some(2));
+		assert_eq!(stored.claim_transaction_hashes().len(), 2);
+	}
+
 	#[tokio::test]
 	async fn test_process_claim_batch_state_write_failure_after_submit_is_non_terminal() {
 		let (handler, mut receiver) = create_test_handler_with_mocks(
@@ -1692,9 +2263,11 @@ mod tests {
 			},
 			|mock_order| {
 				mock_order
-					.expect_generate_claim_transaction()
+					.expect_generate_claim_execution_transaction()
 					.times(1)
-					.returning(|_, _| Box::pin(async move { Ok(create_test_transaction()) }));
+					.returning(|_, _| {
+						Box::pin(async move { Ok(create_test_transaction().into()) })
+					});
 			},
 		)
 		.await;
@@ -1751,9 +2324,11 @@ mod tests {
 			},
 			|mock_order| {
 				mock_order
-					.expect_generate_claim_transaction()
+					.expect_generate_claim_execution_transaction()
 					.times(1)
-					.returning(|_, _| Box::pin(async move { Ok(create_test_transaction()) }));
+					.returning(|_, _| {
+						Box::pin(async move { Ok(create_test_transaction().into()) })
+					});
 			},
 		)
 		.await;

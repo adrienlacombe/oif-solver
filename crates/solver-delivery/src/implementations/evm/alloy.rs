@@ -30,12 +30,14 @@ use alloy_provider::{
 };
 use alloy_rpc_client::RpcClient;
 use alloy_rpc_types::{BlockNumberOrTag, TransactionRequest};
+use alloy_sol_types::SolCall;
 use alloy_transport::layers::RetryBackoffLayer;
 use alloy_transport::TransportError;
 use async_trait::async_trait;
 use solver_account::AccountSigner;
 use solver_types::{
-	Address as SolverAddress, ConfigSchema, Field, FieldType, NetworksConfig, Schema,
+	standards::hyperlane7683::interfaces::IHyperlane7683, Address as SolverAddress, ConfigSchema,
+	Field, FieldType, Hyperlane7683OrderStatus, NetworksConfig, Schema,
 	Transaction as SolverTransaction, TransactionAttempt, TransactionAttemptScope,
 	TransactionAttemptStatus, TransactionHash, TransactionReceipt, TransactionType,
 };
@@ -398,6 +400,20 @@ fn solver_address_from_alloy(address: Address) -> SolverAddress {
 	SolverAddress(address.as_slice().to_vec())
 }
 
+fn normalize_hyperlane7683_evm_settler(
+	destination_settler: &SolverAddress,
+) -> Result<SolverAddress, DeliveryError> {
+	match destination_settler.0.len() {
+		20 => Ok(destination_settler.clone()),
+		32 if destination_settler.0[..12].iter().all(|byte| *byte == 0) => {
+			Ok(SolverAddress(destination_settler.0[12..].to_vec()))
+		},
+		len => Err(DeliveryError::Network(format!(
+			"Hyperlane7683 EVM destination settler must be 20 bytes or left-padded bytes32, got {len} bytes"
+		))),
+	}
+}
+
 fn tracking_scope(id: &str, tx_type: TransactionType) -> TransactionAttemptScope {
 	match tx_type {
 		TransactionType::Approval
@@ -422,7 +438,7 @@ async fn record_planned_attempt(
 			scope: tracking_scope(&tracking.tracking.id, tracking.tracking.tx_type),
 			signer: Some(signer),
 			tx_type: tracking.tracking.tx_type,
-			tx,
+			tx: tx.into(),
 			attempt_id_override,
 			replacement_of,
 		})
@@ -692,7 +708,11 @@ impl AlloyDelivery {
 
 			// Create signer with chain ID
 			let chain_signer = signer.with_chain_id(Some(*network_id));
-			let signer_address = chain_signer.address();
+			let signer_address = chain_signer.evm_address().ok_or_else(|| {
+				DeliveryError::Network(format!(
+					"EVM delivery for network {network_id} requires an EVM account signer"
+				))
+			})?;
 			let chain_signer_for_storage = chain_signer.clone();
 			let wallet = EthereumWallet::from(chain_signer);
 
@@ -3507,6 +3527,44 @@ impl DeliveryInterface for AlloyDelivery {
 			.map_err(|e| DeliveryError::Network(format!("Failed to execute eth_call: {e}")))?;
 
 		Ok(result)
+	}
+
+	async fn get_hyperlane7683_order_status(
+		&self,
+		chain_id: u64,
+		destination_settler: &SolverAddress,
+		order_id: [u8; 32],
+	) -> Result<Hyperlane7683OrderStatus, DeliveryError> {
+		let destination_settler = normalize_hyperlane7683_evm_settler(destination_settler)?;
+		let call_data = IHyperlane7683::orderStatusCall {
+			orderId: FixedBytes::<32>::from(order_id),
+		};
+		let result = self
+			.eth_call(SolverTransaction {
+				to: Some(destination_settler.clone()),
+				data: call_data.abi_encode(),
+				value: U256::ZERO,
+				chain_id,
+				nonce: None,
+				gas_limit: None,
+				gas_price: None,
+				max_fee_per_gas: None,
+				max_priority_fee_per_gas: None,
+			})
+			.await
+			.map_err(|e| {
+				DeliveryError::Network(format!(
+					"Hyperlane7683 orderStatus failed on destination settler {destination_settler}: {e}"
+				))
+			})?;
+		let status = IHyperlane7683::orderStatusCall::abi_decode_returns(&result).map_err(|e| {
+			DeliveryError::Network(format!(
+				"Failed to decode Hyperlane7683 orderStatus result: {e}"
+			))
+		})?;
+		let mut status_bytes = [0u8; 32];
+		status_bytes.copy_from_slice(status.as_slice());
+		Ok(Hyperlane7683OrderStatus::from_evm_bytes32(status_bytes))
 	}
 
 	async fn eth_call_at_block(

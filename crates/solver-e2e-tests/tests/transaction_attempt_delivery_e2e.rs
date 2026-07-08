@@ -13,8 +13,8 @@ use solver_storage::{
 };
 use solver_types::validation::{ConfigSchema, ValidationError};
 use solver_types::{
-	Address, Log, LogFilter, Transaction, TransactionAttemptStatus, TransactionHash,
-	TransactionReceipt, TransactionType,
+	Address, ExecutionTransaction, Log, LogFilter, Transaction, TransactionAttemptStatus,
+	TransactionHash, TransactionReceipt, TransactionType,
 };
 use tempfile::TempDir;
 
@@ -59,7 +59,7 @@ impl DeliveryInterface for RecordingDelivery {
 				},
 				signer: Some(self.signer.clone()),
 				tx_type: tracking.tracking.tx_type,
-				tx,
+				tx: ExecutionTransaction::from(tx),
 				attempt_id_override: None,
 				replacement_of: None,
 			})

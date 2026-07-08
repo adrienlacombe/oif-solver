@@ -1,5 +1,6 @@
 use crate::{
-	current_timestamp, Address, Transaction, TransactionHash, TransactionReceipt, TransactionType,
+	current_timestamp, Address, ExecutionTransaction, TransactionHash, TransactionReceipt,
+	TransactionType,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -73,7 +74,7 @@ pub struct TransactionAttempt {
 	pub nonce: Option<u64>,
 	pub tx_hash: Option<TransactionHash>,
 	pub receipt: Option<TransactionReceipt>,
-	pub tx: Transaction,
+	pub tx: ExecutionTransaction,
 	pub status: TransactionAttemptStatus,
 	pub error: Option<String>,
 	pub created_at: u64,
@@ -104,7 +105,7 @@ impl<'de> Deserialize<'de> for TransactionAttempt {
 			nonce: Option<u64>,
 			tx_hash: Option<TransactionHash>,
 			receipt: Option<TransactionReceipt>,
-			tx: Transaction,
+			tx: ExecutionTransaction,
 			status: TransactionAttemptStatus,
 			error: Option<String>,
 			created_at: u64,
@@ -150,16 +151,17 @@ impl TransactionAttempt {
 		scope: TransactionAttemptScope,
 		signer: Option<Address>,
 		tx_type: TransactionType,
-		tx: Transaction,
+		tx: impl Into<ExecutionTransaction>,
 	) -> Self {
 		let now = current_timestamp();
+		let tx = tx.into();
 		Self {
 			id,
 			scope,
 			signer,
 			tx_type,
-			chain_id: tx.chain_id,
-			nonce: tx.nonce,
+			chain_id: tx.network_id(),
+			nonce: tx.nonce(),
 			tx_hash: None,
 			receipt: None,
 			tx,
@@ -188,7 +190,9 @@ impl TransactionAttempt {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::{Address, Log, TransactionHash, TransactionReceipt};
+	use crate::{
+		Address, Log, StarknetInvokeTransaction, Transaction, TransactionHash, TransactionReceipt,
+	};
 	use alloy_primitives::U256;
 
 	fn sample_tx() -> Transaction {
@@ -286,8 +290,44 @@ mod tests {
 		assert!(decoded.receipt.as_ref().unwrap().success);
 		assert_eq!(decoded.status, attempt.status);
 		assert_eq!(decoded.error, attempt.error);
-		assert_eq!(decoded.tx.data, attempt.tx.data);
-		assert_eq!(decoded.tx.chain_id, attempt.tx.chain_id);
+		assert_eq!(decoded.tx, attempt.tx);
+	}
+
+	#[test]
+	fn planned_attempt_accepts_starknet_execution_transaction() {
+		let invoke = StarknetInvokeTransaction {
+			network_id: 11155111,
+			sender_address: Address(vec![0x11; 32]),
+			calls: vec![],
+			account_calldata: Vec::new(),
+			nonce: Some(U256::from(7)),
+			resource_bounds: None,
+			signature: Vec::new(),
+			tip: U256::ZERO,
+			version: 3,
+			paymaster_data: Vec::new(),
+			account_deployment_data: Vec::new(),
+			nonce_data_availability_mode: None,
+			fee_data_availability_mode: None,
+			starknet_chain_id: Some("SN_SEPOLIA".to_string()),
+		};
+
+		let attempt = TransactionAttempt::planned(
+			"attempt-1".to_string(),
+			TransactionAttemptScope::order("order-1"),
+			Some(Address(vec![9; 32])),
+			TransactionType::Fill,
+			invoke.clone(),
+		);
+
+		assert_eq!(attempt.chain_id, 11155111);
+		assert_eq!(attempt.nonce, Some(7));
+		assert!(attempt.tx.as_evm().is_none());
+
+		let json = serde_json::to_string(&attempt).unwrap();
+		assert!(json.contains("\"kind\":\"starknetInvoke\""));
+		let decoded: TransactionAttempt = serde_json::from_str(&json).unwrap();
+		assert_eq!(decoded.tx, ExecutionTransaction::from(invoke));
 	}
 
 	#[test]

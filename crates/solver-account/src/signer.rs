@@ -9,9 +9,90 @@ use alloy_primitives::{Address, Signature};
 use alloy_signer::Signer;
 use alloy_signer_local::PrivateKeySigner;
 use async_trait::async_trait;
+use solver_types::{
+	parse_starknet_address, parse_starknet_felt, Address as SolverAddress, StarknetConversionError,
+};
+use starknet_rust_core::types::Felt;
+use starknet_rust_signers::SigningKey;
 
 #[cfg(feature = "kms")]
 use alloy_signer_aws::AwsSigner;
+
+/// Local Starknet signer/account metadata.
+#[derive(Clone)]
+pub struct StarknetLocalSigner {
+	account_address: SolverAddress,
+	signing_key: SigningKey,
+	public_key: SolverAddress,
+}
+
+impl StarknetLocalSigner {
+	pub fn new(
+		account_address: SolverAddress,
+		private_key: &str,
+		public_key: Option<&str>,
+	) -> Result<Self, String> {
+		if account_address.0.len() != 32 {
+			return Err(format!(
+				"Starknet account_address must be 32 bytes, got {}",
+				account_address.0.len()
+			));
+		}
+		let parsed_account =
+			parse_starknet_address(&format!("0x{}", hex::encode(&account_address.0)))
+				.map_err(|e| format!("Invalid Starknet account_address: {e}"))?;
+		let account_address = SolverAddress(parsed_account.to_vec());
+
+		let private_key = parse_starknet_private_key(private_key)?;
+		let signing_key = SigningKey::from_secret_scalar(Felt::from_bytes_be(&private_key));
+		let derived_public_key = signing_key.verifying_key().scalar().to_bytes_be();
+		if let Some(public_key) = public_key {
+			let configured = parse_starknet_felt(public_key)
+				.map_err(|e| format!("Invalid Starknet public_key: {e}"))?;
+			if configured != derived_public_key {
+				return Err("Starknet public_key does not match private_key".to_string());
+			}
+		}
+
+		Ok(Self {
+			account_address,
+			signing_key,
+			public_key: SolverAddress(derived_public_key.to_vec()),
+		})
+	}
+
+	pub fn account_address(&self) -> &SolverAddress {
+		&self.account_address
+	}
+
+	pub fn signing_key(&self) -> &SigningKey {
+		&self.signing_key
+	}
+
+	pub fn public_key(&self) -> &SolverAddress {
+		&self.public_key
+	}
+}
+
+fn parse_starknet_private_key(private_key: &str) -> Result<[u8; 32], String> {
+	let private_key = parse_starknet_felt(private_key).map_err(|e| match e {
+		StarknetConversionError::ZeroAddress => "Starknet private_key cannot be zero".to_string(),
+		other => format!("Invalid Starknet private_key: {other}"),
+	})?;
+	if private_key.iter().all(|byte| *byte == 0) {
+		return Err("Starknet private_key cannot be zero".to_string());
+	}
+	Ok(private_key)
+}
+
+impl std::fmt::Debug for StarknetLocalSigner {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("StarknetLocalSigner")
+			.field("account_address", &self.account_address)
+			.field("public_key", &self.public_key)
+			.finish_non_exhaustive()
+	}
+}
 
 /// Unified signer that wraps different signing backends.
 ///
@@ -26,15 +107,32 @@ pub enum AccountSigner {
 	/// AWS KMS signer (only available with `kms` feature).
 	#[cfg(feature = "kms")]
 	Kms(AwsSigner),
+	/// Local Starknet account signer using a STARK-curve private key.
+	StarknetLocal(StarknetLocalSigner),
 }
 
 impl AccountSigner {
 	/// Returns the signer's Ethereum address.
 	pub fn address(&self) -> Address {
+		self.evm_address()
+			.expect("non-EVM signer does not have an Ethereum address")
+	}
+
+	/// Returns the signer's Ethereum address when this is an EVM signer.
+	pub fn evm_address(&self) -> Option<Address> {
 		match self {
-			Self::Local(s) => Signer::address(s),
+			Self::Local(s) => Some(Signer::address(s)),
 			#[cfg(feature = "kms")]
-			Self::Kms(s) => Signer::address(s),
+			Self::Kms(s) => Some(Signer::address(s)),
+			Self::StarknetLocal(_) => None,
+		}
+	}
+
+	/// Returns the signer as a local Starknet account signer, if applicable.
+	pub fn starknet_local(&self) -> Option<&StarknetLocalSigner> {
+		match self {
+			Self::StarknetLocal(signer) => Some(signer),
+			_ => None,
 		}
 	}
 
@@ -44,6 +142,7 @@ impl AccountSigner {
 			Self::Local(s) => Self::Local(Signer::with_chain_id(s, chain_id)),
 			#[cfg(feature = "kms")]
 			Self::Kms(s) => Self::Kms(Signer::with_chain_id(s, chain_id)),
+			Self::StarknetLocal(s) => Self::StarknetLocal(s),
 		}
 	}
 }
@@ -63,6 +162,9 @@ impl TxSigner<Signature> for AccountSigner {
 			Self::Local(s) => TxSigner::sign_transaction(s, tx).await,
 			#[cfg(feature = "kms")]
 			Self::Kms(s) => TxSigner::sign_transaction(s, tx).await,
+			Self::StarknetLocal(_) => {
+				panic!("Starknet signer cannot sign Ethereum transactions")
+			},
 		}
 	}
 }
@@ -75,6 +177,10 @@ impl std::fmt::Debug for AccountSigner {
 				.finish_non_exhaustive(),
 			#[cfg(feature = "kms")]
 			Self::Kms(_) => f.debug_struct("AccountSigner::Kms").finish_non_exhaustive(),
+			Self::StarknetLocal(signer) => f
+				.debug_tuple("AccountSigner::StarknetLocal")
+				.field(signer)
+				.finish(),
 		}
 	}
 }

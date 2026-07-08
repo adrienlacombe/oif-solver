@@ -13,12 +13,13 @@ use thiserror::Error;
 /// Signer abstraction module
 pub mod signer;
 
-/// Re-export AccountSigner for convenience
-pub use signer::AccountSigner;
+/// Re-export signer types for convenience
+pub use signer::{AccountSigner, StarknetLocalSigner};
 
 /// Re-export implementations
 pub mod implementations {
 	pub mod local;
+	pub mod starknet_local;
 
 	#[cfg(feature = "kms")]
 	pub mod kms;
@@ -84,10 +85,16 @@ pub trait AccountRegistry: ImplementationRegistry<Factory = AccountFactory> {}
 /// Returns a vector of (name, factory) tuples for all available account implementations.
 /// This is used by the factory registry to automatically register all implementations.
 pub fn get_all_implementations() -> Vec<(&'static str, AccountFactory)> {
-	use implementations::local;
+	use implementations::{local, starknet_local};
 
 	#[allow(unused_mut)]
-	let mut impls = vec![(local::Registry::NAME, local::Registry::factory())];
+	let mut impls = vec![
+		(local::Registry::NAME, local::Registry::factory()),
+		(
+			starknet_local::Registry::NAME,
+			starknet_local::Registry::factory(),
+		),
+	];
 
 	#[cfg(feature = "kms")]
 	{

@@ -250,12 +250,14 @@ fn parent_for_child<'a>(
 fn assert_replacement(parent: &TransactionAttempt, child: &TransactionAttempt) {
 	assert_eq!(child.replacement_of.as_deref(), Some(parent.id.as_str()));
 	assert_eq!(child.nonce, parent.nonce);
+	let parent_tx = parent.tx.as_evm().expect("parent attempt should be EVM");
+	let child_tx = child.tx.as_evm().expect("child attempt should be EVM");
 	assert!(
-		child.tx.max_fee_per_gas.unwrap_or_default()
-			> parent.tx.max_fee_per_gas.unwrap_or_default(),
+		child_tx.max_fee_per_gas.unwrap_or_default()
+			> parent_tx.max_fee_per_gas.unwrap_or_default(),
 		"child fee must exceed parent fee: parent={:?}, child={:?}",
-		parent.tx.max_fee_per_gas,
-		child.tx.max_fee_per_gas
+		parent_tx.max_fee_per_gas,
+		child_tx.max_fee_per_gas
 	);
 }
 

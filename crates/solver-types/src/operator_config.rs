@@ -27,7 +27,7 @@
 
 use crate::{
 	auth::{normalize_admin_whitelist, upsert_admin_role, AdminRole, AdminWhitelistEntry},
-	networks::NetworkType,
+	networks::{NetworkKind, NetworkType},
 };
 use alloy_primitives::{Address, B256};
 use rust_decimal::Decimal;
@@ -129,6 +129,10 @@ pub struct OperatorNetworkConfig {
 	/// Network role classification.
 	#[serde(default, rename = "type")]
 	pub network_type: NetworkType,
+
+	/// Blockchain execution environment for this network.
+	#[serde(default, skip_serializing_if = "NetworkKind::is_evm")]
+	pub kind: NetworkKind,
 
 	/// Tokens supported on this network.
 	pub tokens: Vec<OperatorToken>,
@@ -261,6 +265,13 @@ pub struct OperatorHyperlaneConfig {
 	/// Hyperlane domain per canonical chain ID.
 	#[serde(default)]
 	pub domains: HashMap<u64, u32>,
+
+	/// Starknet protocol fee token address per Starknet chain.
+	///
+	/// Stored as strings because Starknet fee token addresses are 252-bit felts,
+	/// not 20-byte EVM addresses.
+	#[serde(default)]
+	pub starknet_fee_token_addresses: HashMap<u64, String>,
 
 	/// Oracle addresses for input and output verification.
 	pub oracles: OperatorOracleConfig,
@@ -1060,6 +1071,7 @@ mod tests {
 			chain_id: 10,
 			name: "optimism".to_string(),
 			network_type: NetworkType::Parent,
+			kind: NetworkKind::Evm,
 			tokens: vec![
 				OperatorToken {
 					symbol: "USDC".to_string(),
@@ -1122,6 +1134,7 @@ mod tests {
 						chain_id: 10,
 						name: "optimism".to_string(),
 						network_type: NetworkType::Parent,
+						kind: NetworkKind::Evm,
 						tokens: vec![OperatorToken {
 							symbol: "USDC".to_string(),
 							name: Some("USD Coin".to_string()),
@@ -1151,6 +1164,7 @@ mod tests {
 					mailboxes: HashMap::new(),
 					igp_addresses: HashMap::new(),
 					domains: HashMap::new(),
+					starknet_fee_token_addresses: HashMap::new(),
 					oracles: OperatorOracleConfig {
 						input: HashMap::new(),
 						output: HashMap::new(),

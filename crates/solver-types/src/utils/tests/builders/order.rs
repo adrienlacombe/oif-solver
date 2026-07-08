@@ -22,9 +22,13 @@ pub struct OrderBuilder {
 	execution_params: Option<crate::ExecutionParams>,
 	prepare_tx_hash: Option<TransactionHash>,
 	fill_tx_hash: Option<TransactionHash>,
+	fill_tx_hashes: Vec<TransactionHash>,
+	expected_fill_tx_count: Option<usize>,
 	post_fill_tx_hash: Option<TransactionHash>,
 	pre_claim_tx_hash: Option<TransactionHash>,
 	claim_tx_hash: Option<TransactionHash>,
+	claim_tx_hashes: Vec<TransactionHash>,
+	expected_claim_tx_count: Option<usize>,
 	fill_proof: Option<FillProof>,
 	settlement_name: Option<String>,
 }
@@ -64,9 +68,13 @@ impl Default for OrderBuilder {
 			execution_params: None,
 			prepare_tx_hash: None,
 			fill_tx_hash: None,
+			fill_tx_hashes: Vec::new(),
+			expected_fill_tx_count: None,
 			post_fill_tx_hash: None,
 			pre_claim_tx_hash: None,
 			claim_tx_hash: None,
+			claim_tx_hashes: Vec::new(),
+			expected_claim_tx_count: None,
 			fill_proof: None,
 			settlement_name: None,
 		}
@@ -184,7 +192,21 @@ impl OrderBuilder {
 
 	/// Sets the fill transaction hash.
 	pub fn with_fill_tx_hash(mut self, tx_hash: Option<TransactionHash>) -> Self {
-		self.fill_tx_hash = tx_hash;
+		self.fill_tx_hash = tx_hash.clone();
+		self.fill_tx_hashes = tx_hash.into_iter().collect();
+		self
+	}
+
+	/// Sets all fill transaction hashes.
+	pub fn with_fill_tx_hashes(mut self, tx_hashes: Vec<TransactionHash>) -> Self {
+		self.fill_tx_hash = tx_hashes.first().cloned();
+		self.fill_tx_hashes = tx_hashes;
+		self
+	}
+
+	/// Sets the expected fill transaction count.
+	pub fn with_expected_fill_tx_count(mut self, count: Option<usize>) -> Self {
+		self.expected_fill_tx_count = count;
 		self
 	}
 
@@ -202,7 +224,21 @@ impl OrderBuilder {
 
 	/// Sets the claim transaction hash.
 	pub fn with_claim_tx_hash(mut self, tx_hash: Option<TransactionHash>) -> Self {
-		self.claim_tx_hash = tx_hash;
+		self.claim_tx_hash = tx_hash.clone();
+		self.claim_tx_hashes = tx_hash.into_iter().collect();
+		self
+	}
+
+	/// Sets all claim transaction hashes.
+	pub fn with_claim_tx_hashes(mut self, tx_hashes: Vec<TransactionHash>) -> Self {
+		self.claim_tx_hash = tx_hashes.first().cloned();
+		self.claim_tx_hashes = tx_hashes;
+		self
+	}
+
+	/// Sets the expected claim transaction count.
+	pub fn with_expected_claim_tx_count(mut self, count: Option<usize>) -> Self {
+		self.expected_claim_tx_count = count;
 		self
 	}
 
@@ -223,6 +259,9 @@ impl OrderBuilder {
 		let timestamp = self.updated_at;
 		self.status = OrderStatus::Executed;
 		self.fill_tx_hash = Some(tx_hash.clone());
+		if !self.fill_tx_hashes.contains(&tx_hash) {
+			self.fill_tx_hashes.push(tx_hash.clone());
+		}
 		self.fill_proof = Some(FillProof {
 			tx_hash,
 			block_number,
@@ -255,9 +294,13 @@ impl OrderBuilder {
 			execution_params: self.execution_params,
 			prepare_tx_hash: self.prepare_tx_hash,
 			fill_tx_hash: self.fill_tx_hash,
+			fill_tx_hashes: self.fill_tx_hashes,
+			expected_fill_tx_count: self.expected_fill_tx_count,
 			post_fill_tx_hash: self.post_fill_tx_hash,
 			pre_claim_tx_hash: self.pre_claim_tx_hash,
 			claim_tx_hash: self.claim_tx_hash,
+			claim_tx_hashes: self.claim_tx_hashes,
+			expected_claim_tx_count: self.expected_claim_tx_count,
 			fill_proof: self.fill_proof,
 			settlement_name: self.settlement_name,
 		}

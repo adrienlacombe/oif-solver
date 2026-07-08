@@ -388,10 +388,10 @@ impl OrderStateMachine {
 	) -> Result<Order, OrderStateError> {
 		self.update_order_with(order_id, |order| match tx_type {
 			TransactionType::Prepare => order.prepare_tx_hash = Some(tx_hash.clone()),
-			TransactionType::Fill => order.fill_tx_hash = Some(tx_hash.clone()),
+			TransactionType::Fill => order.add_fill_transaction_hash(tx_hash.clone()),
 			TransactionType::PostFill => order.post_fill_tx_hash = Some(tx_hash.clone()),
 			TransactionType::PreClaim => order.pre_claim_tx_hash = Some(tx_hash.clone()),
-			TransactionType::Claim => order.claim_tx_hash = Some(tx_hash.clone()),
+			TransactionType::Claim => order.add_claim_transaction_hash(tx_hash.clone()),
 			TransactionType::Approval
 			| TransactionType::Withdrawal
 			| TransactionType::Bridge
@@ -1082,7 +1082,23 @@ mod tests {
 			.set_transaction_hash("test_order_1", tx_hash.clone(), TransactionType::Fill)
 			.await
 			.unwrap();
+		assert_eq!(updated.fill_tx_hash, Some(tx_hash.clone()));
+		assert_eq!(updated.fill_tx_hashes, vec![tx_hash.clone()]);
+
+		let second_fill_hash = solver_types::TransactionHash("0xfill2".as_bytes().to_vec());
+		let updated = state_machine
+			.set_transaction_hash(
+				"test_order_1",
+				second_fill_hash.clone(),
+				TransactionType::Fill,
+			)
+			.await
+			.unwrap();
 		assert_eq!(updated.fill_tx_hash, Some(tx_hash));
+		assert_eq!(
+			updated.fill_tx_hashes,
+			vec![updated.fill_tx_hash.clone().unwrap(), second_fill_hash]
+		);
 	}
 
 	#[test]

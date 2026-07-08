@@ -107,9 +107,7 @@ async fn create_planned_attempt_persists_with_v4_id() {
 	assert_eq!(loaded.error, attempt.error);
 	assert_eq!(loaded.created_at, attempt.created_at);
 	assert_eq!(loaded.updated_at, attempt.updated_at);
-	assert_eq!(loaded.tx.chain_id, attempt.tx.chain_id);
-	assert_eq!(loaded.tx.nonce, attempt.tx.nonce);
-	assert_eq!(loaded.tx.data, attempt.tx.data);
+	assert_eq!(loaded.tx, attempt.tx);
 }
 
 #[tokio::test]
@@ -154,7 +152,7 @@ async fn system_attempts_are_discoverable_without_order_lookup() {
 			},
 			signer: Some(Address(vec![7; 20])),
 			tx_type: TransactionType::Approval,
-			tx: sample_tx(10, Some(3)),
+			tx: sample_tx(10, Some(3)).into(),
 			attempt_id_override: None,
 			replacement_of: None,
 		})

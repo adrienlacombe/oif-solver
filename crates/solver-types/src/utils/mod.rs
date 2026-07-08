@@ -8,11 +8,12 @@ pub mod conversion;
 pub mod eip712;
 pub mod formatting;
 pub mod helpers;
+pub mod starknet;
 pub mod tests;
 
 pub use constants::{
 	DEFAULT_GAS_PRICE_WEI, MOCK_ETH_SOL_PRICE, MOCK_ETH_USD_PRICE, MOCK_SOL_USD_PRICE,
-	MOCK_TOKA_USD_PRICE, MOCK_TOKB_USD_PRICE, ZERO_BYTES32,
+	MOCK_STRK_USD_PRICE, MOCK_TOKA_USD_PRICE, MOCK_TOKB_USD_PRICE, ZERO_BYTES32,
 };
 pub use conversion::{
 	address_to_bytes32, address_to_bytes32_hex, addresses_equal, bytes20_to_alloy_address,
@@ -27,3 +28,14 @@ pub use eip712::{
 };
 pub use formatting::{format_token_amount, truncate_id, with_0x_prefix, without_0x_prefix};
 pub use helpers::{current_timestamp, order_id_to_bytes32};
+pub use starknet::{
+	append_cairo_u128_bytes_calldata, build_hyperlane7683_starknet_fill_calldata,
+	build_hyperlane7683_starknet_settle_calldata, bytes32_to_starknet_u256, bytes_to_u128_felts,
+	normalize_starknet_chain_id, parse_starknet_address, parse_starknet_felt,
+	solidity_order_id_to_starknet_u256, starknet_origin_evm_settlement_enabled,
+	starknet_origin_evm_settlement_enabled_for, starknet_selector, u256_to_starknet_felts,
+	StarknetConversionError, StarknetU256Felts, IS_DEVNET_ENV, MAINNET_PRODUCTION_ENV,
+	MAINNET_PROOF_ENV, NETWORK_PROFILE_ENV, STARKNET_FELT_BYTES, STARKNET_MAINNET_CHAIN_ID,
+	STARKNET_MAINNET_CHAIN_ID_HEX, STARKNET_ORIGIN_EVM_SETTLE_ENV, STARKNET_SEPOLIA_CHAIN_ID,
+	STARKNET_SEPOLIA_CHAIN_ID_HEX, STARKNET_U128_WORD_BYTES, STARKNET_U256_LIMB_BITS,
+};

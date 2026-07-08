@@ -9,7 +9,9 @@ use crate::SolverError;
 use alloy_primitives::hex;
 use solver_config::Config;
 use solver_delivery::DeliveryService;
-use solver_types::{Address, ExecutionContext, Intent};
+use solver_types::{
+	Address, ExecutionContext, Hyperlane7683ResolvedOrder, Intent, HYPERLANE7683_STANDARD,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -103,6 +105,7 @@ impl ContextBuilder {
 
 		match intent.standard.as_str() {
 			"eip7683" => self.extract_eip7683_chains(&intent.data),
+			HYPERLANE7683_STANDARD => self.extract_hyperlane7683_chains(&intent.data),
 			_ => {
 				tracing::warn!(
 					standard = %intent.standard,
@@ -184,6 +187,61 @@ impl ContextBuilder {
 		Ok(chains)
 	}
 
+	/// Extracts Hyperlane domains from Hyperlane7683 resolved order data.
+	fn extract_hyperlane7683_chains(
+		&self,
+		data: &serde_json::Value,
+	) -> Result<Vec<u64>, SolverError> {
+		let order: Hyperlane7683ResolvedOrder =
+			serde_json::from_value(data.clone()).map_err(|e| {
+				SolverError::Service(format!(
+					"Failed to parse Hyperlane7683 resolved order data: {e}"
+				))
+			})?;
+
+		let mut chains = Vec::new();
+
+		let origin = order.origin_domain().map_err(|e| {
+			SolverError::Service(format!("Invalid Hyperlane7683 origin_chain_id: {e}"))
+		})?;
+		push_unique_chain(&mut chains, u64::from(origin));
+
+		for (index, output) in order.max_spent.iter().enumerate() {
+			let chain_id = output.chain_domain().map_err(|e| {
+				SolverError::Service(format!(
+					"Invalid Hyperlane7683 max_spent[{index}].chain_id: {e}"
+				))
+			})?;
+			push_unique_chain(&mut chains, u64::from(chain_id));
+		}
+
+		for (index, output) in order.min_received.iter().enumerate() {
+			let chain_id = output.chain_domain().map_err(|e| {
+				SolverError::Service(format!(
+					"Invalid Hyperlane7683 min_received[{index}].chain_id: {e}"
+				))
+			})?;
+			push_unique_chain(&mut chains, u64::from(chain_id));
+		}
+
+		for (index, instruction) in order.fill_instructions.iter().enumerate() {
+			let chain_id = instruction.destination_domain().map_err(|e| {
+				SolverError::Service(format!(
+					"Invalid Hyperlane7683 fill_instructions[{index}].destination_chain_id: {e}"
+				))
+			})?;
+			push_unique_chain(&mut chains, u64::from(chain_id));
+		}
+
+		if chains.is_empty() {
+			return Err(SolverError::Service(
+				"No chains found in Hyperlane7683 resolved order data".to_string(),
+			));
+		}
+
+		Ok(chains)
+	}
+
 	/// Fetches solver balances for all relevant chains and tokens.
 	///
 	/// This method gets the solver's balance for both native tokens and
@@ -255,9 +313,16 @@ impl ContextBuilder {
 	}
 }
 
+fn push_unique_chain(chains: &mut Vec<u64>, chain_id: u64) {
+	if !chains.contains(&chain_id) {
+		chains.push(chain_id);
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use alloy_primitives::U256;
 	use mockall::predicate::*;
 	use serde_json::json;
 	use solver_account::MockAccountInterface;
@@ -496,6 +561,106 @@ mod tests {
 			.unwrap_err()
 			.to_string()
 			.contains("Unsupported intent standard"));
+	}
+
+	#[test]
+	fn test_extract_hyperlane7683_chains_preserves_first_seen_order() {
+		let context_builder = create_context_builder();
+		let resolved_order = Hyperlane7683ResolvedOrder {
+			user: [0x11; 32],
+			origin_chain_id: U256::from(700001),
+			open_deadline: 1,
+			fill_deadline: 2,
+			order_id: [0x22; 32],
+			max_spent: vec![
+				solver_types::Hyperlane7683Output {
+					token: [0x33; 32],
+					amount: U256::from(1000),
+					recipient: [0x44; 32],
+					chain_id: U256::from(700002),
+				},
+				solver_types::Hyperlane7683Output {
+					token: [0x55; 32],
+					amount: U256::from(2000),
+					recipient: [0x66; 32],
+					chain_id: U256::from(700003),
+				},
+			],
+			min_received: vec![
+				solver_types::Hyperlane7683Output {
+					token: [0x77; 32],
+					amount: U256::from(900),
+					recipient: [0x88; 32],
+					chain_id: U256::from(700003),
+				},
+				solver_types::Hyperlane7683Output {
+					token: [0x99; 32],
+					amount: U256::from(1800),
+					recipient: [0xaa; 32],
+					chain_id: U256::from(700004),
+				},
+			],
+			fill_instructions: vec![
+				solver_types::Hyperlane7683FillInstruction {
+					destination_chain_id: U256::from(700004),
+					destination_settler: [0xbb; 32],
+					origin_data: vec![0xcc],
+				},
+				solver_types::Hyperlane7683FillInstruction {
+					destination_chain_id: U256::from(700005),
+					destination_settler: [0xdd; 32],
+					origin_data: vec![0xee],
+				},
+				solver_types::Hyperlane7683FillInstruction {
+					destination_chain_id: U256::from(700001),
+					destination_settler: [0xff; 32],
+					origin_data: vec![],
+				},
+			],
+		};
+		let intent = create_test_intent(
+			HYPERLANE7683_STANDARD,
+			serde_json::to_value(resolved_order).unwrap(),
+		);
+
+		let chains = context_builder
+			.extract_chains_from_intent(&intent)
+			.expect("Hyperlane7683 chain extraction should succeed");
+
+		assert_eq!(chains, vec![700001, 700002, 700003, 700004, 700005]);
+	}
+
+	#[test]
+	fn test_extract_hyperlane7683_chains_rejects_invalid_domain_width() {
+		let context_builder = create_context_builder();
+		let invalid_domain = U256::from(u32::MAX) + U256::from(1);
+		let resolved_order = Hyperlane7683ResolvedOrder {
+			user: [0x11; 32],
+			origin_chain_id: U256::from(700001),
+			open_deadline: 1,
+			fill_deadline: 2,
+			order_id: [0x22; 32],
+			max_spent: vec![solver_types::Hyperlane7683Output {
+				token: [0x33; 32],
+				amount: U256::from(1000),
+				recipient: [0x44; 32],
+				chain_id: invalid_domain,
+			}],
+			min_received: vec![],
+			fill_instructions: vec![],
+		};
+		let intent = create_test_intent(
+			HYPERLANE7683_STANDARD,
+			serde_json::to_value(resolved_order).unwrap(),
+		);
+
+		let error = context_builder
+			.extract_chains_from_intent(&intent)
+			.expect_err("Hyperlane7683 chain extraction should reject oversized domains");
+
+		let message = error.to_string();
+		assert!(message.contains("Invalid Hyperlane7683 max_spent[0].chain_id"));
+		assert!(message.contains("exceeds uint32 max"));
 	}
 
 	#[tokio::test]

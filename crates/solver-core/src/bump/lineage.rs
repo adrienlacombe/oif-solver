@@ -105,13 +105,16 @@ pub fn highest_fees_in_lineage(
 	let mut max_priority: Option<u128> = None;
 	let mut max_gas_price: Option<u128> = None;
 	for a in component {
-		if let Some(v) = a.tx.max_fee_per_gas {
+		let Some(tx) = a.tx.as_evm() else {
+			continue;
+		};
+		if let Some(v) = tx.max_fee_per_gas {
 			max_fee = Some(max_fee.map_or(v, |cur| cur.max(v)));
 		}
-		if let Some(v) = a.tx.max_priority_fee_per_gas {
+		if let Some(v) = tx.max_priority_fee_per_gas {
 			max_priority = Some(max_priority.map_or(v, |cur| cur.max(v)));
 		}
-		if let Some(v) = a.tx.gas_price {
+		if let Some(v) = tx.gas_price {
 			max_gas_price = Some(max_gas_price.map_or(v, |cur| cur.max(v)));
 		}
 	}

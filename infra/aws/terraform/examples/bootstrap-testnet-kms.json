@@ -1,0 +1,71 @@
+{
+  "solver_id": "oif-solver-dev",
+  "solver_name": "OIF Solver Dev",
+  "account": {
+    "primary": "kms",
+    "implementations": {
+      "kms": {
+        "key_id": "arn:aws:kms:us-east-1:123456789012:key/00000000-0000-0000-0000-000000000000",
+        "region": "us-east-1"
+      }
+    }
+  },
+  "networks": [
+    {
+      "chain_id": 11155420,
+      "name": "optimism-sepolia",
+      "type": "parent",
+      "tokens": [
+        {
+          "symbol": "USDC",
+          "name": "USD Coin",
+          "address": "0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6",
+          "decimals": 6
+        }
+      ]
+    },
+    {
+      "chain_id": 84532,
+      "name": "base-sepolia",
+      "type": "hub",
+      "tokens": [
+        {
+          "symbol": "USDC",
+          "name": "USD Coin",
+          "address": "0x73c83DAcc74bB8a704717AC09703b959E74b9705",
+          "decimals": 6
+        }
+      ]
+    }
+  ],
+  "source_finality": {
+    "default_mode": "conservative",
+    "default_blocks": 20,
+    "default_block_time_seconds": 12,
+    "retry_grace_seconds": 10,
+    "chains": {
+      "11155420": {
+        "mode": "numeric",
+        "blocks": 30,
+        "block_time_seconds": 2
+      },
+      "84532": {
+        "mode": "numeric",
+        "blocks": 30,
+        "block_time_seconds": 2
+      }
+    }
+  },
+  "admin": {
+    "enabled": true,
+    "domain": "solver.example.com",
+    "chain_id": 84532,
+    "admin_addresses": [
+      "0xYourAdminAddress"
+    ],
+    "withdrawals": {
+      "enabled": true,
+      "recipient_allowlist": []
+    }
+  }
+}

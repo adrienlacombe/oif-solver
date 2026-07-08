@@ -13,7 +13,7 @@ use serde::Serialize;
 use solver_config::Config;
 use solver_core::SolverEngine;
 use solver_types::{networks::NetworkType, with_0x_prefix};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -53,6 +53,66 @@ pub struct TokenInfo {
 	pub name: Option<String>,
 	/// Number of decimal places for the token.
 	pub decimals: u8,
+}
+
+/// Go public API compatibility response for supported tokens.
+#[derive(Debug, Serialize)]
+pub struct TokenCompatibilityResponse {
+	/// Map of chain ID (as string) to network token information.
+	pub networks: HashMap<String, TokenCompatibilityNetwork>,
+}
+
+/// Go public API compatibility token information for one network.
+#[derive(Debug, Serialize)]
+pub struct TokenCompatibilityNetwork {
+	/// The blockchain network ID.
+	pub chain_id: u64,
+	/// Input settler contract address.
+	pub input_settler: String,
+	/// Output settler contract address.
+	pub output_settler: String,
+	/// List of supported tokens on this network.
+	pub tokens: Vec<TokenCompatibilityInfo>,
+}
+
+/// Go public API compatibility token metadata.
+#[derive(Debug, Serialize)]
+pub struct TokenCompatibilityInfo {
+	/// Token contract address.
+	pub address: String,
+	/// Token symbol (e.g., "USDC", "USDT").
+	pub symbol: String,
+	/// Number of decimal places for the token.
+	pub decimals: u8,
+}
+
+fn executable_token_network_ids(config: &Config) -> Option<HashSet<u64>> {
+	let mut chain_ids = HashSet::new();
+
+	for implementation in config.settlement.implementations.values() {
+		let Some(routes) = implementation
+			.get("routes")
+			.and_then(|value| value.as_object())
+		else {
+			continue;
+		};
+
+		for (source, destinations) in routes {
+			if let Ok(source_chain_id) = source.parse::<u64>() {
+				chain_ids.insert(source_chain_id);
+			}
+
+			if let Some(destinations) = destinations.as_array() {
+				for destination in destinations {
+					if let Some(destination_chain_id) = destination.as_u64() {
+						chain_ids.insert(destination_chain_id);
+					}
+				}
+			}
+		}
+	}
+
+	(!chain_ids.is_empty()).then_some(chain_ids)
 }
 
 /// Handles GET /api/v1/assets requests.
@@ -193,6 +253,80 @@ pub async fn get_assets_for_chain_from_config(
 	}
 }
 
+/// Handles Go public API compatibility token list requests using dynamic_config.
+pub async fn get_tokens_compat_from_config(
+	State(dynamic_config): State<Arc<RwLock<Config>>>,
+) -> Json<TokenCompatibilityResponse> {
+	let config = dynamic_config.read().await;
+
+	let mut response = TokenCompatibilityResponse {
+		networks: HashMap::new(),
+	};
+	let executable_networks = executable_token_network_ids(&config);
+
+	for (chain_id, network) in &config.networks {
+		if executable_networks
+			.as_ref()
+			.is_some_and(|networks| !networks.contains(chain_id))
+		{
+			continue;
+		}
+
+		response.networks.insert(
+			chain_id.to_string(),
+			TokenCompatibilityNetwork {
+				chain_id: *chain_id,
+				input_settler: with_0x_prefix(&hex::encode(&network.input_settler_address.0)),
+				output_settler: with_0x_prefix(&hex::encode(&network.output_settler_address.0)),
+				tokens: network
+					.tokens
+					.iter()
+					.map(|t| TokenCompatibilityInfo {
+						address: with_0x_prefix(&hex::encode(&t.address.0)),
+						symbol: t.symbol.clone(),
+						decimals: t.decimals,
+					})
+					.collect(),
+			},
+		);
+	}
+
+	Json(response)
+}
+
+/// Handles Go public API compatibility token list requests for a specific chain.
+pub async fn get_tokens_compat_for_chain_from_config(
+	Path(chain_id): Path<u64>,
+	State(dynamic_config): State<Arc<RwLock<Config>>>,
+) -> Result<Json<TokenCompatibilityNetwork>, StatusCode> {
+	let config = dynamic_config.read().await;
+	let executable_networks = executable_token_network_ids(&config);
+	if executable_networks
+		.as_ref()
+		.is_some_and(|networks| !networks.contains(&chain_id))
+	{
+		return Err(StatusCode::NOT_FOUND);
+	}
+
+	match config.networks.get(&chain_id) {
+		Some(network) => Ok(Json(TokenCompatibilityNetwork {
+			chain_id,
+			input_settler: with_0x_prefix(&hex::encode(&network.input_settler_address.0)),
+			output_settler: with_0x_prefix(&hex::encode(&network.output_settler_address.0)),
+			tokens: network
+				.tokens
+				.iter()
+				.map(|t| TokenCompatibilityInfo {
+					address: with_0x_prefix(&hex::encode(&t.address.0)),
+					symbol: t.symbol.clone(),
+					decimals: t.decimals,
+				})
+				.collect(),
+		})),
+		None => Err(StatusCode::NOT_FOUND),
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -238,6 +372,7 @@ mod tests {
 			NetworkConfig {
 				name: Some("ethereum".to_string()),
 				network_type: NetworkType::Parent,
+				kind: Default::default(),
 				rpc_urls: vec![RpcEndpoint::http_only(
 					"https://eth.example.com".to_string(),
 				)],
@@ -256,6 +391,7 @@ mod tests {
 			NetworkConfig {
 				name: Some("polygon".to_string()),
 				network_type: NetworkType::Hub,
+				kind: Default::default(),
 				rpc_urls: vec![RpcEndpoint::http_only(
 					"https://polygon.example.com".to_string(),
 				)],
@@ -294,6 +430,7 @@ mod tests {
 			NetworkConfig {
 				name: Some("ethereum".to_string()),
 				network_type: NetworkType::Parent,
+				kind: Default::default(),
 				rpc_urls: vec![RpcEndpoint::http_only(
 					"https://eth.example.com".to_string(),
 				)],
@@ -316,6 +453,7 @@ mod tests {
 			NetworkConfig {
 				name: Some("arbitrum".to_string()),
 				network_type: NetworkType::Hub,
+				kind: Default::default(),
 				rpc_urls: vec![RpcEndpoint::http_only(
 					"https://arb.example.com".to_string(),
 				)],
@@ -887,6 +1025,39 @@ mod tests {
 		.expect("Failed to parse test config with empty tokens")
 	}
 
+	fn create_test_config_with_route_filter() -> Config {
+		let mut config = create_test_config();
+		config.networks.insert(
+			10,
+			NetworkConfig {
+				name: Some("optimism".to_string()),
+				network_type: NetworkType::New,
+				kind: Default::default(),
+				rpc_urls: vec![RpcEndpoint::http_only("http://localhost:8547".to_string())],
+				input_settler_address: Address(AlloyAddress::from([0x88u8; 20]).to_vec()),
+				output_settler_address: Address(AlloyAddress::from([0x99u8; 20]).to_vec()),
+				tokens: vec![TokenConfig {
+					address: Address(AlloyAddress::from([0xaau8; 20]).to_vec()),
+					symbol: "AUX".to_string(),
+					name: None,
+					decimals: 18,
+				}],
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+		config.settlement.implementations.insert(
+			"hyperlane".to_string(),
+			serde_json::json!({
+				"routes": {
+					"1": [137]
+				}
+			}),
+		);
+		config
+	}
+
 	#[tokio::test]
 	async fn test_get_assets_from_config_returns_all_networks() {
 		let config = create_test_config();
@@ -1013,5 +1184,90 @@ mod tests {
 		let network = response.unwrap().0;
 		assert_eq!(network.chain_id, 137);
 		assert!(network.assets.is_empty());
+	}
+
+	#[tokio::test]
+	async fn test_get_tokens_compat_from_config_uses_go_token_shape() {
+		let config = create_test_config();
+		let dynamic_config = Arc::new(RwLock::new(config));
+
+		let response = get_tokens_compat_from_config(State(dynamic_config)).await;
+		let tokens_response = response.0;
+
+		let eth_network = tokens_response.networks.get("1").unwrap();
+		assert_eq!(eth_network.chain_id, 1);
+		assert_eq!(
+			eth_network.input_settler,
+			"0x1111111111111111111111111111111111111111"
+		);
+		assert_eq!(
+			eth_network.output_settler,
+			"0x2222222222222222222222222222222222222222"
+		);
+		assert_eq!(eth_network.tokens.len(), 2);
+		assert_eq!(eth_network.tokens[0].symbol, "USDC");
+
+		let json = serde_json::to_value(&tokens_response).unwrap();
+		let eth_json = &json["networks"]["1"];
+		assert!(eth_json.get("tokens").is_some());
+		assert!(eth_json.get("assets").is_none());
+		assert!(eth_json.get("type").is_none());
+		assert!(eth_json["tokens"][0].get("name").is_none());
+	}
+
+	#[tokio::test]
+	async fn test_get_tokens_compat_from_config_filters_to_configured_routes() {
+		let config = create_test_config_with_route_filter();
+		let dynamic_config = Arc::new(RwLock::new(config));
+
+		let response = get_tokens_compat_from_config(State(dynamic_config)).await;
+		let tokens_response = response.0;
+
+		assert!(tokens_response.networks.contains_key("1"));
+		assert!(tokens_response.networks.contains_key("137"));
+		assert!(!tokens_response.networks.contains_key("10"));
+	}
+
+	#[tokio::test]
+	async fn test_get_tokens_compat_for_chain_from_config_valid_chain() {
+		let config = create_test_config();
+		let dynamic_config = Arc::new(RwLock::new(config));
+
+		let response =
+			get_tokens_compat_for_chain_from_config(Path(137), State(dynamic_config)).await;
+
+		assert!(response.is_ok());
+		let network = response.unwrap().0;
+		assert_eq!(network.chain_id, 137);
+		assert_eq!(
+			network.input_settler,
+			"0x5555555555555555555555555555555555555555"
+		);
+		assert_eq!(network.tokens.len(), 1);
+		assert_eq!(network.tokens[0].symbol, "USDC");
+	}
+
+	#[tokio::test]
+	async fn test_get_tokens_compat_for_chain_from_config_invalid_chain() {
+		let config = create_test_config();
+		let dynamic_config = Arc::new(RwLock::new(config));
+
+		let response =
+			get_tokens_compat_for_chain_from_config(Path(999), State(dynamic_config)).await;
+
+		assert!(response.is_err());
+		assert_eq!(response.unwrap_err(), StatusCode::NOT_FOUND);
+	}
+
+	#[tokio::test]
+	async fn test_get_tokens_compat_for_chain_from_config_rejects_unrouted_chain() {
+		let config = create_test_config_with_route_filter();
+		let dynamic_config = Arc::new(RwLock::new(config));
+
+		let response =
+			get_tokens_compat_for_chain_from_config(Path(10), State(dynamic_config)).await;
+
+		assert!(response.is_err());
+		assert_eq!(response.unwrap_err(), StatusCode::NOT_FOUND);
 	}
 }

@@ -10,24 +10,26 @@ This file is the source of truth for AI coding assistants working in this repo. 
 
 | Crate | Path | Purpose | Crate-specific `AGENTS.md`? |
 |---|---|---|---|
-| solver-account | `crates/solver-account` | Account abstractions, signers (local + AWS KMS) | No |
-| solver-bridge | `crates/solver-bridge` | Cross-chain bridge orchestrator (LayerZero VaultBridge + Redis state) | No |
-| solver-config | `crates/solver-config` | Config load/validation with optimistic locking | No |
+| solver-account | `crates/solver-account` | Account abstractions, signers (local + AWS KMS) | **Yes** |
+| solver-bridge | `crates/solver-bridge` | Cross-chain bridge orchestrator (LayerZero VaultBridge + Redis state) | **Yes** |
+| solver-config | `crates/solver-config` | Config load/validation with optimistic locking | **Yes** |
 | solver-core | `crates/solver-core` | Orchestration: discovery → order → delivery → settlement | **Yes** |
-| solver-delivery | `crates/solver-delivery` | Transaction delivery abstraction across chains | No |
+| solver-delivery | `crates/solver-delivery` | Transaction delivery abstraction across chains | **Yes** |
 | solver-demo | `crates/solver-demo` | CLI for cross-chain intent testing (default-member binary) | **Yes** |
-| solver-discovery | `crates/solver-discovery` | Intent discovery (on-chain events + off-chain APIs) | No |
+| solver-discovery | `crates/solver-discovery` | Intent discovery (on-chain events + off-chain APIs) | **Yes** |
 | solver-e2e-tests | `crates/solver-e2e-tests` | End-to-end harness with real Anvil chains + Foundry | **Yes** |
-| solver-order | `crates/solver-order` | Order validation, fill, transaction generation | No |
-| solver-pricing | `crates/solver-pricing` | Pricing oracle trait + mock impls | No |
+| solver-order | `crates/solver-order` | Order validation, fill, transaction generation | **Yes** |
+| solver-pricing | `crates/solver-pricing` | Pricing oracle trait + mock impls | **Yes** |
 | solver-service | `crates/solver-service` | HTTP service (Axum); the `solver` binary (default-member) | **Yes** |
-| solver-settlement | `crates/solver-settlement` | Settlement lifecycle orchestration | No |
-| solver-storage | `crates/solver-storage` | Persistence abstractions (Redis + file backends) | No |
-| solver-types | `crates/solver-types` | Shared types: orders, events, auth, admin | No |
+| solver-settlement | `crates/solver-settlement` | Settlement lifecycle orchestration | **Yes** |
+| solver-storage | `crates/solver-storage` | Persistence abstractions (Redis + file backends) | **Yes** |
+| solver-types | `crates/solver-types` | Shared types: orders, events, auth, admin | **Yes** |
 
 ## Walk the tree before editing
 
 Before editing a file in `crates/<X>/`, read root `AGENTS.md` (this file) and, if present, `crates/<X>/AGENTS.md`. Crate-specific files override or refine the defaults stated here.
+
+When adding a new crate, add a local `AGENTS.md` and a sibling `CLAUDE.md` containing only `@AGENTS.md`.
 
 ## Build / test / lint — canonical commands
 
@@ -93,7 +95,8 @@ cargo clippy --all-features --all-targets 2>&1 | tee /tmp/clippy.log
 
 ## Conventions worth knowing
 
-- **Alloy ecosystem only.** No ethers-rs, no web3. Don't introduce a second EVM library.
+- **EVM code uses Alloy.** No ethers-rs, no web3. Don't introduce a second EVM library.
+- **Non-EVM code uses the chain SDK already in the workspace.** Starknet support uses the `starknet-rust-*` crates; don't rewrite it through EVM abstractions or replace it with another Starknet SDK without a deliberate migration.
 - **`edition = "2021"`** in workspace `Cargo.toml`. **MSRV `1.88.0`** pinned in `rust-toolchain.toml`.
 - Note: `rustfmt.toml` currently has `edition = "2024"`. This is a known internal inconsistency. Do not "fix" by bumping the workspace edition.
 - rustfmt: 100-column max width, hard tabs (intentional).

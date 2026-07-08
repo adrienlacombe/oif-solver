@@ -25,6 +25,8 @@ mockall = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 solver-types = { path = "../solver-types" }
+starknet-rust-core = { workspace = true }
+starknet-rust-signers = { workspace = true }
 thiserror = "2.0.17"
 tokio = { workspace = true }
 

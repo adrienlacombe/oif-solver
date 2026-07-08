@@ -423,8 +423,22 @@ pub async fn start_server(
 		.route("/health", get(handle_health))
 		.with_state(app_state.clone());
 
+	let token_compatibility_routes = Router::new()
+		.route("/api/tokens", get(handle_get_tokens_compat))
+		.route("/v1/tokens", get(handle_get_tokens_compat))
+		.route(
+			"/api/tokens/{chain_id}",
+			get(handle_get_tokens_compat_for_chain),
+		)
+		.route(
+			"/v1/tokens/{chain_id}",
+			get(handle_get_tokens_compat_for_chain),
+		)
+		.with_state(app_state.clone());
+
 	let app = Router::new()
 		.merge(health_routes) // Health endpoints at root level
+		.merge(token_compatibility_routes)
 		.nest("/api/v1", api_routes)
 		.layer(ServiceBuilder::new().layer(CorsLayer::permissive()))
 		.with_state(app_state);
@@ -584,6 +598,25 @@ async fn handle_get_assets_for_chain(
 ) -> Result<Json<crate::apis::tokens::NetworkTokens>, StatusCode> {
 	// Use shared config to support hot reload from admin API
 	crate::apis::tokens::get_assets_for_chain_from_config(
+		Path(chain_id),
+		State(state.config.clone()),
+	)
+	.await
+}
+
+/// Handles GET /api/tokens and /v1/tokens compatibility requests.
+async fn handle_get_tokens_compat(
+	State(state): State<AppState>,
+) -> Json<crate::apis::tokens::TokenCompatibilityResponse> {
+	crate::apis::tokens::get_tokens_compat_from_config(State(state.config)).await
+}
+
+/// Handles GET /api/tokens/{chain_id} and /v1/tokens/{chain_id} compatibility requests.
+async fn handle_get_tokens_compat_for_chain(
+	Path(chain_id): Path<u64>,
+	State(state): State<AppState>,
+) -> Result<Json<crate::apis::tokens::TokenCompatibilityNetwork>, StatusCode> {
+	crate::apis::tokens::get_tokens_compat_for_chain_from_config(
 		Path(chain_id),
 		State(state.config.clone()),
 	)

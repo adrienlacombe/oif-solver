@@ -14,5 +14,11 @@ pub mod eip7683;
 /// ERC-7930 Interoperable Address types for cross-chain addressing.
 pub mod eip7930;
 
+/// Hyperlane7683 resolved-order protocol types.
+pub mod hyperlane7683;
+
 // Re-export commonly used types for convenience
 pub use eip7683::{Eip7683OrderData, MandateOutput as Eip7683Output};
+pub use hyperlane7683::{
+	Hyperlane7683FillInstruction, Hyperlane7683Output, Hyperlane7683ResolvedOrder,
+};

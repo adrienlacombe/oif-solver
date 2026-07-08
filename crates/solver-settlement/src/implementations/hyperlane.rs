@@ -18,14 +18,24 @@ use alloy_primitives::{hex, FixedBytes, U256};
 use alloy_provider::{DynProvider, Provider};
 use alloy_sol_types::{sol, SolCall};
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use solver_storage::StorageService;
 use solver_types::{
-	order_id_to_bytes32, with_0x_prefix, ConfigSchema, Field, FieldType, FillProof, NetworksConfig,
-	Order, Schema, Transaction, TransactionHash, TransactionReceipt, TransactionType,
+	build_hyperlane7683_starknet_settle_calldata, order_id_to_bytes32, parse_starknet_address,
+	parse_starknet_felt,
+	standards::hyperlane7683::{
+		interfaces::IHyperlane7683, Hyperlane7683FillInstruction, Hyperlane7683ResolvedOrder,
+		HYPERLANE7683_STANDARD,
+	},
+	starknet_origin_evm_settlement_enabled, starknet_selector,
+	utils::bytes32_to_starknet_u256,
+	with_0x_prefix, ConfigSchema, ExecutionTransaction, Field, FieldType, FillProof, NetworkKind,
+	NetworksConfig, Order, Schema, SolverIdentityAddresses, StarknetCall,
+	StarknetInvokeTransaction, StarknetResourceBoundsMapping, Transaction, TransactionHash,
+	TransactionReceipt, TransactionType,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Custom serialization for U256
@@ -97,6 +107,121 @@ fn transaction_receipt_from_alloy(
 	receipt: &alloy_rpc_types::TransactionReceipt,
 ) -> TransactionReceipt {
 	TransactionReceipt::from(receipt)
+}
+
+const HYPERLANE7683_STATUS_UNKNOWN: [u8; 32] = [0u8; 32];
+const HYPERLANE7683_STATUS_FILLED: [u8; 32] = [
+	b'F', b'I', b'L', b'L', b'E', b'D', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0,
+];
+const HYPERLANE7683_STATUS_SETTLED: [u8; 32] = [
+	b'S', b'E', b'T', b'T', b'L', b'E', b'D', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0,
+];
+const HYPERLANE7683_STARKNET_STATUS_FILLED: &str = "FILLED";
+const HYPERLANE7683_STARKNET_STATUS_SETTLED: &str = "SETTLED";
+const HYPERLANE7683_ORDER_STATUS_ENTRYPOINT: &str = "order_status";
+const HYPERLANE7683_QUOTE_GAS_PAYMENT_ENTRYPOINT: &str = "quote_gas_payment";
+const HYPERLANE7683_ALLOWANCE_ENTRYPOINT: &str = "allowance";
+const HYPERLANE7683_APPROVE_ENTRYPOINT: &str = "approve";
+const HYPERLANE7683_SETTLE_ENTRYPOINT: &str = "settle";
+const STARKNET_U128_MAX: U256 = U256::from_limbs([u64::MAX, u64::MAX, 0, 0]);
+const DEFAULT_STARKNET_FEE_TOKEN_ADDRESS: &str =
+	"0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d";
+
+fn hyperlane7683_status_name(status: &[u8; 32]) -> String {
+	match *status {
+		HYPERLANE7683_STATUS_UNKNOWN => "UNKNOWN".to_string(),
+		HYPERLANE7683_STATUS_FILLED => "FILLED".to_string(),
+		HYPERLANE7683_STATUS_SETTLED => "SETTLED".to_string(),
+		_ => format!("0x{}", hex::encode(status)),
+	}
+}
+
+#[derive(Debug, Clone)]
+struct HyperlaneStarknetRpcClient {
+	http_url: String,
+	client: reqwest::Client,
+}
+
+impl HyperlaneStarknetRpcClient {
+	fn new(http_url: String) -> Self {
+		Self {
+			http_url,
+			client: reqwest::Client::new(),
+		}
+	}
+
+	async fn json_rpc<T: DeserializeOwned>(
+		&self,
+		method: &str,
+		params: serde_json::Value,
+	) -> Result<T, SettlementError> {
+		let request = serde_json::json!({
+			"jsonrpc": "2.0",
+			"id": 1,
+			"method": method,
+			"params": params,
+		});
+
+		let response = self
+			.client
+			.post(&self.http_url)
+			.json(&request)
+			.send()
+			.await
+			.map_err(|e| {
+				SettlementError::BackendUnavailable(format!(
+					"Failed to call Starknet RPC method {method}: {e}"
+				))
+			})?;
+
+		let status = response.status();
+		if !status.is_success() {
+			let body = response.text().await.unwrap_or_default();
+			return Err(SettlementError::BackendUnavailable(format!(
+				"Starknet RPC method {method} failed with HTTP {status}: {body}"
+			)));
+		}
+
+		let envelope = response
+			.json::<HyperlaneStarknetRpcEnvelope<T>>()
+			.await
+			.map_err(|e| {
+				SettlementError::BackendUnavailable(format!(
+					"Failed to parse Starknet RPC response for {method}: {e}"
+				))
+			})?;
+
+		match (envelope.result, envelope.error) {
+			(Some(result), None) => Ok(result),
+			(_, Some(error)) => Err(SettlementError::BackendUnavailable(format!(
+				"Starknet RPC method {method} returned error {}: {}{}",
+				error.code,
+				error.message,
+				error
+					.data
+					.map(|data| format!(" ({data})"))
+					.unwrap_or_default()
+			))),
+			(None, None) => Err(SettlementError::BackendUnavailable(format!(
+				"Starknet RPC response for {method} did not include result or error"
+			))),
+		}
+	}
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct HyperlaneStarknetRpcEnvelope<T> {
+	result: Option<T>,
+	error: Option<HyperlaneStarknetRpcError>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct HyperlaneStarknetRpcError {
+	code: i64,
+	message: String,
+	data: Option<serde_json::Value>,
 }
 
 sol! {
@@ -350,15 +475,47 @@ impl MessageTracker {
 #[allow(dead_code)]
 pub struct HyperlaneSettlement {
 	providers: HashMap<u64, DynProvider>,
+	network_kinds: HashMap<u64, NetworkKind>,
+	starknet_clients: HashMap<u64, HyperlaneStarknetRpcClient>,
 	oracle_config: OracleConfig,
 	mailbox_addresses: HashMap<u64, solver_types::Address>,
 	igp_addresses: HashMap<u64, solver_types::Address>,
+	starknet_fee_token_addresses: HashMap<u64, solver_types::Address>,
 	domains: HashMap<u64, u32>,
 	message_tracker: Arc<MessageTracker>,
 	default_gas_limit: u64,
+	allow_zero_hyperlane7683_settle_quote: bool,
+	solver_identities: SolverIdentityAddresses,
+}
+
+pub struct HyperlaneSettlementInit {
+	pub oracle_config: OracleConfig,
+	pub mailbox_addresses: HashMap<u64, solver_types::Address>,
+	pub igp_addresses: HashMap<u64, solver_types::Address>,
+	pub starknet_fee_token_addresses: HashMap<u64, solver_types::Address>,
+	pub domains: HashMap<u64, u32>,
+	pub default_gas_limit: u64,
+	pub allow_zero_hyperlane7683_settle_quote: bool,
+	pub storage: Arc<StorageService>,
+	pub solver_identities: SolverIdentityAddresses,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Hyperlane7683SettlementLeg<'a> {
+	index: usize,
+	instruction: &'a Hyperlane7683FillInstruction,
+	destination_chain_id: u64,
+	network_kind: NetworkKind,
 }
 
 impl HyperlaneSettlement {
+	fn starknet_sender_address<'a>(&'a self, order: &'a Order) -> &'a solver_types::Address {
+		self.solver_identities
+			.starknet
+			.as_ref()
+			.unwrap_or(&order.solver_address)
+	}
+
 	fn resolve_domain(&self, chain_id: u64) -> Result<u32, SettlementError> {
 		self.domains.get(&chain_id).copied().ok_or_else(|| {
 			SettlementError::ValidationFailed(format!(
@@ -386,6 +543,78 @@ impl HyperlaneSettlement {
 			resolved.insert(*chain_id, domain);
 		}
 		Ok(resolved)
+	}
+
+	fn default_starknet_fee_token_address() -> Result<solver_types::Address, SettlementError> {
+		parse_starknet_address(DEFAULT_STARKNET_FEE_TOKEN_ADDRESS)
+			.map(|address| solver_types::Address(address.to_vec()))
+			.map_err(|e| {
+				SettlementError::ValidationFailed(format!(
+					"Default Starknet fee token address is invalid: {e}"
+				))
+			})
+	}
+
+	fn resolve_starknet_fee_token_addresses(
+		networks: &NetworksConfig,
+		configured: HashMap<u64, solver_types::Address>,
+	) -> Result<HashMap<u64, solver_types::Address>, SettlementError> {
+		let mut resolved = configured;
+		let default = Self::default_starknet_fee_token_address()?;
+		for (network_id, network) in networks {
+			if network.kind == NetworkKind::Starknet {
+				resolved
+					.entry(*network_id)
+					.or_insert_with(|| default.clone());
+			}
+		}
+		Ok(resolved)
+	}
+
+	fn network_kind(&self, chain_id: u64) -> NetworkKind {
+		self.network_kinds
+			.get(&chain_id)
+			.copied()
+			.unwrap_or(NetworkKind::Evm)
+	}
+
+	fn require_starknet_origin_evm_settlement_enabled(
+		&self,
+		origin_domain: u32,
+	) -> Result<(), SettlementError> {
+		let origin_chain_id = u64::from(origin_domain);
+		if self.network_kind(origin_chain_id) == NetworkKind::Starknet
+			&& !starknet_origin_evm_settlement_enabled()
+		{
+			return Err(SettlementError::ValidationFailed(format!(
+				"Starknet-origin EVM settlement for origin domain {origin_domain} is disabled on public profiles; verify router/gas registration, then set OIF_ENABLE_STARKNET_ORIGIN_EVM_SETTLE=true"
+			)));
+		}
+		Ok(())
+	}
+
+	fn starknet_client(
+		&self,
+		chain_id: u64,
+	) -> Result<&HyperlaneStarknetRpcClient, SettlementError> {
+		self.starknet_clients.get(&chain_id).ok_or_else(|| {
+			SettlementError::ValidationFailed(format!(
+				"No Starknet RPC URL configured for Hyperlane7683 destination chain {chain_id}"
+			))
+		})
+	}
+
+	fn starknet_fee_token_address(
+		&self,
+		chain_id: u64,
+	) -> Result<&solver_types::Address, SettlementError> {
+		self.starknet_fee_token_addresses
+			.get(&chain_id)
+			.ok_or_else(|| {
+				SettlementError::ValidationFailed(format!(
+					"No Starknet fee token address configured for Hyperlane7683 destination chain {chain_id}"
+				))
+			})
 	}
 
 	/// Validate that the order-bound input oracle is configured for the given
@@ -592,25 +821,67 @@ impl HyperlaneSettlement {
 	/// Creates a new HyperlaneSettlement instance
 	pub async fn new(
 		networks: &NetworksConfig,
-		oracle_config: OracleConfig,
-		mailbox_addresses: HashMap<u64, solver_types::Address>,
-		igp_addresses: HashMap<u64, solver_types::Address>,
-		domains: HashMap<u64, u32>,
-		default_gas_limit: u64,
-		storage: Arc<StorageService>,
+		init: HyperlaneSettlementInit,
 	) -> Result<Self, SettlementError> {
-		// Collect unique network IDs from input and output oracles
-		let all_network_ids: Vec<u64> = oracle_config
+		let HyperlaneSettlementInit {
+			oracle_config,
+			mailbox_addresses,
+			igp_addresses,
+			starknet_fee_token_addresses,
+			domains,
+			default_gas_limit,
+			allow_zero_hyperlane7683_settle_quote,
+			storage,
+			solver_identities,
+		} = init;
+
+		// Oracle post-fill requires mailbox/domain configuration only for
+		// oracle chains, but Hyperlane7683 direct settlement also needs EVM
+		// providers and domains for no-oracle destination chains.
+		let oracle_network_ids: Vec<u64> = oracle_config
 			.input_oracles
 			.keys()
 			.chain(oracle_config.output_oracles.keys())
 			.copied()
 			.collect();
-		let providers = create_providers_for_chains(&all_network_ids, networks)?;
-		let domains = Self::build_resolved_domains(domains, &all_network_ids)?;
+		let mut provider_network_ids = oracle_network_ids.clone();
+		provider_network_ids.extend(mailbox_addresses.keys().copied());
+		provider_network_ids.extend(igp_addresses.keys().copied());
+		provider_network_ids.extend(domains.keys().copied());
+		provider_network_ids.sort_unstable();
+		provider_network_ids.dedup();
+		provider_network_ids.retain(|network_id| {
+			networks
+				.get(network_id)
+				.is_none_or(|network| network.kind == NetworkKind::Evm)
+		});
+		let providers = create_providers_for_chains(&provider_network_ids, networks)?;
+		let network_kinds = networks
+			.iter()
+			.map(|(network_id, network)| (*network_id, network.kind))
+			.collect();
+		let starknet_clients = networks
+			.iter()
+			.filter(|(_, network)| network.kind == NetworkKind::Starknet)
+			.filter_map(|(network_id, network)| {
+				network.get_http_url().map(|url| {
+					(
+						*network_id,
+						HyperlaneStarknetRpcClient::new(url.to_string()),
+					)
+				})
+			})
+			.collect();
+		let starknet_fee_token_addresses =
+			Self::resolve_starknet_fee_token_addresses(networks, starknet_fee_token_addresses)?;
+		let mut domain_network_ids = oracle_network_ids.clone();
+		domain_network_ids.extend(domains.keys().copied());
+		domain_network_ids.sort_unstable();
+		domain_network_ids.dedup();
+		let domains = Self::build_resolved_domains(domains, &domain_network_ids)?;
 
 		// Validate mailbox addresses are configured for all oracle chains
-		for chain_id in &all_network_ids {
+		for chain_id in &oracle_network_ids {
 			if !mailbox_addresses.contains_key(chain_id) {
 				return Err(SettlementError::ValidationFailed(format!(
 					"Mailbox address not configured for chain {chain_id}"
@@ -623,12 +894,17 @@ impl HyperlaneSettlement {
 
 		Ok(Self {
 			providers,
+			network_kinds,
+			starknet_clients,
 			oracle_config,
 			mailbox_addresses,
 			igp_addresses,
+			starknet_fee_token_addresses,
 			domains,
 			message_tracker: Arc::new(message_tracker),
 			default_gas_limit,
+			allow_zero_hyperlane7683_settle_quote,
+			solver_identities,
 		})
 	}
 
@@ -709,6 +985,729 @@ impl HyperlaneSettlement {
 
 		// Return quote without buffer for now - the quote already includes IGP overhead
 		Ok(quote)
+	}
+
+	fn parse_hyperlane7683_order(
+		order: &Order,
+	) -> Result<Hyperlane7683ResolvedOrder, SettlementError> {
+		if order.standard != HYPERLANE7683_STANDARD {
+			return Err(SettlementError::ValidationFailed(format!(
+				"order standard {} is not {HYPERLANE7683_STANDARD}",
+				order.standard
+			)));
+		}
+
+		serde_json::from_value(order.data.clone()).map_err(|e| {
+			SettlementError::ValidationFailed(format!(
+				"Failed to deserialize Hyperlane7683 resolved order data: {e}"
+			))
+		})
+	}
+
+	fn hyperlane7683_settlement_leg<'a>(
+		&self,
+		index: usize,
+		instruction: &'a Hyperlane7683FillInstruction,
+	) -> Result<Hyperlane7683SettlementLeg<'a>, SettlementError> {
+		let destination_chain_id = instruction.destination_domain().map_err(|e| {
+			SettlementError::ValidationFailed(format!(
+				"Invalid Hyperlane7683 destination domain: {e}"
+			))
+		})?;
+		let destination_chain_id = u64::from(destination_chain_id);
+
+		Ok(Hyperlane7683SettlementLeg {
+			index,
+			instruction,
+			destination_chain_id,
+			network_kind: self.network_kind(destination_chain_id),
+		})
+	}
+
+	fn single_hyperlane7683_settlement_leg<'a>(
+		&self,
+		resolved_order: &'a Hyperlane7683ResolvedOrder,
+	) -> Result<Hyperlane7683SettlementLeg<'a>, SettlementError> {
+		if resolved_order.fill_instructions.is_empty() {
+			return Err(SettlementError::ValidationFailed(
+				"Hyperlane7683 order has no fill instructions".to_string(),
+			));
+		}
+		if resolved_order.fill_instructions.len() != 1 {
+			return Err(SettlementError::ValidationFailed(format!(
+				"Hyperlane7683 Rust settlement currently supports exactly one fill instruction, got {}",
+				resolved_order.fill_instructions.len()
+			)));
+		}
+		let leg = self.hyperlane7683_settlement_leg(0, &resolved_order.fill_instructions[0])?;
+		debug_assert_eq!(leg.index, 0);
+		Ok(leg)
+	}
+
+	fn hyperlane7683_settlement_legs<'a>(
+		&self,
+		resolved_order: &'a Hyperlane7683ResolvedOrder,
+	) -> Result<Vec<Hyperlane7683SettlementLeg<'a>>, SettlementError> {
+		if resolved_order.fill_instructions.is_empty() {
+			return Err(SettlementError::ValidationFailed(
+				"Hyperlane7683 order has no fill instructions".to_string(),
+			));
+		}
+
+		resolved_order
+			.fill_instructions
+			.iter()
+			.enumerate()
+			.map(|(index, instruction)| self.hyperlane7683_settlement_leg(index, instruction))
+			.collect()
+	}
+
+	fn evm_address_from_bytes32(
+		field: &str,
+		bytes: &[u8; 32],
+	) -> Result<solver_types::Address, SettlementError> {
+		if bytes[..12].iter().any(|byte| *byte != 0) {
+			return Err(SettlementError::ValidationFailed(format!(
+				"Hyperlane7683 {field} is not an EVM address"
+			)));
+		}
+		if bytes[12..].iter().all(|byte| *byte == 0) {
+			return Err(SettlementError::ValidationFailed(format!(
+				"Hyperlane7683 {field} is the zero address"
+			)));
+		}
+		Ok(solver_types::Address(bytes[12..].to_vec()))
+	}
+
+	fn starknet_address_from_bytes32(
+		field: &str,
+		bytes: &[u8; 32],
+	) -> Result<solver_types::Address, SettlementError> {
+		let encoded = format!("0x{}", hex::encode(bytes));
+		parse_starknet_address(&encoded)
+			.map(|felt| solver_types::Address(felt.to_vec()))
+			.map_err(|e| {
+				SettlementError::ValidationFailed(format!(
+					"Hyperlane7683 {field} is not a valid Starknet address: {e}"
+				))
+			})
+	}
+
+	fn starknet_transaction_address(
+		field: &str,
+		address: &solver_types::Address,
+	) -> Result<solver_types::Address, SettlementError> {
+		if address.0.len() != 32 {
+			return Err(SettlementError::ValidationFailed(format!(
+				"Hyperlane7683 {field} is not a Starknet address: expected 32 bytes, got {} bytes",
+				address.0.len()
+			)));
+		}
+		let mut bytes = [0u8; 32];
+		bytes.copy_from_slice(&address.0);
+		Self::starknet_address_from_bytes32(field, &bytes)
+	}
+
+	fn starknet_felt_hex(bytes: &[u8; 32]) -> String {
+		let Some(start) = bytes.iter().position(|byte| *byte != 0) else {
+			return "0x0".to_string();
+		};
+		let encoded = hex::encode(&bytes[start..]);
+		format!("0x{}", encoded.trim_start_matches('0'))
+	}
+
+	fn u256_to_starknet_felt_hex(value: U256) -> String {
+		Self::starknet_felt_hex(&value.to_be_bytes::<32>())
+	}
+
+	fn starknet_address_hex(
+		address: &solver_types::Address,
+		field: &str,
+	) -> Result<String, SettlementError> {
+		let address = Self::starknet_transaction_address(field, address)?;
+		let mut bytes = [0u8; 32];
+		bytes.copy_from_slice(&address.0);
+		Ok(Self::starknet_felt_hex(&bytes))
+	}
+
+	fn starknet_address_calldata_value(
+		address: &solver_types::Address,
+		field: &str,
+	) -> Result<U256, SettlementError> {
+		let address = Self::starknet_transaction_address(field, address)?;
+		Ok(U256::from_be_slice(&address.0))
+	}
+
+	fn starknet_selector_hex(entrypoint: &str) -> String {
+		Self::starknet_felt_hex(&starknet_selector(entrypoint))
+	}
+
+	fn starknet_call_params(
+		contract_address: String,
+		entry_point_selector: &str,
+		calldata: Vec<String>,
+	) -> serde_json::Value {
+		serde_json::json!([
+			{
+				"contract_address": contract_address,
+				"entry_point_selector": entry_point_selector,
+				"calldata": calldata,
+			},
+			"latest"
+		])
+	}
+
+	fn starknet_felt_to_u256(value: &str, field: &str) -> Result<U256, SettlementError> {
+		let felt = parse_starknet_felt(value).map_err(|e| {
+			SettlementError::BackendUnavailable(format!(
+				"{field} is not a valid Starknet felt: {e}"
+			))
+		})?;
+		Ok(U256::from_be_slice(&felt))
+	}
+
+	fn starknet_u256_from_low_high_felts(
+		values: &[String],
+		field: &str,
+	) -> Result<U256, SettlementError> {
+		if values.len() != 2 {
+			return Err(SettlementError::BackendUnavailable(format!(
+				"{field} result length: expected 2 felts, got {}",
+				values.len()
+			)));
+		}
+		let low = Self::starknet_felt_to_u256(&values[0], field)?;
+		let high = Self::starknet_felt_to_u256(&values[1], field)?;
+		if low > STARKNET_U128_MAX || high > STARKNET_U128_MAX {
+			return Err(SettlementError::BackendUnavailable(format!(
+				"{field} u256 limb exceeds u128 max"
+			)));
+		}
+		Ok(low + (high << 128))
+	}
+
+	fn starknet_short_string_bytes(value: &str) -> [u8; 32] {
+		let raw = value.as_bytes();
+		let mut bytes = [0u8; 32];
+		bytes[32 - raw.len()..].copy_from_slice(raw);
+		bytes
+	}
+
+	fn interpret_hyperlane7683_starknet_status(status: &str) -> Result<String, SettlementError> {
+		let bytes = parse_starknet_felt(status).map_err(|e| {
+			SettlementError::BackendUnavailable(format!(
+				"Starknet order_status returned invalid felt: {e}"
+			))
+		})?;
+
+		if bytes.iter().all(|byte| *byte == 0) {
+			return Ok("UNKNOWN".to_string());
+		}
+		if bytes == Self::starknet_short_string_bytes(HYPERLANE7683_STARKNET_STATUS_FILLED) {
+			return Ok(HYPERLANE7683_STARKNET_STATUS_FILLED.to_string());
+		}
+		if bytes == Self::starknet_short_string_bytes(HYPERLANE7683_STARKNET_STATUS_SETTLED) {
+			return Ok(HYPERLANE7683_STARKNET_STATUS_SETTLED.to_string());
+		}
+
+		Ok(Self::starknet_felt_hex(&bytes))
+	}
+
+	async fn get_hyperlane7683_starknet_order_status(
+		&self,
+		destination_chain_id: u64,
+		destination_settler: &solver_types::Address,
+		order_id: [u8; 32],
+	) -> Result<String, SettlementError> {
+		let order_id = bytes32_to_starknet_u256(order_id);
+		let result = self
+			.starknet_client(destination_chain_id)?
+			.json_rpc::<Vec<String>>(
+				"starknet_call",
+				Self::starknet_call_params(
+					Self::starknet_address_hex(destination_settler, "destination_settler")?,
+					&Self::starknet_selector_hex(HYPERLANE7683_ORDER_STATUS_ENTRYPOINT),
+					vec![
+						Self::u256_to_starknet_felt_hex(order_id.low),
+						Self::u256_to_starknet_felt_hex(order_id.high),
+					],
+				),
+			)
+			.await?;
+		let status = result.first().ok_or_else(|| {
+			SettlementError::BackendUnavailable(
+				"Starknet order_status returned no values".to_string(),
+			)
+		})?;
+		Self::interpret_hyperlane7683_starknet_status(status)
+	}
+
+	async fn estimate_hyperlane7683_starknet_settle_gas_payment(
+		&self,
+		destination_chain_id: u64,
+		destination_settler: &solver_types::Address,
+		origin_domain: u32,
+	) -> Result<U256, SettlementError> {
+		let result = self
+			.starknet_client(destination_chain_id)?
+			.json_rpc::<Vec<String>>(
+				"starknet_call",
+				Self::starknet_call_params(
+					Self::starknet_address_hex(destination_settler, "destination_settler")?,
+					&Self::starknet_selector_hex(HYPERLANE7683_QUOTE_GAS_PAYMENT_ENTRYPOINT),
+					vec![Self::u256_to_starknet_felt_hex(U256::from(origin_domain))],
+				),
+			)
+			.await?;
+		let quote = Self::starknet_u256_from_low_high_felts(&result, "Starknet quote_gas_payment")?;
+		if quote == U256::ZERO && !self.allow_zero_hyperlane7683_settle_quote {
+			return Err(SettlementError::ValidationFailed(format!(
+				"Hyperlane7683 settle gas payment quote is zero on Starknet destination chain {destination_chain_id}; set allow_zero_hyperlane7683_settle_quote only for environments where this is expected"
+			)));
+		}
+		Ok(quote)
+	}
+
+	async fn get_starknet_fee_token_allowance(
+		&self,
+		destination_chain_id: u64,
+		fee_token: &solver_types::Address,
+		owner: &solver_types::Address,
+		spender: &solver_types::Address,
+	) -> Result<U256, SettlementError> {
+		let result = self
+			.starknet_client(destination_chain_id)?
+			.json_rpc::<Vec<String>>(
+				"starknet_call",
+				Self::starknet_call_params(
+					Self::starknet_address_hex(fee_token, "Starknet fee token")?,
+					&Self::starknet_selector_hex(HYPERLANE7683_ALLOWANCE_ENTRYPOINT),
+					vec![
+						Self::starknet_address_hex(owner, "Starknet fee token owner")?,
+						Self::starknet_address_hex(spender, "Starknet fee token spender")?,
+					],
+				),
+			)
+			.await?;
+		Self::starknet_u256_from_low_high_felts(&result, "Starknet fee token allowance")
+	}
+
+	async fn build_starknet_fee_token_approval_call(
+		&self,
+		destination_chain_id: u64,
+		owner: &solver_types::Address,
+		spender: &solver_types::Address,
+		amount: U256,
+	) -> Result<Option<StarknetCall>, SettlementError> {
+		let fee_token = self
+			.starknet_fee_token_address(destination_chain_id)?
+			.clone();
+		let allowance = self
+			.get_starknet_fee_token_allowance(destination_chain_id, &fee_token, owner, spender)
+			.await?;
+		if allowance >= amount {
+			return Ok(None);
+		}
+
+		let amount = bytes32_to_starknet_u256(amount.to_be_bytes::<32>());
+		Ok(Some(StarknetCall {
+			contract_address: fee_token,
+			entry_point_selector: starknet_selector(HYPERLANE7683_APPROVE_ENTRYPOINT),
+			calldata: vec![
+				Self::starknet_address_calldata_value(spender, "Starknet fee token spender")?,
+				amount.low,
+				amount.high,
+			],
+		}))
+	}
+
+	async fn estimate_hyperlane7683_settle_gas_payment(
+		&self,
+		destination_chain_id: u64,
+		destination_settler: &solver_types::Address,
+		origin_domain: u32,
+	) -> Result<U256, SettlementError> {
+		let provider = self.providers.get(&destination_chain_id).ok_or_else(|| {
+			SettlementError::ValidationFailed(format!(
+				"No provider for Hyperlane7683 destination chain {destination_chain_id}"
+			))
+		})?;
+
+		let settler = alloy_primitives::Address::from_slice(&destination_settler.0);
+		let call_data = IHyperlane7683::quoteGasPaymentCall {
+			_destinationDomain: origin_domain,
+		};
+		let call_request = alloy_rpc_types::eth::transaction::TransactionRequest {
+			to: Some(alloy_primitives::TxKind::Call(settler)),
+			input: call_data.abi_encode().into(),
+			..Default::default()
+		};
+
+		let result = provider
+			.call(call_request)
+			.block(alloy_rpc_types::eth::BlockId::latest())
+			.await
+			.map_err(|e| {
+				SettlementError::BackendUnavailable(format!(
+					"Hyperlane7683 quoteGasPayment failed on destination settler {destination_settler}: {e}"
+				))
+			})?;
+
+		let quote =
+			IHyperlane7683::quoteGasPaymentCall::abi_decode_returns(&result).map_err(|e| {
+				SettlementError::BackendUnavailable(format!(
+					"Failed to decode Hyperlane7683 quoteGasPayment result: {e}"
+				))
+			})?;
+		if quote == U256::ZERO && !self.allow_zero_hyperlane7683_settle_quote {
+			return Err(SettlementError::ValidationFailed(format!(
+				"Hyperlane7683 settle gas payment quote is zero on destination chain {destination_chain_id}; set allow_zero_hyperlane7683_settle_quote only for environments where this is expected"
+			)));
+		}
+
+		Ok(quote)
+	}
+
+	async fn get_hyperlane7683_order_status(
+		&self,
+		destination_chain_id: u64,
+		destination_settler: &solver_types::Address,
+		order_id: [u8; 32],
+	) -> Result<[u8; 32], SettlementError> {
+		let provider = self.providers.get(&destination_chain_id).ok_or_else(|| {
+			SettlementError::ValidationFailed(format!(
+				"No provider for Hyperlane7683 destination chain {destination_chain_id}"
+			))
+		})?;
+
+		let settler = alloy_primitives::Address::from_slice(&destination_settler.0);
+		let call_data = IHyperlane7683::orderStatusCall {
+			orderId: FixedBytes::<32>::from(order_id),
+		};
+		let call_request = alloy_rpc_types::eth::transaction::TransactionRequest {
+			to: Some(alloy_primitives::TxKind::Call(settler)),
+			input: call_data.abi_encode().into(),
+			..Default::default()
+		};
+
+		let result = provider
+			.call(call_request)
+			.block(alloy_rpc_types::eth::BlockId::latest())
+			.await
+			.map_err(|e| {
+				SettlementError::BackendUnavailable(format!(
+					"Hyperlane7683 orderStatus failed on destination settler {destination_settler}: {e}"
+				))
+			})?;
+
+		let status = IHyperlane7683::orderStatusCall::abi_decode_returns(&result).map_err(|e| {
+			SettlementError::BackendUnavailable(format!(
+				"Failed to decode Hyperlane7683 orderStatus result: {e}"
+			))
+		})?;
+		let mut status_bytes = [0u8; 32];
+		status_bytes.copy_from_slice(status.as_slice());
+		Ok(status_bytes)
+	}
+
+	async fn generate_hyperlane7683_claim_transaction_for_leg(
+		&self,
+		order: &Order,
+		resolved_order: &Hyperlane7683ResolvedOrder,
+		origin_domain: u32,
+		leg: Hyperlane7683SettlementLeg<'_>,
+	) -> Result<Option<Transaction>, SettlementError> {
+		let destination_settler = Self::evm_address_from_bytes32(
+			"destination_settler",
+			&leg.instruction.destination_settler,
+		)?;
+		let status = self
+			.get_hyperlane7683_order_status(
+				leg.destination_chain_id,
+				&destination_settler,
+				resolved_order.order_id,
+			)
+			.await?;
+		match status {
+			HYPERLANE7683_STATUS_FILLED => {},
+			HYPERLANE7683_STATUS_SETTLED => {
+				tracing::info!(
+					order_id = %solver_types::utils::formatting::truncate_id(&order.id),
+					destination_chain_id = leg.destination_chain_id,
+					"Hyperlane7683 settle skipped: order is already SETTLED on destination settler"
+				);
+				return Ok(None);
+			},
+			_ => {
+				return Err(SettlementError::ValidationFailed(format!(
+					"Hyperlane7683 settle aborted: destination orderStatus is {}, expected FILLED",
+					hyperlane7683_status_name(&status)
+				)));
+			},
+		}
+		self.require_starknet_origin_evm_settlement_enabled(origin_domain)?;
+
+		let gas_payment = self
+			.estimate_hyperlane7683_settle_gas_payment(
+				leg.destination_chain_id,
+				&destination_settler,
+				origin_domain,
+			)
+			.await?;
+
+		let call_data = IHyperlane7683::settleCall {
+			_orderIds: vec![FixedBytes::<32>::from(resolved_order.order_id)],
+		}
+		.abi_encode();
+
+		Ok(Some(Transaction {
+			to: Some(destination_settler),
+			data: call_data,
+			value: gas_payment,
+			chain_id: leg.destination_chain_id,
+			nonce: None,
+			gas_limit: None,
+			gas_price: None,
+			max_fee_per_gas: None,
+			max_priority_fee_per_gas: None,
+		}))
+	}
+
+	async fn generate_hyperlane7683_claim_transaction(
+		&self,
+		order: &Order,
+	) -> Result<Option<Transaction>, SettlementError> {
+		let resolved_order = Self::parse_hyperlane7683_order(order)?;
+		let origin_domain = resolved_order.origin_domain().map_err(|e| {
+			SettlementError::ValidationFailed(format!("Invalid Hyperlane7683 origin domain: {e}"))
+		})?;
+		let leg = self.single_hyperlane7683_settlement_leg(&resolved_order)?;
+		self.generate_hyperlane7683_claim_transaction_for_leg(
+			order,
+			&resolved_order,
+			origin_domain,
+			leg,
+		)
+		.await
+	}
+
+	async fn generate_hyperlane7683_starknet_claim_execution_transaction_for_leg(
+		&self,
+		order: &Order,
+		resolved_order: &Hyperlane7683ResolvedOrder,
+		origin_domain: u32,
+		leg: Hyperlane7683SettlementLeg<'_>,
+	) -> Result<Option<ExecutionTransaction>, SettlementError> {
+		let destination_settler = Self::starknet_address_from_bytes32(
+			"destination_settler",
+			&leg.instruction.destination_settler,
+		)?;
+		let sender_address = Self::starknet_transaction_address(
+			"solver Starknet account",
+			self.starknet_sender_address(order),
+		)?;
+
+		let status = self
+			.get_hyperlane7683_starknet_order_status(
+				leg.destination_chain_id,
+				&destination_settler,
+				resolved_order.order_id,
+			)
+			.await?;
+		match status.as_str() {
+			HYPERLANE7683_STARKNET_STATUS_FILLED => {},
+			HYPERLANE7683_STARKNET_STATUS_SETTLED => {
+				tracing::info!(
+					order_id = %solver_types::utils::formatting::truncate_id(&order.id),
+					destination_chain_id = leg.destination_chain_id,
+					"Hyperlane7683 Starknet settle skipped: order is already SETTLED on destination settler"
+				);
+				return Ok(None);
+			},
+			_ => {
+				return Err(SettlementError::ValidationFailed(format!(
+					"Hyperlane7683 Starknet settle aborted: destination order_status is {status}, expected FILLED"
+				)));
+			},
+		}
+
+		let gas_payment = self
+			.estimate_hyperlane7683_starknet_settle_gas_payment(
+				leg.destination_chain_id,
+				&destination_settler,
+				origin_domain,
+			)
+			.await?;
+
+		let mut calls = Vec::with_capacity(2);
+		if let Some(approval_call) = self
+			.build_starknet_fee_token_approval_call(
+				leg.destination_chain_id,
+				&sender_address,
+				&destination_settler,
+				gas_payment,
+			)
+			.await?
+		{
+			calls.push(approval_call);
+		}
+		calls.push(StarknetCall {
+			contract_address: destination_settler,
+			entry_point_selector: starknet_selector(HYPERLANE7683_SETTLE_ENTRYPOINT),
+			calldata: build_hyperlane7683_starknet_settle_calldata(
+				resolved_order.order_id,
+				gas_payment,
+			),
+		});
+
+		Ok(Some(ExecutionTransaction::from(
+			StarknetInvokeTransaction {
+				network_id: leg.destination_chain_id,
+				sender_address,
+				calls,
+				account_calldata: Vec::new(),
+				nonce: None,
+				resource_bounds: Some(StarknetResourceBoundsMapping::zero()),
+				signature: Vec::new(),
+				tip: U256::ZERO,
+				version: 3,
+				paymaster_data: Vec::new(),
+				account_deployment_data: Vec::new(),
+				nonce_data_availability_mode: None,
+				fee_data_availability_mode: None,
+				starknet_chain_id: None,
+			},
+		)))
+	}
+
+	async fn generate_hyperlane7683_starknet_claim_execution_transaction(
+		&self,
+		order: &Order,
+	) -> Result<Option<ExecutionTransaction>, SettlementError> {
+		let resolved_order = Self::parse_hyperlane7683_order(order)?;
+		let origin_domain = resolved_order.origin_domain().map_err(|e| {
+			SettlementError::ValidationFailed(format!("Invalid Hyperlane7683 origin domain: {e}"))
+		})?;
+		let leg = self.single_hyperlane7683_settlement_leg(&resolved_order)?;
+		self.generate_hyperlane7683_starknet_claim_execution_transaction_for_leg(
+			order,
+			&resolved_order,
+			origin_domain,
+			leg,
+		)
+		.await
+	}
+
+	async fn generate_hyperlane7683_claim_execution_transactions(
+		&self,
+		order: &Order,
+	) -> Result<Vec<ExecutionTransaction>, SettlementError> {
+		let resolved_order = Self::parse_hyperlane7683_order(order)?;
+		let origin_domain = resolved_order.origin_domain().map_err(|e| {
+			SettlementError::ValidationFailed(format!("Invalid Hyperlane7683 origin domain: {e}"))
+		})?;
+		let legs = self.hyperlane7683_settlement_legs(&resolved_order)?;
+		let mut txs = Vec::new();
+		let mut seen_destinations = HashSet::new();
+
+		for leg in legs {
+			let destination_key = (
+				leg.destination_chain_id,
+				leg.instruction.destination_settler,
+			);
+			if !seen_destinations.insert(destination_key) {
+				tracing::info!(
+					order_id = %solver_types::utils::formatting::truncate_id(&order.id),
+					destination_chain_id = leg.destination_chain_id,
+					"Skipping duplicate Hyperlane7683 settlement leg for destination settler"
+				);
+				continue;
+			}
+
+			let tx = if leg.network_kind == NetworkKind::Starknet {
+				self.generate_hyperlane7683_starknet_claim_execution_transaction_for_leg(
+					order,
+					&resolved_order,
+					origin_domain,
+					leg,
+				)
+				.await?
+			} else {
+				self.generate_hyperlane7683_claim_transaction_for_leg(
+					order,
+					&resolved_order,
+					origin_domain,
+					leg,
+				)
+				.await?
+				.map(ExecutionTransaction::from)
+			};
+
+			if let Some(tx) = tx {
+				txs.push(tx);
+			}
+		}
+
+		Ok(txs)
+	}
+
+	async fn get_hyperlane7683_attestation(
+		&self,
+		order: &Order,
+		tx_hash: &TransactionHash,
+	) -> Result<FillProof, SettlementError> {
+		let resolved_order = Self::parse_hyperlane7683_order(order)?;
+		let leg = self.single_hyperlane7683_settlement_leg(&resolved_order)?;
+		let provider = self
+			.providers
+			.get(&leg.destination_chain_id)
+			.ok_or_else(|| {
+				SettlementError::ValidationFailed(format!(
+					"No provider for Hyperlane7683 destination chain {}",
+					leg.destination_chain_id
+				))
+			})?;
+
+		let receipt = provider
+			.get_transaction_receipt(FixedBytes::<32>::from_slice(&tx_hash.0))
+			.await
+			.map_err(|e| {
+				SettlementError::BackendUnavailable(format!(
+					"Failed to get Hyperlane7683 fill receipt: {e}"
+				))
+			})?
+			.ok_or_else(|| {
+				SettlementError::ValidationFailed(
+					"Hyperlane7683 fill transaction not found".to_string(),
+				)
+			})?;
+
+		if !receipt.status() {
+			return Err(SettlementError::ValidationFailed(
+				"Hyperlane7683 fill transaction failed".to_string(),
+			));
+		}
+
+		let tx_block = receipt.block_number.unwrap_or(0);
+		let block = provider
+			.get_block_by_number(alloy_rpc_types::BlockNumberOrTag::Number(tx_block))
+			.await
+			.map_err(|e| {
+				SettlementError::BackendUnavailable(format!(
+					"Failed to get Hyperlane7683 fill block: {e}"
+				))
+			})?
+			.ok_or_else(|| {
+				SettlementError::ValidationFailed("Hyperlane7683 fill block not found".to_string())
+			})?;
+
+		Ok(FillProof {
+			tx_hash: tx_hash.clone(),
+			block_number: tx_block,
+			oracle_address: "0x0000000000000000000000000000000000000000".to_string(),
+			attestation_data: None,
+			filled_timestamp: block.header.timestamp,
+		})
 	}
 
 	/// Returns true when this order's route actually uses Hyperlane PostFill.
@@ -843,6 +1842,39 @@ fn parse_domain_table(table: &serde_json::Value) -> Result<HashMap<u64, u32>, Se
 	Ok(result)
 }
 
+fn parse_starknet_address_table(
+	table: Option<&serde_json::Value>,
+) -> Result<HashMap<u64, solver_types::Address>, SettlementError> {
+	let Some(table) = table else {
+		return Ok(HashMap::new());
+	};
+	let table = table.as_object().ok_or_else(|| {
+		SettlementError::ValidationFailed(
+			"Starknet fee token addresses must be an object".to_string(),
+		)
+	})?;
+	let mut result = HashMap::new();
+
+	for (chain_id_str, address_value) in table {
+		let chain_id = chain_id_str.parse::<u64>().map_err(|e| {
+			SettlementError::ValidationFailed(format!("Invalid chain ID '{chain_id_str}': {e}"))
+		})?;
+		let address_str = address_value.as_str().ok_or_else(|| {
+			SettlementError::ValidationFailed(format!(
+				"Starknet fee token address must be string for chain {chain_id}"
+			))
+		})?;
+		let address = parse_starknet_address(address_str).map_err(|e| {
+			SettlementError::ValidationFailed(format!(
+				"Invalid Starknet fee token address for chain {chain_id}: {e}"
+			))
+		})?;
+		result.insert(chain_id, solver_types::Address(address.to_vec()));
+	}
+
+	Ok(result)
+}
+
 /// Configuration schema for HyperlaneSettlement
 pub struct HyperlaneSettlementSchema;
 
@@ -889,6 +1921,11 @@ impl ConfigSchema for HyperlaneSettlementSchema {
 			// Optional fields
 			vec![
 				Field::new("oracle_selection_strategy", FieldType::String),
+				Field::new("allow_zero_hyperlane7683_settle_quote", FieldType::Boolean),
+				Field::new(
+					"starknet_fee_token_addresses",
+					FieldType::Table(Schema::new(vec![], vec![])),
+				),
 				Field::new(
 					"message_timeout_seconds",
 					FieldType::Integer {
@@ -917,6 +1954,21 @@ impl SettlementInterface for HyperlaneSettlement {
 		&self,
 		params: &PostFillFeeParams,
 	) -> Result<Option<SettlementFeeQuote>, SettlementError> {
+		if self.network_kind(params.dest_chain_id) == NetworkKind::Starknet {
+			let origin_domain = self.resolve_domain(params.origin_chain_id)?;
+			let fee_wei = self
+				.estimate_hyperlane7683_starknet_settle_gas_payment(
+					params.dest_chain_id,
+					&params.source_settler,
+					origin_domain,
+				)
+				.await?;
+			return Ok(Some(SettlementFeeQuote {
+				fee_wei,
+				chain_id: params.dest_chain_id,
+			}));
+		}
+
 		if self.get_output_oracles(params.dest_chain_id).is_empty()
 			|| self.get_input_oracles(params.origin_chain_id).is_empty()
 		{
@@ -965,6 +2017,10 @@ impl SettlementInterface for HyperlaneSettlement {
 		order: &Order,
 		tx_hash: &TransactionHash,
 	) -> Result<FillProof, SettlementError> {
+		if order.standard == HYPERLANE7683_STANDARD {
+			return self.get_hyperlane7683_attestation(order, tx_hash).await;
+		}
+
 		let origin_chain_id = order
 			.input_chains
 			.first()
@@ -1258,6 +2314,57 @@ impl SettlementInterface for HyperlaneSettlement {
 		Ok(None)
 	}
 
+	async fn generate_claim_transaction(
+		&self,
+		order: &Order,
+		_fill_proof: &FillProof,
+	) -> Result<Option<Transaction>, SettlementError> {
+		if order.standard != HYPERLANE7683_STANDARD {
+			return Ok(None);
+		}
+
+		self.generate_hyperlane7683_claim_transaction(order).await
+	}
+
+	async fn generate_claim_execution_transaction(
+		&self,
+		order: &Order,
+		_fill_proof: &FillProof,
+	) -> Result<Option<ExecutionTransaction>, SettlementError> {
+		if order.standard != HYPERLANE7683_STANDARD {
+			return Ok(None);
+		}
+
+		let resolved_order = Self::parse_hyperlane7683_order(order)?;
+		let leg = self.single_hyperlane7683_settlement_leg(&resolved_order)?;
+		if leg.network_kind == NetworkKind::Starknet {
+			return self
+				.generate_hyperlane7683_starknet_claim_execution_transaction(order)
+				.await;
+		}
+
+		self.generate_hyperlane7683_claim_transaction(order)
+			.await
+			.map(|tx| tx.map(ExecutionTransaction::from))
+	}
+
+	async fn generate_claim_execution_transactions(
+		&self,
+		order: &Order,
+		fill_proof: &FillProof,
+	) -> Result<Vec<ExecutionTransaction>, SettlementError> {
+		if order.standard != HYPERLANE7683_STANDARD {
+			return Ok(self
+				.generate_claim_execution_transaction(order, fill_proof)
+				.await?
+				.into_iter()
+				.collect());
+		}
+
+		self.generate_hyperlane7683_claim_execution_transactions(order)
+			.await
+	}
+
 	async fn handle_transaction_confirmed(
 		&self,
 		order: &Order,
@@ -1278,6 +2385,7 @@ pub fn create_settlement(
 	config: &serde_json::Value,
 	networks: &NetworksConfig,
 	storage: Arc<StorageService>,
+	solver_identities: &SolverIdentityAddresses,
 ) -> Result<Box<dyn SettlementInterface>, SettlementError> {
 	// Validate configuration first
 	HyperlaneSettlementSchema::validate_config(config)
@@ -1302,23 +2410,34 @@ pub fn create_settlement(
 	let domains = parse_domain_table(config.get("domains").ok_or_else(|| {
 		SettlementError::ValidationFailed("Missing Hyperlane domains".to_string())
 	})?)?;
+	let starknet_fee_token_addresses =
+		parse_starknet_address_table(config.get("starknet_fee_token_addresses"))?;
 
 	let default_gas_limit = config
 		.get("default_gas_limit")
 		.and_then(|v| v.as_i64())
 		.unwrap_or(500000) as u64;
+	let allow_zero_hyperlane7683_settle_quote = config
+		.get("allow_zero_hyperlane7683_settle_quote")
+		.and_then(|v| v.as_bool())
+		.unwrap_or(false);
 
 	// Create settlement service synchronously
 	let settlement = tokio::task::block_in_place(|| {
 		tokio::runtime::Handle::current().block_on(async {
 			HyperlaneSettlement::new(
 				networks,
-				oracle_config,
-				mailbox_addresses,
-				igp_addresses,
-				domains,
-				default_gas_limit,
-				storage,
+				HyperlaneSettlementInit {
+					oracle_config,
+					mailbox_addresses,
+					igp_addresses,
+					starknet_fee_token_addresses,
+					domains,
+					default_gas_limit,
+					allow_zero_hyperlane7683_settle_quote,
+					storage,
+					solver_identities: solver_identities.clone(),
+				},
 			)
 			.await
 		})
@@ -1362,12 +2481,17 @@ mod tests {
 	fn test_hyperlane_settlement(oracle_config: OracleConfig) -> HyperlaneSettlement {
 		HyperlaneSettlement {
 			providers: HashMap::new(),
+			network_kinds: HashMap::new(),
+			starknet_clients: HashMap::new(),
 			oracle_config,
 			mailbox_addresses: HashMap::new(),
 			igp_addresses: HashMap::new(),
+			starknet_fee_token_addresses: HashMap::new(),
 			domains: HashMap::new(),
 			message_tracker: Arc::new(MessageTracker::new(test_storage())),
 			default_gas_limit: 500_000,
+			allow_zero_hyperlane7683_settle_quote: false,
+			solver_identities: SolverIdentityAddresses::default(),
 		}
 	}
 
@@ -1378,13 +2502,99 @@ mod tests {
 	) -> HyperlaneSettlement {
 		HyperlaneSettlement {
 			providers,
+			network_kinds: HashMap::new(),
+			starknet_clients: HashMap::new(),
 			oracle_config,
 			mailbox_addresses: HashMap::new(),
 			igp_addresses: HashMap::new(),
+			starknet_fee_token_addresses: HashMap::new(),
 			domains,
 			message_tracker: Arc::new(MessageTracker::new(test_storage())),
 			default_gas_limit: 500_000,
+			allow_zero_hyperlane7683_settle_quote: false,
+			solver_identities: SolverIdentityAddresses::default(),
 		}
+	}
+
+	fn empty_oracle_config() -> OracleConfig {
+		OracleConfig {
+			input_oracles: HashMap::new(),
+			output_oracles: HashMap::new(),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::First,
+		}
+	}
+
+	fn rpc_result_bytes32(bytes: [u8; 32]) -> serde_json::Value {
+		serde_json::json!({
+			"jsonrpc": "2.0",
+			"id": 1,
+			"result": format!("0x{}", hex::encode(bytes))
+		})
+	}
+
+	fn order_status_selector_hex() -> String {
+		hex::encode(IHyperlane7683::orderStatusCall::SELECTOR)
+	}
+
+	fn quote_gas_payment_selector_hex() -> String {
+		hex::encode(IHyperlane7683::quoteGasPaymentCall::SELECTOR)
+	}
+
+	fn starknet_selector_hex(entrypoint: &str) -> String {
+		HyperlaneSettlement::starknet_selector_hex(entrypoint)
+	}
+
+	fn starknet_bytes32(byte: u8) -> [u8; 32] {
+		let mut bytes = [0u8; 32];
+		bytes[31] = byte;
+		bytes
+	}
+
+	fn rpc_result_starknet_felts(values: Vec<&str>) -> serde_json::Value {
+		serde_json::json!({
+			"jsonrpc": "2.0",
+			"id": 1,
+			"result": values,
+		})
+	}
+
+	fn test_hyperlane_starknet_settlement_for_chains(
+		dest_chains: &[u64],
+		rpc_url: String,
+	) -> HyperlaneSettlement {
+		HyperlaneSettlement {
+			providers: HashMap::new(),
+			network_kinds: dest_chains
+				.iter()
+				.map(|chain_id| (*chain_id, NetworkKind::Starknet))
+				.collect(),
+			starknet_clients: dest_chains
+				.iter()
+				.map(|chain_id| (*chain_id, HyperlaneStarknetRpcClient::new(rpc_url.clone())))
+				.collect(),
+			oracle_config: empty_oracle_config(),
+			mailbox_addresses: HashMap::new(),
+			igp_addresses: HashMap::new(),
+			starknet_fee_token_addresses: dest_chains
+				.iter()
+				.map(|chain_id| {
+					(
+						*chain_id,
+						HyperlaneSettlement::default_starknet_fee_token_address().unwrap(),
+					)
+				})
+				.collect(),
+			domains: HashMap::new(),
+			message_tracker: Arc::new(MessageTracker::new(test_storage())),
+			default_gas_limit: 500_000,
+			allow_zero_hyperlane7683_settle_quote: false,
+			solver_identities: SolverIdentityAddresses::default(),
+		}
+	}
+
+	fn test_hyperlane_starknet_settlement(dest_chain: u64, rpc_url: String) -> HyperlaneSettlement {
+		test_hyperlane_starknet_settlement_for_chains(&[dest_chain], rpc_url)
 	}
 
 	fn make_eip7683_order_data_for_binding(
@@ -1465,6 +2675,67 @@ mod tests {
 		);
 	}
 
+	#[tokio::test]
+	async fn hyperlane_new_creates_direct_hyperlane7683_providers_without_oracles() {
+		let origin = 700001u64;
+		let dest = 700002u64;
+		let server = MockServer::start().await;
+		let networks = HashMap::from([
+			(
+				origin,
+				solver_types::NetworkConfig {
+					name: Some("origin".to_string()),
+					network_type: solver_types::NetworkType::New,
+					kind: NetworkKind::Evm,
+					rpc_urls: vec![solver_types::networks::RpcEndpoint::http_only(server.uri())],
+					input_settler_address: solver_types::Address(vec![0x11; 20]),
+					output_settler_address: solver_types::Address(vec![0x22; 20]),
+					tokens: Vec::new(),
+					input_settler_compact_address: None,
+					the_compact_address: None,
+					allocator_address: None,
+				},
+			),
+			(
+				dest,
+				solver_types::NetworkConfig {
+					name: Some("dest".to_string()),
+					network_type: solver_types::NetworkType::New,
+					kind: NetworkKind::Evm,
+					rpc_urls: vec![solver_types::networks::RpcEndpoint::http_only(server.uri())],
+					input_settler_address: solver_types::Address(vec![0x33; 20]),
+					output_settler_address: solver_types::Address(vec![0x44; 20]),
+					tokens: Vec::new(),
+					input_settler_compact_address: None,
+					the_compact_address: None,
+					allocator_address: None,
+				},
+			),
+		]);
+
+		let settlement = HyperlaneSettlement::new(
+			&networks,
+			HyperlaneSettlementInit {
+				oracle_config: empty_oracle_config(),
+				mailbox_addresses: HashMap::new(),
+				igp_addresses: HashMap::new(),
+				starknet_fee_token_addresses: HashMap::new(),
+				domains: HashMap::from([(origin, origin as u32), (dest, dest as u32)]),
+				default_gas_limit: 500_000,
+				allow_zero_hyperlane7683_settle_quote: false,
+				storage: test_storage(),
+				solver_identities: SolverIdentityAddresses::default(),
+			},
+		)
+		.await
+		.unwrap();
+
+		assert!(settlement.providers.contains_key(&origin));
+		assert!(settlement.providers.contains_key(&dest));
+		assert_eq!(settlement.resolve_domain(origin).unwrap(), origin as u32);
+		assert_eq!(settlement.resolve_domain(dest).unwrap(), dest as u32);
+	}
+
 	#[test]
 	fn hyperlane_create_settlement_requires_domains() {
 		let config = serde_json::json!({
@@ -1478,7 +2749,12 @@ mod tests {
 			"default_gas_limit": 500000
 		});
 
-		let err = match create_settlement(&config, &NetworksConfig::new(), test_storage()) {
+		let err = match create_settlement(
+			&config,
+			&NetworksConfig::new(),
+			test_storage(),
+			&SolverIdentityAddresses::default(),
+		) {
 			Ok(_) => panic!("missing domains must fail validation"),
 			Err(err) => err,
 		};
@@ -1538,7 +2814,11 @@ mod tests {
 			execution_params: None,
 			prepare_tx_hash: None,
 			fill_tx_hash: None,
+			fill_tx_hashes: Vec::new(),
+			expected_fill_tx_count: None,
 			claim_tx_hash: None,
+			claim_tx_hashes: Vec::new(),
+			expected_claim_tx_count: None,
 			post_fill_tx_hash: None,
 			pre_claim_tx_hash: None,
 			fill_proof: None,
@@ -1670,6 +2950,54 @@ mod tests {
 			.build();
 
 		(order, output, output_settler)
+	}
+
+	fn evm_bytes32(byte: u8) -> [u8; 32] {
+		let mut bytes = [0u8; 32];
+		bytes[12..32].fill(byte);
+		bytes
+	}
+
+	fn make_hyperlane7683_order(
+		order_id: [u8; 32],
+		origin_domain: u64,
+		dest_domain: u64,
+		destination_settler: [u8; 32],
+	) -> Order {
+		let resolved = Hyperlane7683ResolvedOrder {
+			user: evm_bytes32(0x11),
+			origin_chain_id: U256::from(origin_domain),
+			open_deadline: 1,
+			fill_deadline: u32::MAX,
+			order_id,
+			max_spent: vec![solver_types::Hyperlane7683Output {
+				token: evm_bytes32(0x22),
+				amount: U256::from(1000u64),
+				recipient: evm_bytes32(0x33),
+				chain_id: U256::from(dest_domain),
+			}],
+			min_received: vec![solver_types::Hyperlane7683Output {
+				token: evm_bytes32(0x44),
+				amount: U256::from(900u64),
+				recipient: evm_bytes32(0x55),
+				chain_id: U256::from(dest_domain),
+			}],
+			fill_instructions: vec![Hyperlane7683FillInstruction {
+				destination_chain_id: U256::from(dest_domain),
+				destination_settler,
+				origin_data: vec![0xaa, 0xbb],
+			}],
+		};
+
+		OrderBuilder::new()
+			.with_id(format!("0x{}", hex::encode(order_id)))
+			.with_standard(HYPERLANE7683_STANDARD)
+			.with_data(serde_json::to_value(resolved).unwrap())
+			.with_output_chains(vec![solver_types::order::ChainSettlerInfo {
+				chain_id: dest_domain,
+				settler_address: solver_types::Address(destination_settler.to_vec()),
+			}])
+			.build()
 	}
 
 	fn make_receipt_json(
@@ -2133,7 +3461,11 @@ mod tests {
 			execution_params: None,
 			prepare_tx_hash: None,
 			fill_tx_hash: None,
+			fill_tx_hashes: Vec::new(),
+			expected_fill_tx_count: None,
 			claim_tx_hash: None,
+			claim_tx_hashes: Vec::new(),
+			expected_claim_tx_count: None,
 			post_fill_tx_hash: None,
 			pre_claim_tx_hash: None,
 			fill_proof: None,
@@ -2180,6 +3512,890 @@ mod tests {
 			ready,
 			"can_claim must return true when PostFill is not required and message_id is missing"
 		);
+	}
+
+	#[tokio::test]
+	async fn hyperlane7683_claim_quotes_settle_fee_and_encodes_settle_call() {
+		let server = MockServer::start().await;
+		let quoted_fee = U256::from(123_456_789u64);
+		Mock::given(method("POST"))
+			.and(body_string_contains(order_status_selector_hex()))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_body_json(rpc_result_bytes32(HYPERLANE7683_STATUS_FILLED)),
+			)
+			.mount(&server)
+			.await;
+		Mock::given(method("POST"))
+			.and(body_string_contains(quote_gas_payment_selector_hex()))
+			.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+				"jsonrpc": "2.0",
+				"id": 1,
+				"result": format!("0x{}", hex::encode(quoted_fee.to_be_bytes::<32>()))
+			})))
+			.mount(&server)
+			.await;
+
+		let origin_domain = 700001u64;
+		let dest_domain = 700002u64;
+		let order_id = [0x42; 32];
+		let destination_settler = evm_bytes32(0x77);
+		let provider = ProviderBuilder::new()
+			.connect_http(server.uri().parse().expect("valid RPC URL"))
+			.erased();
+		let settlement = test_hyperlane_settlement_with_providers(
+			empty_oracle_config(),
+			HashMap::from([(dest_domain, provider)]),
+			HashMap::new(),
+		);
+		let order =
+			make_hyperlane7683_order(order_id, origin_domain, dest_domain, destination_settler);
+
+		let claim_tx = settlement
+			.generate_claim_transaction(&order, &fill_proof_skeleton())
+			.await
+			.unwrap()
+			.expect("Hyperlane7683 settlement should own claim tx");
+
+		assert_eq!(claim_tx.to, Some(solver_types::Address(vec![0x77; 20])));
+		assert_eq!(claim_tx.chain_id, dest_domain);
+		assert_eq!(claim_tx.value, quoted_fee);
+		let settle = IHyperlane7683::settleCall::abi_decode(&claim_tx.data).unwrap();
+		assert_eq!(settle._orderIds, vec![FixedBytes::<32>::from(order_id)]);
+
+		let requests = server.received_requests().await.unwrap();
+		assert_eq!(requests.len(), 2);
+		let body: serde_json::Value = requests
+			.iter()
+			.map(|request| serde_json::from_slice(&request.body).unwrap())
+			.find(|body: &serde_json::Value| {
+				body["params"][0]["input"]
+					.as_str()
+					.is_some_and(|input| input.contains(&quote_gas_payment_selector_hex()))
+			})
+			.expect("quoteGasPayment request should be present");
+		let input_hex = body["params"][0]["input"].as_str().unwrap();
+		let input = hex::decode(input_hex.trim_start_matches("0x")).unwrap();
+		let quote_call = IHyperlane7683::quoteGasPaymentCall::abi_decode(&input).unwrap();
+		assert_eq!(quote_call._destinationDomain, origin_domain as u32);
+	}
+
+	#[tokio::test]
+	async fn hyperlane7683_claim_rejects_zero_settle_fee_quote_by_default() {
+		let server = MockServer::start().await;
+		Mock::given(method("POST"))
+			.and(body_string_contains(order_status_selector_hex()))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_body_json(rpc_result_bytes32(HYPERLANE7683_STATUS_FILLED)),
+			)
+			.mount(&server)
+			.await;
+		Mock::given(method("POST"))
+			.and(body_string_contains(quote_gas_payment_selector_hex()))
+			.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+				"jsonrpc": "2.0",
+				"id": 1,
+				"result": format!("0x{}", hex::encode(U256::ZERO.to_be_bytes::<32>()))
+			})))
+			.mount(&server)
+			.await;
+
+		let dest_domain = 700002u64;
+		let provider = ProviderBuilder::new()
+			.connect_http(server.uri().parse().expect("valid RPC URL"))
+			.erased();
+		let settlement = test_hyperlane_settlement_with_providers(
+			empty_oracle_config(),
+			HashMap::from([(dest_domain, provider)]),
+			HashMap::new(),
+		);
+		let order = make_hyperlane7683_order([0x43; 32], 700001, dest_domain, evm_bytes32(0x77));
+
+		let error = settlement
+			.generate_claim_transaction(&order, &fill_proof_skeleton())
+			.await
+			.unwrap_err();
+
+		assert!(error
+			.to_string()
+			.contains("settle gas payment quote is zero"));
+	}
+
+	#[tokio::test]
+	async fn hyperlane7683_claim_skips_when_destination_already_settled() {
+		let server = MockServer::start().await;
+		Mock::given(method("POST"))
+			.and(body_string_contains(order_status_selector_hex()))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_body_json(rpc_result_bytes32(HYPERLANE7683_STATUS_SETTLED)),
+			)
+			.mount(&server)
+			.await;
+
+		let dest_domain = 700002u64;
+		let provider = ProviderBuilder::new()
+			.connect_http(server.uri().parse().expect("valid RPC URL"))
+			.erased();
+		let settlement = test_hyperlane_settlement_with_providers(
+			empty_oracle_config(),
+			HashMap::from([(dest_domain, provider)]),
+			HashMap::new(),
+		);
+		let order = make_hyperlane7683_order([0x44; 32], 700001, dest_domain, evm_bytes32(0x77));
+
+		let claim_tx = settlement
+			.generate_claim_transaction(&order, &fill_proof_skeleton())
+			.await
+			.unwrap();
+
+		assert!(claim_tx.is_none());
+		let requests = server.received_requests().await.unwrap();
+		assert_eq!(requests.len(), 1);
+		let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+		let input = body["params"][0]["input"].as_str().unwrap();
+		assert!(input.contains(&order_status_selector_hex()));
+		assert!(!input.contains(&quote_gas_payment_selector_hex()));
+	}
+
+	#[tokio::test]
+	async fn hyperlane7683_claim_execution_transactions_builds_one_evm_settle_per_instruction() {
+		let server = MockServer::start().await;
+		Mock::given(method("POST"))
+			.and(body_string_contains(order_status_selector_hex()))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_body_json(rpc_result_bytes32(HYPERLANE7683_STATUS_FILLED)),
+			)
+			.mount(&server)
+			.await;
+		let quoted_fee = U256::from(55u64);
+		Mock::given(method("POST"))
+			.and(body_string_contains(quote_gas_payment_selector_hex()))
+			.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+				"jsonrpc": "2.0",
+				"id": 1,
+				"result": format!("0x{}", hex::encode(quoted_fee.to_be_bytes::<32>()))
+			})))
+			.mount(&server)
+			.await;
+
+		let origin_domain = 700001u64;
+		let first_dest = 700002u64;
+		let second_dest = 700003u64;
+		let order_id = [0x48; 32];
+		let first_settler = evm_bytes32(0x77);
+		let second_settler = evm_bytes32(0x78);
+		let provider_one = ProviderBuilder::new()
+			.connect_http(server.uri().parse().expect("valid RPC URL"))
+			.erased();
+		let provider_two = ProviderBuilder::new()
+			.connect_http(server.uri().parse().expect("valid RPC URL"))
+			.erased();
+		let settlement = test_hyperlane_settlement_with_providers(
+			empty_oracle_config(),
+			HashMap::from([(first_dest, provider_one), (second_dest, provider_two)]),
+			HashMap::new(),
+		);
+		let mut order =
+			make_hyperlane7683_order(order_id, origin_domain, first_dest, first_settler);
+		let mut resolved_order: Hyperlane7683ResolvedOrder =
+			serde_json::from_value(order.data.clone()).unwrap();
+		resolved_order
+			.fill_instructions
+			.push(Hyperlane7683FillInstruction {
+				destination_chain_id: U256::from(second_dest),
+				destination_settler: second_settler,
+				origin_data: vec![0xcc, 0xdd],
+			});
+		order.data = serde_json::to_value(resolved_order).unwrap();
+
+		let txs = settlement
+			.generate_claim_execution_transactions(&order, &fill_proof_skeleton())
+			.await
+			.unwrap();
+
+		assert_eq!(txs.len(), 2);
+		let first = txs[0].as_evm().expect("first settle should be EVM");
+		assert_eq!(first.chain_id, first_dest);
+		assert_eq!(first.to, Some(solver_types::Address(vec![0x77; 20])));
+		assert_eq!(first.value, quoted_fee);
+		let first_settle = IHyperlane7683::settleCall::abi_decode(&first.data).unwrap();
+		assert_eq!(
+			first_settle._orderIds,
+			vec![FixedBytes::<32>::from(order_id)]
+		);
+
+		let second = txs[1].as_evm().expect("second settle should be EVM");
+		assert_eq!(second.chain_id, second_dest);
+		assert_eq!(second.to, Some(solver_types::Address(vec![0x78; 20])));
+		assert_eq!(second.value, quoted_fee);
+		let second_settle = IHyperlane7683::settleCall::abi_decode(&second.data).unwrap();
+		assert_eq!(
+			second_settle._orderIds,
+			vec![FixedBytes::<32>::from(order_id)]
+		);
+
+		let requests = server.received_requests().await.unwrap();
+		assert_eq!(requests.len(), 4);
+	}
+
+	#[tokio::test]
+	async fn hyperlane7683_claim_execution_transactions_dedupes_same_destination_settler() {
+		let server = MockServer::start().await;
+		Mock::given(method("POST"))
+			.and(body_string_contains(order_status_selector_hex()))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_body_json(rpc_result_bytes32(HYPERLANE7683_STATUS_FILLED)),
+			)
+			.mount(&server)
+			.await;
+		let quoted_fee = U256::from(55u64);
+		Mock::given(method("POST"))
+			.and(body_string_contains(quote_gas_payment_selector_hex()))
+			.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+				"jsonrpc": "2.0",
+				"id": 1,
+				"result": format!("0x{}", hex::encode(quoted_fee.to_be_bytes::<32>()))
+			})))
+			.mount(&server)
+			.await;
+
+		let origin_domain = 700001u64;
+		let dest_domain = 700002u64;
+		let order_id = [0x49; 32];
+		let destination_settler = evm_bytes32(0x77);
+		let provider = ProviderBuilder::new()
+			.connect_http(server.uri().parse().expect("valid RPC URL"))
+			.erased();
+		let settlement = test_hyperlane_settlement_with_providers(
+			empty_oracle_config(),
+			HashMap::from([(dest_domain, provider)]),
+			HashMap::new(),
+		);
+		let mut order =
+			make_hyperlane7683_order(order_id, origin_domain, dest_domain, destination_settler);
+		let mut resolved_order: Hyperlane7683ResolvedOrder =
+			serde_json::from_value(order.data.clone()).unwrap();
+		resolved_order
+			.fill_instructions
+			.push(Hyperlane7683FillInstruction {
+				destination_chain_id: U256::from(dest_domain),
+				destination_settler,
+				origin_data: vec![0xcc, 0xdd],
+			});
+		order.data = serde_json::to_value(resolved_order).unwrap();
+
+		let txs = settlement
+			.generate_claim_execution_transactions(&order, &fill_proof_skeleton())
+			.await
+			.unwrap();
+
+		assert_eq!(txs.len(), 1);
+		let tx = txs[0].as_evm().expect("deduped settle should be EVM");
+		assert_eq!(tx.chain_id, dest_domain);
+		assert_eq!(tx.to, Some(solver_types::Address(vec![0x77; 20])));
+		assert_eq!(tx.value, quoted_fee);
+		let settle = IHyperlane7683::settleCall::abi_decode(&tx.data).unwrap();
+		assert_eq!(settle._orderIds, vec![FixedBytes::<32>::from(order_id)]);
+
+		let requests = server.received_requests().await.unwrap();
+		assert_eq!(requests.len(), 2);
+	}
+
+	#[tokio::test]
+	async fn hyperlane7683_claim_execution_transactions_preserves_mixed_evm_starknet_order() {
+		let server = MockServer::start().await;
+		Mock::given(method("POST"))
+			.and(body_string_contains(order_status_selector_hex()))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_body_json(rpc_result_bytes32(HYPERLANE7683_STATUS_FILLED)),
+			)
+			.mount(&server)
+			.await;
+		let quoted_evm_fee = U256::from(55u64);
+		Mock::given(method("POST"))
+			.and(body_string_contains(quote_gas_payment_selector_hex()))
+			.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+				"jsonrpc": "2.0",
+				"id": 1,
+				"result": format!("0x{}", hex::encode(quoted_evm_fee.to_be_bytes::<32>()))
+			})))
+			.mount(&server)
+			.await;
+		Mock::given(method("POST"))
+			.and(body_string_contains("\"method\":\"starknet_call\""))
+			.and(body_string_contains(&starknet_selector_hex(
+				HYPERLANE7683_ORDER_STATUS_ENTRYPOINT,
+			)))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_body_json(rpc_result_starknet_felts(vec!["0x46494c4c4544"])),
+			)
+			.mount(&server)
+			.await;
+		Mock::given(method("POST"))
+			.and(body_string_contains("\"method\":\"starknet_call\""))
+			.and(body_string_contains(&starknet_selector_hex(
+				HYPERLANE7683_QUOTE_GAS_PAYMENT_ENTRYPOINT,
+			)))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_body_json(rpc_result_starknet_felts(vec!["0x1e240", "0x0"])),
+			)
+			.mount(&server)
+			.await;
+		Mock::given(method("POST"))
+			.and(body_string_contains("\"method\":\"starknet_call\""))
+			.and(body_string_contains(&starknet_selector_hex(
+				HYPERLANE7683_ALLOWANCE_ENTRYPOINT,
+			)))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_body_json(rpc_result_starknet_felts(vec!["0x1e240", "0x0"])),
+			)
+			.mount(&server)
+			.await;
+
+		let origin_domain = 700001u64;
+		let evm_dest = 700002u64;
+		let starknet_dest = 700003u64;
+		let order_id = [0x49; 32];
+		let evm_settler = evm_bytes32(0x77);
+		let starknet_settler = starknet_bytes32(0x78);
+		let evm_provider = ProviderBuilder::new()
+			.connect_http(server.uri().parse().expect("valid RPC URL"))
+			.erased();
+		let mut settlement = HyperlaneSettlement {
+			providers: HashMap::from([(evm_dest, evm_provider)]),
+			network_kinds: HashMap::from([(starknet_dest, NetworkKind::Starknet)]),
+			starknet_clients: HashMap::from([(
+				starknet_dest,
+				HyperlaneStarknetRpcClient::new(server.uri()),
+			)]),
+			oracle_config: empty_oracle_config(),
+			mailbox_addresses: HashMap::new(),
+			igp_addresses: HashMap::new(),
+			starknet_fee_token_addresses: HashMap::from([(
+				starknet_dest,
+				HyperlaneSettlement::default_starknet_fee_token_address().unwrap(),
+			)]),
+			domains: HashMap::new(),
+			message_tracker: Arc::new(MessageTracker::new(test_storage())),
+			default_gas_limit: 500_000,
+			allow_zero_hyperlane7683_settle_quote: false,
+			solver_identities: SolverIdentityAddresses::default(),
+		};
+		settlement
+			.domains
+			.insert(origin_domain, origin_domain as u32);
+
+		let mut order = make_hyperlane7683_order(order_id, origin_domain, evm_dest, evm_settler);
+		order.solver_address = solver_types::Address(starknet_bytes32(0x99).to_vec());
+		let mut resolved_order: Hyperlane7683ResolvedOrder =
+			serde_json::from_value(order.data.clone()).unwrap();
+		resolved_order
+			.max_spent
+			.push(solver_types::Hyperlane7683Output {
+				token: starknet_bytes32(0x23),
+				amount: U256::from(2000u64),
+				recipient: starknet_bytes32(0x34),
+				chain_id: U256::from(starknet_dest),
+			});
+		resolved_order
+			.fill_instructions
+			.push(Hyperlane7683FillInstruction {
+				destination_chain_id: U256::from(starknet_dest),
+				destination_settler: starknet_settler,
+				origin_data: vec![0xcc, 0xdd],
+			});
+		order.data = serde_json::to_value(resolved_order).unwrap();
+
+		let claim_txs = settlement
+			.generate_claim_execution_transactions(&order, &fill_proof_skeleton())
+			.await
+			.unwrap();
+
+		assert_eq!(claim_txs.len(), 2);
+		let evm = claim_txs[0].as_evm().expect("first settle should be EVM");
+		assert_eq!(evm.chain_id, evm_dest);
+		assert_eq!(evm.to, Some(solver_types::Address(vec![0x77; 20])));
+		assert_eq!(evm.value, quoted_evm_fee);
+
+		let ExecutionTransaction::StarknetInvoke(starknet) = &claim_txs[1] else {
+			panic!("second settle should be Starknet");
+		};
+		assert_eq!(starknet.network_id, starknet_dest);
+		assert_eq!(starknet.calls.len(), 1);
+		assert_eq!(
+			starknet.calls[0].contract_address.0,
+			starknet_settler.to_vec()
+		);
+		assert_eq!(
+			starknet.calls[0].entry_point_selector,
+			starknet_selector(HYPERLANE7683_SETTLE_ENTRYPOINT)
+		);
+		assert_eq!(
+			starknet.calls[0].calldata,
+			build_hyperlane7683_starknet_settle_calldata(order_id, U256::from(123_456u64))
+		);
+
+		let requests = server.received_requests().await.unwrap();
+		assert_eq!(requests.len(), 5);
+	}
+
+	#[tokio::test]
+	async fn hyperlane7683_starknet_claim_quotes_settle_fee_and_builds_settle_invoke() {
+		let server = MockServer::start().await;
+		Mock::given(method("POST"))
+			.and(body_string_contains("\"method\":\"starknet_call\""))
+			.and(body_string_contains(&starknet_selector_hex(
+				HYPERLANE7683_ORDER_STATUS_ENTRYPOINT,
+			)))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_body_json(rpc_result_starknet_felts(vec!["0x46494c4c4544"])),
+			)
+			.mount(&server)
+			.await;
+		Mock::given(method("POST"))
+			.and(body_string_contains("\"method\":\"starknet_call\""))
+			.and(body_string_contains(&starknet_selector_hex(
+				HYPERLANE7683_QUOTE_GAS_PAYMENT_ENTRYPOINT,
+			)))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_body_json(rpc_result_starknet_felts(vec!["0x1e240", "0x0"])),
+			)
+			.mount(&server)
+			.await;
+		Mock::given(method("POST"))
+			.and(body_string_contains("\"method\":\"starknet_call\""))
+			.and(body_string_contains(&starknet_selector_hex(
+				HYPERLANE7683_ALLOWANCE_ENTRYPOINT,
+			)))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_body_json(rpc_result_starknet_felts(vec!["0x1e240", "0x0"])),
+			)
+			.mount(&server)
+			.await;
+
+		let origin_domain = 700001u64;
+		let dest_domain = 700002u64;
+		let order_id = [0x42; 32];
+		let destination_settler = starknet_bytes32(0x77);
+		let mut order =
+			make_hyperlane7683_order(order_id, origin_domain, dest_domain, destination_settler);
+		order.solver_address = solver_types::Address(vec![0xaa; 20]);
+		let mut settlement = test_hyperlane_starknet_settlement(dest_domain, server.uri());
+		settlement.solver_identities = SolverIdentityAddresses::new(
+			None,
+			Some(solver_types::Address(starknet_bytes32(0x99).to_vec())),
+		);
+
+		let claim_tx = settlement
+			.generate_claim_execution_transaction(&order, &fill_proof_skeleton())
+			.await
+			.unwrap()
+			.expect("Starknet destination should build execution transaction");
+
+		let ExecutionTransaction::StarknetInvoke(invoke) = claim_tx else {
+			panic!("expected Starknet invoke transaction");
+		};
+		assert_eq!(invoke.network_id, dest_domain);
+		assert_eq!(invoke.sender_address.0, starknet_bytes32(0x99).to_vec());
+		assert_eq!(invoke.calls.len(), 1);
+		assert_eq!(
+			invoke.calls[0].contract_address.0,
+			starknet_bytes32(0x77).to_vec()
+		);
+		assert_eq!(
+			invoke.calls[0].entry_point_selector,
+			starknet_selector(HYPERLANE7683_SETTLE_ENTRYPOINT)
+		);
+		assert_eq!(
+			invoke.calls[0].calldata,
+			build_hyperlane7683_starknet_settle_calldata(order_id, U256::from(123_456u64))
+		);
+		assert_eq!(
+			invoke.resource_bounds,
+			Some(StarknetResourceBoundsMapping::zero())
+		);
+
+		let requests = server.received_requests().await.unwrap();
+		assert_eq!(requests.len(), 3);
+		let quote_request: serde_json::Value = requests
+			.iter()
+			.map(|request| serde_json::from_slice(&request.body).unwrap())
+			.find(|body: &serde_json::Value| {
+				body["params"][0]["entry_point_selector"]
+					.as_str()
+					.is_some_and(|selector| {
+						selector
+							== starknet_selector_hex(HYPERLANE7683_QUOTE_GAS_PAYMENT_ENTRYPOINT)
+					})
+			})
+			.expect("quote_gas_payment request should be present");
+		assert_eq!(quote_request["params"][0]["calldata"][0], "0xaae61");
+	}
+
+	#[tokio::test]
+	async fn hyperlane7683_starknet_claim_execution_transactions_builds_one_settle_per_instruction()
+	{
+		let server = MockServer::start().await;
+		Mock::given(method("POST"))
+			.and(body_string_contains("\"method\":\"starknet_call\""))
+			.and(body_string_contains(&starknet_selector_hex(
+				HYPERLANE7683_ORDER_STATUS_ENTRYPOINT,
+			)))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_body_json(rpc_result_starknet_felts(vec!["0x46494c4c4544"])),
+			)
+			.mount(&server)
+			.await;
+		Mock::given(method("POST"))
+			.and(body_string_contains("\"method\":\"starknet_call\""))
+			.and(body_string_contains(&starknet_selector_hex(
+				HYPERLANE7683_QUOTE_GAS_PAYMENT_ENTRYPOINT,
+			)))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_body_json(rpc_result_starknet_felts(vec!["0x1e240", "0x0"])),
+			)
+			.mount(&server)
+			.await;
+		Mock::given(method("POST"))
+			.and(body_string_contains("\"method\":\"starknet_call\""))
+			.and(body_string_contains(&starknet_selector_hex(
+				HYPERLANE7683_ALLOWANCE_ENTRYPOINT,
+			)))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_body_json(rpc_result_starknet_felts(vec!["0x1e240", "0x0"])),
+			)
+			.mount(&server)
+			.await;
+
+		let origin_domain = 700001u64;
+		let first_dest = 700002u64;
+		let second_dest = 700003u64;
+		let order_id = [0x48; 32];
+		let first_settler = starknet_bytes32(0x77);
+		let second_settler = starknet_bytes32(0x78);
+		let mut order =
+			make_hyperlane7683_order(order_id, origin_domain, first_dest, first_settler);
+		order.solver_address = solver_types::Address(starknet_bytes32(0x99).to_vec());
+		let mut resolved_order: Hyperlane7683ResolvedOrder =
+			serde_json::from_value(order.data.clone()).unwrap();
+		resolved_order
+			.max_spent
+			.push(solver_types::Hyperlane7683Output {
+				token: evm_bytes32(0x23),
+				amount: U256::from(2000u64),
+				recipient: evm_bytes32(0x34),
+				chain_id: U256::from(second_dest),
+			});
+		resolved_order
+			.fill_instructions
+			.push(Hyperlane7683FillInstruction {
+				destination_chain_id: U256::from(second_dest),
+				destination_settler: second_settler,
+				origin_data: vec![0xcc, 0xdd],
+			});
+		order.data = serde_json::to_value(resolved_order).unwrap();
+		let settlement =
+			test_hyperlane_starknet_settlement_for_chains(&[first_dest, second_dest], server.uri());
+
+		let claim_txs = settlement
+			.generate_claim_execution_transactions(&order, &fill_proof_skeleton())
+			.await
+			.unwrap();
+
+		assert_eq!(claim_txs.len(), 2);
+		let ExecutionTransaction::StarknetInvoke(first) = &claim_txs[0] else {
+			panic!("expected first Starknet invoke transaction");
+		};
+		assert_eq!(first.network_id, first_dest);
+		assert_eq!(first.calls.len(), 1);
+		assert_eq!(first.calls[0].contract_address.0, first_settler.to_vec());
+		assert_eq!(
+			first.calls[0].entry_point_selector,
+			starknet_selector(HYPERLANE7683_SETTLE_ENTRYPOINT)
+		);
+		assert_eq!(
+			first.calls[0].calldata,
+			build_hyperlane7683_starknet_settle_calldata(order_id, U256::from(123_456u64))
+		);
+
+		let ExecutionTransaction::StarknetInvoke(second) = &claim_txs[1] else {
+			panic!("expected second Starknet invoke transaction");
+		};
+		assert_eq!(second.network_id, second_dest);
+		assert_eq!(second.calls.len(), 1);
+		assert_eq!(second.calls[0].contract_address.0, second_settler.to_vec());
+		assert_eq!(
+			second.calls[0].entry_point_selector,
+			starknet_selector(HYPERLANE7683_SETTLE_ENTRYPOINT)
+		);
+		assert_eq!(
+			second.calls[0].calldata,
+			build_hyperlane7683_starknet_settle_calldata(order_id, U256::from(123_456u64))
+		);
+
+		let requests = server.received_requests().await.unwrap();
+		assert_eq!(requests.len(), 6);
+	}
+
+	#[tokio::test]
+	async fn hyperlane7683_starknet_claim_prepends_fee_token_approval_when_allowance_low() {
+		let server = MockServer::start().await;
+		Mock::given(method("POST"))
+			.and(body_string_contains("\"method\":\"starknet_call\""))
+			.and(body_string_contains(&starknet_selector_hex(
+				HYPERLANE7683_ORDER_STATUS_ENTRYPOINT,
+			)))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_body_json(rpc_result_starknet_felts(vec!["0x46494c4c4544"])),
+			)
+			.mount(&server)
+			.await;
+		Mock::given(method("POST"))
+			.and(body_string_contains("\"method\":\"starknet_call\""))
+			.and(body_string_contains(&starknet_selector_hex(
+				HYPERLANE7683_QUOTE_GAS_PAYMENT_ENTRYPOINT,
+			)))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_body_json(rpc_result_starknet_felts(vec!["0x1e240", "0x0"])),
+			)
+			.mount(&server)
+			.await;
+		Mock::given(method("POST"))
+			.and(body_string_contains("\"method\":\"starknet_call\""))
+			.and(body_string_contains(&starknet_selector_hex(
+				HYPERLANE7683_ALLOWANCE_ENTRYPOINT,
+			)))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_body_json(rpc_result_starknet_felts(vec!["0x1", "0x0"])),
+			)
+			.mount(&server)
+			.await;
+
+		let origin_domain = 700001u64;
+		let dest_domain = 700002u64;
+		let order_id = [0x47; 32];
+		let destination_settler = starknet_bytes32(0x77);
+		let mut order =
+			make_hyperlane7683_order(order_id, origin_domain, dest_domain, destination_settler);
+		order.solver_address = solver_types::Address(starknet_bytes32(0x99).to_vec());
+		let settlement = test_hyperlane_starknet_settlement(dest_domain, server.uri());
+
+		let claim_tx = settlement
+			.generate_claim_execution_transaction(&order, &fill_proof_skeleton())
+			.await
+			.unwrap()
+			.expect("Starknet destination should build execution transaction");
+
+		let ExecutionTransaction::StarknetInvoke(invoke) = claim_tx else {
+			panic!("expected Starknet invoke transaction");
+		};
+		assert_eq!(invoke.calls.len(), 2);
+		assert_eq!(
+			invoke.calls[0].contract_address,
+			HyperlaneSettlement::default_starknet_fee_token_address().unwrap()
+		);
+		assert_eq!(
+			invoke.calls[0].entry_point_selector,
+			starknet_selector(HYPERLANE7683_APPROVE_ENTRYPOINT)
+		);
+		assert_eq!(
+			invoke.calls[0].calldata,
+			vec![U256::from(0x77u8), U256::from(123_456u64), U256::ZERO]
+		);
+		assert_eq!(
+			invoke.calls[1].entry_point_selector,
+			starknet_selector(HYPERLANE7683_SETTLE_ENTRYPOINT)
+		);
+		assert_eq!(
+			invoke.calls[1].calldata,
+			build_hyperlane7683_starknet_settle_calldata(order_id, U256::from(123_456u64))
+		);
+
+		let requests = server.received_requests().await.unwrap();
+		assert_eq!(requests.len(), 3);
+		assert!(requests
+			.iter()
+			.map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).unwrap())
+			.any(|body| body["params"][0]["entry_point_selector"]
+				.as_str()
+				.is_some_and(|selector| selector
+					== starknet_selector_hex(HYPERLANE7683_ALLOWANCE_ENTRYPOINT))));
+	}
+
+	#[tokio::test]
+	async fn hyperlane7683_starknet_claim_skips_when_destination_already_settled() {
+		let server = MockServer::start().await;
+		Mock::given(method("POST"))
+			.and(body_string_contains("\"method\":\"starknet_call\""))
+			.and(body_string_contains(&starknet_selector_hex(
+				HYPERLANE7683_ORDER_STATUS_ENTRYPOINT,
+			)))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_body_json(rpc_result_starknet_felts(vec!["0x534554544c4544"])),
+			)
+			.mount(&server)
+			.await;
+
+		let dest_domain = 700002u64;
+		let mut order =
+			make_hyperlane7683_order([0x44; 32], 700001, dest_domain, starknet_bytes32(0x77));
+		order.solver_address = solver_types::Address(starknet_bytes32(0x99).to_vec());
+		let settlement = test_hyperlane_starknet_settlement(dest_domain, server.uri());
+
+		let claim_tx = settlement
+			.generate_claim_execution_transaction(&order, &fill_proof_skeleton())
+			.await
+			.unwrap();
+
+		assert!(claim_tx.is_none());
+		let requests = server.received_requests().await.unwrap();
+		assert_eq!(requests.len(), 1);
+		let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+		let selector = body["params"][0]["entry_point_selector"].as_str().unwrap();
+		assert_eq!(
+			selector,
+			starknet_selector_hex(HYPERLANE7683_ORDER_STATUS_ENTRYPOINT)
+		);
+	}
+
+	#[tokio::test]
+	async fn hyperlane7683_starknet_claim_rejects_non_filled_status() {
+		let server = MockServer::start().await;
+		Mock::given(method("POST"))
+			.and(body_string_contains("\"method\":\"starknet_call\""))
+			.and(body_string_contains(&starknet_selector_hex(
+				HYPERLANE7683_ORDER_STATUS_ENTRYPOINT,
+			)))
+			.respond_with(
+				ResponseTemplate::new(200).set_body_json(rpc_result_starknet_felts(vec!["0x0"])),
+			)
+			.mount(&server)
+			.await;
+
+		let dest_domain = 700002u64;
+		let mut order =
+			make_hyperlane7683_order([0x45; 32], 700001, dest_domain, starknet_bytes32(0x77));
+		order.solver_address = solver_types::Address(starknet_bytes32(0x99).to_vec());
+		let settlement = test_hyperlane_starknet_settlement(dest_domain, server.uri());
+
+		let error = settlement
+			.generate_claim_execution_transaction(&order, &fill_proof_skeleton())
+			.await
+			.unwrap_err();
+
+		assert!(error
+			.to_string()
+			.contains("destination order_status is UNKNOWN, expected FILLED"));
+		let requests = server.received_requests().await.unwrap();
+		assert_eq!(requests.len(), 1);
+	}
+
+	#[tokio::test]
+	async fn hyperlane7683_starknet_claim_rejects_zero_settle_fee_quote_by_default() {
+		let server = MockServer::start().await;
+		Mock::given(method("POST"))
+			.and(body_string_contains("\"method\":\"starknet_call\""))
+			.and(body_string_contains(&starknet_selector_hex(
+				HYPERLANE7683_ORDER_STATUS_ENTRYPOINT,
+			)))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_body_json(rpc_result_starknet_felts(vec!["0x46494c4c4544"])),
+			)
+			.mount(&server)
+			.await;
+		Mock::given(method("POST"))
+			.and(body_string_contains("\"method\":\"starknet_call\""))
+			.and(body_string_contains(&starknet_selector_hex(
+				HYPERLANE7683_QUOTE_GAS_PAYMENT_ENTRYPOINT,
+			)))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_body_json(rpc_result_starknet_felts(vec!["0x0", "0x0"])),
+			)
+			.mount(&server)
+			.await;
+
+		let dest_domain = 700002u64;
+		let mut order =
+			make_hyperlane7683_order([0x46; 32], 700001, dest_domain, starknet_bytes32(0x77));
+		order.solver_address = solver_types::Address(starknet_bytes32(0x99).to_vec());
+		let settlement = test_hyperlane_starknet_settlement(dest_domain, server.uri());
+
+		let error = settlement
+			.generate_claim_execution_transaction(&order, &fill_proof_skeleton())
+			.await
+			.unwrap_err();
+
+		assert!(error
+			.to_string()
+			.contains("settle gas payment quote is zero on Starknet destination chain"));
+		let requests = server.received_requests().await.unwrap();
+		assert_eq!(requests.len(), 2);
+	}
+
+	#[tokio::test]
+	async fn hyperlane_quotes_starknet_post_fill_fee_from_destination_settler() {
+		let server = MockServer::start().await;
+		Mock::given(method("POST"))
+			.and(body_string_contains("\"method\":\"starknet_call\""))
+			.and(body_string_contains(&starknet_selector_hex(
+				HYPERLANE7683_QUOTE_GAS_PAYMENT_ENTRYPOINT,
+			)))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_body_json(rpc_result_starknet_felts(vec!["0x1e240", "0x0"])),
+			)
+			.mount(&server)
+			.await;
+
+		let origin_chain = 700001u64;
+		let origin_domain = 700001u32;
+		let dest_chain = 700002u64;
+		let mut settlement = test_hyperlane_starknet_settlement(dest_chain, server.uri());
+		settlement.domains.insert(origin_chain, origin_domain);
+		let params = PostFillFeeParams {
+			origin_chain_id: origin_chain,
+			dest_chain_id: dest_chain,
+			output_token: [0x11; 32],
+			output_amount: U256::from(1000u64),
+			output_recipient: [0x22; 32],
+			output_call: vec![0xab, 0xcd],
+			source_settler: solver_types::Address(starknet_bytes32(0x77).to_vec()),
+		};
+
+		let quote = settlement
+			.quote_post_fill_fee(&params)
+			.await
+			.unwrap()
+			.expect("Starknet Hyperlane7683 route has a fee");
+
+		assert_eq!(quote.fee_wei, U256::from(123_456u64));
+		assert_eq!(quote.chain_id, dest_chain);
+		let requests = server.received_requests().await.unwrap();
+		assert_eq!(requests.len(), 1);
+		let body = std::str::from_utf8(&requests[0].body).unwrap();
+		assert!(body.contains(&starknet_selector_hex(
+			HYPERLANE7683_QUOTE_GAS_PAYMENT_ENTRYPOINT
+		)));
 	}
 
 	#[tokio::test]

@@ -744,6 +744,7 @@ mod tests {
 			solver_types::NetworkConfig {
 				name: Some("ethereum".to_string()),
 				network_type: solver_types::networks::NetworkType::Parent,
+				kind: Default::default(),
 				rpc_urls: vec![],
 				input_settler_address: parse_address("0x1111111111111111111111111111111111111111")
 					.unwrap(),
@@ -765,6 +766,7 @@ mod tests {
 			solver_types::NetworkConfig {
 				name: Some("polygon".to_string()),
 				network_type: solver_types::networks::NetworkType::Hub,
+				kind: Default::default(),
 				rpc_urls: vec![],
 				input_settler_address: parse_address("0x3333333333333333333333333333333333333333")
 					.unwrap(),

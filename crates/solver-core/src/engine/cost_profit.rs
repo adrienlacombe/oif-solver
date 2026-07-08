@@ -342,6 +342,7 @@ struct GasLegCostsWei {
 /// `origin_cost_per_gas`; destination legs (fill / post_fill) use
 /// `dest_cost_per_gas`. Saturating multiplication mirrors the inline
 /// behaviour the helper replaced.
+#[cfg(test)]
 fn calculate_gas_leg_costs_wei(
 	gas_units: &GasUnits,
 	origin_cost_per_gas: U256,
@@ -353,6 +354,76 @@ fn calculate_gas_leg_costs_wei(
 		post_fill: dest_cost_per_gas.saturating_mul(U256::from(gas_units.post_fill_units)),
 		pre_claim: origin_cost_per_gas.saturating_mul(U256::from(gas_units.pre_claim_units)),
 		claim: origin_cost_per_gas.saturating_mul(U256::from(gas_units.claim_units)),
+	}
+}
+
+fn calculate_fee_leg_cost(gas_units: u64, fee_params: &FeeParams) -> U256 {
+	if gas_units == 0 {
+		return U256::ZERO;
+	}
+	if let Some(fixed_tx_fee) = fee_params.fixed_tx_fee {
+		return fixed_tx_fee;
+	}
+	U256::from(fee_params.cost_per_gas).saturating_mul(U256::from(gas_units))
+}
+
+fn calculate_gas_leg_costs_from_fee_params(
+	gas_units: &GasUnits,
+	origin_fee: &FeeParams,
+	dest_fee: &FeeParams,
+) -> GasLegCostsWei {
+	GasLegCostsWei {
+		open: calculate_fee_leg_cost(gas_units.open_units, origin_fee),
+		fill: calculate_fee_leg_cost(gas_units.fill_units, dest_fee),
+		post_fill: calculate_fee_leg_cost(gas_units.post_fill_units, dest_fee),
+		pre_claim: calculate_fee_leg_cost(gas_units.pre_claim_units, origin_fee),
+		claim: calculate_fee_leg_cost(gas_units.claim_units, origin_fee),
+	}
+}
+
+fn format_atomic_units(amount: &U256, decimals: u8) -> String {
+	let mut digits = amount.to_string();
+	let decimals = usize::from(decimals);
+	if decimals == 0 {
+		return digits;
+	}
+	if digits.len() <= decimals {
+		let zeros = "0".repeat(decimals - digits.len());
+		digits = format!("0.{zeros}{digits}");
+	} else {
+		let split_at = digits.len() - decimals;
+		digits.insert(split_at, '.');
+	}
+	let trimmed = digits.trim_end_matches('0').trim_end_matches('.');
+	if trimmed.is_empty() {
+		"0".to_string()
+	} else {
+		trimmed.to_string()
+	}
+}
+
+fn interop_address_to_post_fill_bytes32(
+	field: &str,
+	address: &InteropAddress,
+) -> Result<[u8; 32], APIError> {
+	match address.address.len() {
+		20 => {
+			let mut bytes = [0u8; 32];
+			bytes[12..].copy_from_slice(&address.address);
+			Ok(bytes)
+		},
+		32 => {
+			let mut bytes = [0u8; 32];
+			bytes.copy_from_slice(&address.address);
+			Ok(bytes)
+		},
+		len => Err(APIError::BadRequest {
+			error_type: ApiErrorType::InvalidRequest,
+			message: format!(
+				"{field} must be a 20-byte EVM address or 32-byte bytes32 address, got {len} bytes"
+			),
+			details: None,
+		}),
 	}
 }
 
@@ -1275,9 +1346,6 @@ impl CostProfitService {
 			self.get_chain_fee_params(dest_chain_id),
 		)?;
 
-		let origin_gp = U256::from(origin_fee.cost_per_gas);
-		let dest_gp = U256::from(dest_fee.cost_per_gas);
-
 		// Single structured event covering both legs — at INFO so the value
 		// used for quote economics is auditable in canary deploys. Move to
 		// `debug` once production confidence exists.
@@ -1297,10 +1365,9 @@ impl CostProfitService {
 			"Quote gas fee params resolved"
 		);
 
-		// Split gas costs across origin/destination contract legs. Helper
-		// is pure to allow proptest coverage of the chain-boundary
-		// invariant without touching mocks.
-		let leg_costs = calculate_gas_leg_costs_wei(gas_units, origin_gp, dest_gp);
+		// Split gas costs across origin/destination contract legs. EVM chains use
+		// per-gas pricing; Starknet uses a configured fixed per-invoke fee cap.
+		let leg_costs = calculate_gas_leg_costs_from_fee_params(gas_units, &origin_fee, &dest_fee);
 		let open_cost_wei = leg_costs.open;
 		let fill_cost_wei = leg_costs.fill;
 		let post_fill_cost_wei = leg_costs.post_fill;
@@ -1309,11 +1376,11 @@ impl CostProfitService {
 
 		// Price conversions are independent as well.
 		let (gas_open, gas_fill, gas_post_fill, gas_pre_claim, gas_claim) = tokio::try_join!(
-			self.wei_to_usd(&open_cost_wei),
-			self.wei_to_usd(&fill_cost_wei),
-			self.wei_to_usd(&post_fill_cost_wei),
-			self.wei_to_usd(&pre_claim_cost_wei),
-			self.wei_to_usd(&claim_cost_wei),
+			self.native_fee_to_usd(&origin_fee, &open_cost_wei),
+			self.native_fee_to_usd(&dest_fee, &fill_cost_wei),
+			self.native_fee_to_usd(&dest_fee, &post_fill_cost_wei),
+			self.native_fee_to_usd(&origin_fee, &pre_claim_cost_wei),
+			self.native_fee_to_usd(&origin_fee, &claim_cost_wei),
 		)?;
 
 		// Calculate gas buffer using config value (hot-reloadable)
@@ -2451,35 +2518,9 @@ impl CostProfitService {
 			.output_settler_address
 			.clone();
 
-		let token_addr = output
-			.asset
-			.ethereum_address()
-			.map_err(|e| APIError::BadRequest {
-				error_type: ApiErrorType::InvalidRequest,
-				message: format!("Output asset is not an EVM address: {e}"),
-				details: None,
-			})?;
-		let recipient_addr =
-			output
-				.receiver
-				.ethereum_address()
-				.map_err(|e| APIError::BadRequest {
-					error_type: ApiErrorType::InvalidRequest,
-					message: format!("Output receiver is not an EVM address: {e}"),
-					details: None,
-				})?;
-		let mut output_token = [0u8; 32];
-		output_token.copy_from_slice(
-			AlloyAddress::from_slice(token_addr.as_slice())
-				.into_word()
-				.as_slice(),
-		);
-		let mut output_recipient = [0u8; 32];
-		output_recipient.copy_from_slice(
-			AlloyAddress::from_slice(recipient_addr.as_slice())
-				.into_word()
-				.as_slice(),
-		);
+		let output_token = interop_address_to_post_fill_bytes32("Output asset", &output.asset)?;
+		let output_recipient =
+			interop_address_to_post_fill_bytes32("Output receiver", &output.receiver)?;
 		let output_call = match output.calldata.as_deref() {
 			None => Vec::new(),
 			Some(s) if s.is_empty() || s == "0x" => Vec::new(),
@@ -2522,35 +2563,9 @@ impl CostProfitService {
 				message: "No output chain found".to_string(),
 				details: None,
 			})?;
-		let token_addr = output
-			.asset
-			.ethereum_address()
-			.map_err(|e| APIError::BadRequest {
-				error_type: ApiErrorType::InvalidRequest,
-				message: format!("Output asset is not an EVM address: {e}"),
-				details: None,
-			})?;
-		let recipient_addr =
-			output
-				.receiver
-				.ethereum_address()
-				.map_err(|e| APIError::BadRequest {
-					error_type: ApiErrorType::InvalidRequest,
-					message: format!("Output receiver is not an EVM address: {e}"),
-					details: None,
-				})?;
-		let mut output_token = [0u8; 32];
-		output_token.copy_from_slice(
-			AlloyAddress::from_slice(token_addr.as_slice())
-				.into_word()
-				.as_slice(),
-		);
-		let mut output_recipient = [0u8; 32];
-		output_recipient.copy_from_slice(
-			AlloyAddress::from_slice(recipient_addr.as_slice())
-				.into_word()
-				.as_slice(),
-		);
+		let output_token = interop_address_to_post_fill_bytes32("Output asset", &output.asset)?;
+		let output_recipient =
+			interop_address_to_post_fill_bytes32("Output receiver", &output.receiver)?;
 		let output_call = match output.calldata.as_deref() {
 			None => Vec::new(),
 			Some(s) if s.is_empty() || s == "0x" => Vec::new(),
@@ -2834,6 +2849,34 @@ impl CostProfitService {
 			.await
 			.map_err(|e| {
 				CostProfitError::Calculation(format!("Failed to convert wei to USD: {e}"))
+			})?;
+
+		Decimal::from_str(&usd_value)
+			.map_err(|e| CostProfitError::Calculation(format!("Failed to parse USD value: {e}")))
+	}
+
+	async fn native_fee_to_usd(
+		&self,
+		fee_params: &FeeParams,
+		amount: &U256,
+	) -> Result<Decimal, CostProfitError> {
+		if *amount == U256::ZERO {
+			return Ok(Decimal::ZERO);
+		}
+		if fee_params.native_asset_symbol == "ETH" {
+			return self.wei_to_usd(amount).await;
+		}
+
+		let native_amount = format_atomic_units(amount, fee_params.native_asset_decimals);
+		let usd_value = self
+			.pricing_service
+			.convert_asset(fee_params.native_asset_symbol, "USD", &native_amount)
+			.await
+			.map_err(|e| {
+				CostProfitError::Calculation(format!(
+					"Failed to convert {} fee to USD: {e}",
+					fee_params.native_asset_symbol
+				))
 			})?;
 
 		Decimal::from_str(&usd_value)
@@ -3901,6 +3944,7 @@ mod tests {
 		let network_1 = solver_types::NetworkConfig {
 			name: Some("ethereum".to_string()),
 			network_type: solver_types::networks::NetworkType::Parent,
+			kind: Default::default(),
 			rpc_urls: vec![],
 			input_settler_address: solver_types::Address([0x11; 20].to_vec()),
 			output_settler_address: solver_types::Address([0x22; 20].to_vec()),
@@ -3926,6 +3970,7 @@ mod tests {
 		let network_137 = solver_types::NetworkConfig {
 			name: Some("polygon".to_string()),
 			network_type: solver_types::networks::NetworkType::Hub,
+			kind: Default::default(),
 			rpc_urls: vec![],
 			input_settler_address: solver_types::Address([0x11; 20].to_vec()),
 			output_settler_address: solver_types::Address([0x22; 20].to_vec()),
@@ -4077,6 +4122,7 @@ mod tests {
 		let network_1 = solver_types::NetworkConfig {
 			name: Some("ethereum".to_string()),
 			network_type: solver_types::networks::NetworkType::Parent,
+			kind: Default::default(),
 			rpc_urls: vec![],
 			input_settler_address: solver_types::Address([0x11; 20].to_vec()),
 			output_settler_address: solver_types::Address([0x22; 20].to_vec()),
@@ -4101,6 +4147,7 @@ mod tests {
 		let network_137 = solver_types::NetworkConfig {
 			name: Some("polygon".to_string()),
 			network_type: solver_types::networks::NetworkType::Hub,
+			kind: Default::default(),
 			rpc_urls: vec![],
 			input_settler_address: solver_types::Address([0x11; 20].to_vec()),
 			output_settler_address: solver_types::Address([0x22; 20].to_vec()),
@@ -4247,6 +4294,7 @@ mod tests {
 		let network_1 = solver_types::NetworkConfig {
 			name: Some("ethereum".to_string()),
 			network_type: solver_types::networks::NetworkType::Parent,
+			kind: Default::default(),
 			rpc_urls: vec![],
 			input_settler_address: solver_types::Address([0x11; 20].to_vec()),
 			output_settler_address: solver_types::Address([0x22; 20].to_vec()),
@@ -4272,6 +4320,7 @@ mod tests {
 		let network_137 = solver_types::NetworkConfig {
 			name: Some("polygon".to_string()),
 			network_type: solver_types::networks::NetworkType::Hub,
+			kind: Default::default(),
 			rpc_urls: vec![],
 			input_settler_address: solver_types::Address([0x11; 20].to_vec()),
 			output_settler_address: solver_types::Address([0x22; 20].to_vec()),
@@ -4650,9 +4699,13 @@ mod tests {
 			execution_params: None,
 			prepare_tx_hash: None,
 			fill_tx_hash: None,
+			fill_tx_hashes: Vec::new(),
+			expected_fill_tx_count: None,
 			post_fill_tx_hash: None,
 			pre_claim_tx_hash: None,
 			claim_tx_hash: None,
+			claim_tx_hashes: Vec::new(),
+			expected_claim_tx_count: None,
 			fill_proof: None,
 			settlement_name: None,
 		}
@@ -5488,9 +5541,13 @@ mod tests {
 			execution_params: None,
 			prepare_tx_hash: None,
 			fill_tx_hash: None,
+			fill_tx_hashes: Vec::new(),
+			expected_fill_tx_count: None,
 			post_fill_tx_hash: None,
 			pre_claim_tx_hash: None,
 			claim_tx_hash: None,
+			claim_tx_hashes: Vec::new(),
+			expected_claim_tx_count: None,
 			fill_proof: None,
 			settlement_name: None,
 		}
@@ -5565,9 +5622,13 @@ mod tests {
 			execution_params: None,
 			prepare_tx_hash: None,
 			fill_tx_hash: None,
+			fill_tx_hashes: Vec::new(),
+			expected_fill_tx_count: None,
 			post_fill_tx_hash: None,
 			pre_claim_tx_hash: None,
 			claim_tx_hash: None,
+			claim_tx_hashes: Vec::new(),
+			expected_claim_tx_count: None,
 			fill_proof: None,
 			settlement_name: None,
 		}
@@ -6699,6 +6760,7 @@ mod tests {
 			solver_types::NetworkConfig {
 				name: Some("ethereum".to_string()),
 				network_type: solver_types::networks::NetworkType::Parent,
+				kind: Default::default(),
 				rpc_urls: vec![],
 				input_settler_address: solver_types::Address([0x11; 20].to_vec()),
 				output_settler_address: solver_types::Address([0x22; 20].to_vec()),
@@ -6724,6 +6786,7 @@ mod tests {
 			solver_types::NetworkConfig {
 				name: Some("polygon".to_string()),
 				network_type: solver_types::networks::NetworkType::Hub,
+				kind: Default::default(),
 				rpc_urls: vec![],
 				input_settler_address: solver_types::Address([0x11; 20].to_vec()),
 				output_settler_address: solver_types::Address([0x22; 20].to_vec()),
@@ -6773,6 +6836,7 @@ mod tests {
 			solver_types::NetworkConfig {
 				name: Some("ethereum".to_string()),
 				network_type: solver_types::networks::NetworkType::Parent,
+				kind: Default::default(),
 				rpc_urls: vec![],
 				input_settler_address: solver_types::Address([0x11; 20].to_vec()),
 				output_settler_address: solver_types::Address([0x22; 20].to_vec()),
@@ -6787,6 +6851,7 @@ mod tests {
 			solver_types::NetworkConfig {
 				name: Some("polygon".to_string()),
 				network_type: solver_types::networks::NetworkType::Hub,
+				kind: Default::default(),
 				rpc_urls: vec![],
 				input_settler_address: solver_types::Address([0x11; 20].to_vec()),
 				output_settler_address: solver_types::Address([0x22; 20].to_vec()),
@@ -7525,6 +7590,7 @@ mod tests {
 			solver_types::NetworkConfig {
 				name: Some("ethereum".to_string()),
 				network_type: solver_types::networks::NetworkType::Parent,
+				kind: Default::default(),
 				rpc_urls: vec![],
 				input_settler_address: solver_types::Address([0x11; 20].to_vec()),
 				output_settler_address: solver_types::Address([0x22; 20].to_vec()),
@@ -7550,6 +7616,7 @@ mod tests {
 			solver_types::NetworkConfig {
 				name: Some("polygon".to_string()),
 				network_type: solver_types::networks::NetworkType::Hub,
+				kind: Default::default(),
 				rpc_urls: vec![],
 				input_settler_address: solver_types::Address([0x11; 20].to_vec()),
 				output_settler_address: solver_types::Address([0x22; 20].to_vec()),
@@ -8328,6 +8395,56 @@ mod tests {
 		assert_eq!(params.output_amount, U256::from_str("2000000000").unwrap());
 	}
 
+	#[test]
+	fn quote_post_fill_fee_params_left_pads_evm_output_addresses() {
+		let config = config_with_output_settler_on_dest(QUOTE_OUTPUT_SETTLER);
+		let request = create_test_request(true);
+		let context = create_test_validated_context(true);
+		let resolved = resolved_amounts_for_request(&request, U256::from(1_000_000u64));
+		let service = cost_profit_service_no_delivery_chains();
+
+		let params = service
+			.build_post_fill_fee_params_for_quote(&request, &context, &resolved, &config)
+			.expect("EVM output addresses should build fee params")
+			.expect("quote has a post-fill output");
+
+		assert_eq!(&params.output_token[..12], &[0u8; 12]);
+		assert_eq!(&params.output_token[12..], QUOTE_OUTPUT_TOKEN.as_slice());
+		assert_eq!(&params.output_recipient[..12], &[0u8; 12]);
+		assert_eq!(
+			&params.output_recipient[12..],
+			QUOTE_OUTPUT_RECIPIENT.as_slice()
+		);
+	}
+
+	#[test]
+	fn quote_post_fill_fee_params_accept_bytes32_output_addresses() {
+		let config = config_with_output_settler_on_dest(QUOTE_OUTPUT_SETTLER);
+		let mut request = create_test_request(true);
+		let context = create_test_validated_context(true);
+		let output_token = solver_types::utils::parse_starknet_address(
+			"0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d",
+		)
+		.unwrap();
+		let output_recipient = solver_types::utils::parse_starknet_address(
+			"0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		)
+		.unwrap();
+		request.intent.outputs[0].asset.address = output_token.to_vec();
+		request.intent.outputs[0].receiver.address = output_recipient.to_vec();
+		let resolved = resolved_amounts_for_request(&request, U256::from(1_000_000u64));
+		let service = cost_profit_service_no_delivery_chains();
+
+		let params = service
+			.build_post_fill_fee_params_for_quote(&request, &context, &resolved, &config)
+			.expect("bytes32 output addresses should build fee params")
+			.expect("quote has a post-fill output");
+
+		assert_eq!(params.output_token, output_token);
+		assert_eq!(params.output_recipient, output_recipient);
+		assert_eq!(params.output_amount, U256::from(1_000_000u64));
+	}
+
 	// ----- Task 5: validator honors stored cost_breakdown for quoted orders ---
 
 	/// Helper that builds a `StoredQuote` whose embedded `cost_context` carries
@@ -8807,6 +8924,41 @@ mod gas_leg_proptests {
 				pre_claim_units: pre_claim,
 				claim_units: claim,
 			})
+	}
+
+	#[test]
+	fn fixed_fee_params_charge_once_per_nonzero_leg() {
+		let origin_fee = FeeParams::starknet_fixed(700001, U256::from(1000));
+		let dest_fee = FeeParams::legacy(1, 10);
+		let gas_units = GasUnits {
+			open_units: 1,
+			fill_units: 2,
+			post_fill_units: 0,
+			pre_claim_units: 3,
+			claim_units: 0,
+		};
+
+		let costs = calculate_gas_leg_costs_from_fee_params(&gas_units, &origin_fee, &dest_fee);
+
+		assert_eq!(costs.open, U256::from(1000));
+		assert_eq!(costs.pre_claim, U256::from(1000));
+		assert_eq!(costs.claim, U256::ZERO);
+		assert_eq!(costs.fill, U256::from(20));
+		assert_eq!(costs.post_fill, U256::ZERO);
+	}
+
+	#[test]
+	fn formats_atomic_units_with_configured_decimals() {
+		assert_eq!(format_atomic_units(&U256::ZERO, 18), "0");
+		assert_eq!(
+			format_atomic_units(&U256::from(1), 18),
+			"0.000000000000000001"
+		);
+		assert_eq!(
+			format_atomic_units(&U256::from(1_500_000_000_000_000_000u128), 18),
+			"1.5"
+		);
+		assert_eq!(format_atomic_units(&U256::from(42), 0), "42");
 	}
 
 	proptest! {

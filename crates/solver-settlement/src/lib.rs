@@ -8,8 +8,9 @@
 use async_trait::async_trait;
 use solver_types::{
 	oracle::{OracleInfo, OracleRoutes},
-	Address, ConfigSchema, FillProof, ImplementationRegistry, NetworksConfig, Order,
-	PusherL2Params, Transaction, TransactionHash, TransactionReceipt, TransactionType,
+	Address, ConfigSchema, ExecutionTransaction, FillProof, ImplementationRegistry, NetworksConfig,
+	Order, PusherL2Params, Transaction, TransactionHash, TransactionReceipt, TransactionType,
+	HYPERLANE7683_STANDARD,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -73,6 +74,20 @@ pub enum SettlementError {
 	/// Settlement backend storage is temporarily unavailable.
 	#[error("Storage unavailable: {0}")]
 	StorageUnavailable(String),
+}
+
+/// Rejects orders that require plural fill settlement while the settlement
+/// service still exposes scalar fill-proof and claim APIs.
+pub fn ensure_scalar_settlement_supported(order: &Order) -> Result<(), SettlementError> {
+	let known_fill_hashes = order.fill_transaction_hashes().len();
+	let expected_fill_hashes = order.expected_fill_transaction_count();
+	if expected_fill_hashes > 1 || known_fill_hashes > 1 {
+		return Err(SettlementError::ValidationFailed(format!(
+			"multi-fill settlement is not supported by scalar settlement pipeline \
+			 (expected_fill_tx_count={expected_fill_hashes}, known_fill_tx_hashes={known_fill_hashes})"
+		)));
+	}
+	Ok(())
 }
 
 /// Direction for pushing L1 block hashes into an L2 buffer contract.
@@ -369,6 +384,17 @@ pub trait SettlementInterface: Send + Sync {
 		Ok(None)
 	}
 
+	/// Generates a typed transaction to execute after fill confirmation.
+	async fn generate_post_fill_execution_transaction(
+		&self,
+		order: &Order,
+		fill_receipt: &TransactionReceipt,
+	) -> Result<Option<ExecutionTransaction>, SettlementError> {
+		self.generate_post_fill_transaction(order, fill_receipt)
+			.await
+			.map(|tx| tx.map(ExecutionTransaction::from))
+	}
+
 	/// Generates a transaction to execute before claiming (optional).
 	///
 	/// This transaction might:
@@ -383,6 +409,56 @@ pub trait SettlementInterface: Send + Sync {
 	) -> Result<Option<Transaction>, SettlementError> {
 		// Default: no pre-claim transaction needed
 		Ok(None)
+	}
+
+	/// Generates a typed transaction to execute before claiming.
+	async fn generate_pre_claim_execution_transaction(
+		&self,
+		order: &Order,
+		fill_proof: &FillProof,
+	) -> Result<Option<ExecutionTransaction>, SettlementError> {
+		self.generate_pre_claim_transaction(order, fill_proof)
+			.await
+			.map(|tx| tx.map(ExecutionTransaction::from))
+	}
+
+	/// Generates a settlement-owned claim transaction when final claim mechanics
+	/// require settlement backend state, such as live protocol fee quotes.
+	///
+	/// Order implementations remain the default owner of claim calldata. A
+	/// settlement returns `Some` only when it can build a more complete transaction
+	/// than the order layer can build by itself.
+	async fn generate_claim_transaction(
+		&self,
+		_order: &Order,
+		_fill_proof: &FillProof,
+	) -> Result<Option<Transaction>, SettlementError> {
+		Ok(None)
+	}
+
+	/// Generates a typed settlement-owned claim transaction when supported.
+	async fn generate_claim_execution_transaction(
+		&self,
+		order: &Order,
+		fill_proof: &FillProof,
+	) -> Result<Option<ExecutionTransaction>, SettlementError> {
+		self.generate_claim_transaction(order, fill_proof)
+			.await
+			.map(|tx| tx.map(ExecutionTransaction::from))
+	}
+
+	/// Generates all typed settlement-owned claim transactions when a standard
+	/// settles multiple destination legs independently.
+	async fn generate_claim_execution_transactions(
+		&self,
+		order: &Order,
+		fill_proof: &FillProof,
+	) -> Result<Vec<ExecutionTransaction>, SettlementError> {
+		Ok(self
+			.generate_claim_execution_transaction(order, fill_proof)
+			.await?
+			.into_iter()
+			.collect())
 	}
 
 	/// Check whether the L2 block-hash buffer needs to be advanced for this order.
@@ -419,6 +495,7 @@ pub type SettlementFactory = fn(
 	&serde_json::Value,
 	&NetworksConfig,
 	Arc<solver_storage::StorageService>,
+	&solver_types::SolverIdentityAddresses,
 ) -> Result<Box<dyn SettlementInterface>, SettlementError>;
 
 /// Registry trait for settlement implementations.
@@ -559,6 +636,7 @@ impl SettlementService {
 
 	/// Attempts to recover already-broadcast post-fill state for an order.
 	pub async fn recover_post_fill_state(&self, order: &Order) -> Result<bool, SettlementError> {
+		ensure_scalar_settlement_supported(order)?;
 		self.find_settlement_for_order(order)?
 			.recover_post_fill_state(order)
 			.await
@@ -589,6 +667,9 @@ impl SettlementService {
 
 	/// Returns typed settlement readiness for an order/fill pair.
 	pub async fn readiness(&self, order: &Order, fill_proof: &FillProof) -> SettlementReadiness {
+		if let Err(e) = ensure_scalar_settlement_supported(order) {
+			return SettlementReadiness::PermanentFailure(e.to_string());
+		}
 		match self.find_settlement_for_order(order) {
 			Ok(implementation) => implementation.readiness(order, fill_proof).await,
 			Err(e) => SettlementReadiness::PermanentFailure(e.to_string()),
@@ -847,8 +928,13 @@ impl SettlementService {
 		order: &Order,
 		tx_hash: &TransactionHash,
 	) -> Result<FillProof, SettlementError> {
+		ensure_scalar_settlement_supported(order)?;
 		let implementation = self.find_settlement_for_order(order)?;
 		let proof = implementation.get_attestation(order, tx_hash).await?;
+
+		if order.standard == HYPERLANE7683_STANDARD {
+			return Ok(proof);
+		}
 
 		// Security: every FillProof must carry the order-bound input oracle.
 		// This is the central guard that protects against settlement implementations
@@ -871,6 +957,9 @@ impl SettlementService {
 
 	/// Checks if an order can be claimed using the appropriate settlement implementation.
 	pub async fn can_claim(&self, order: &Order, fill_proof: &FillProof) -> bool {
+		if ensure_scalar_settlement_supported(order).is_err() {
+			return false;
+		}
 		if let Ok(implementation) = self.find_settlement_for_order(order) {
 			implementation.can_claim(order, fill_proof).await
 		} else {
@@ -884,9 +973,23 @@ impl SettlementService {
 		order: &Order,
 		fill_receipt: &TransactionReceipt,
 	) -> Result<Option<Transaction>, SettlementError> {
+		ensure_scalar_settlement_supported(order)?;
 		let implementation = self.find_settlement_for_order(order)?;
 		implementation
 			.generate_post_fill_transaction(order, fill_receipt)
+			.await
+	}
+
+	/// Generates a typed post-fill execution transaction if needed.
+	pub async fn generate_post_fill_execution_transaction(
+		&self,
+		order: &Order,
+		fill_receipt: &TransactionReceipt,
+	) -> Result<Option<ExecutionTransaction>, SettlementError> {
+		ensure_scalar_settlement_supported(order)?;
+		let implementation = self.find_settlement_for_order(order)?;
+		implementation
+			.generate_post_fill_execution_transaction(order, fill_receipt)
 			.await
 	}
 
@@ -896,9 +999,65 @@ impl SettlementService {
 		order: &Order,
 		fill_proof: &FillProof,
 	) -> Result<Option<Transaction>, SettlementError> {
+		ensure_scalar_settlement_supported(order)?;
 		let implementation = self.find_settlement_for_order(order)?;
 		implementation
 			.generate_pre_claim_transaction(order, fill_proof)
+			.await
+	}
+
+	/// Generates a typed pre-claim execution transaction if needed.
+	pub async fn generate_pre_claim_execution_transaction(
+		&self,
+		order: &Order,
+		fill_proof: &FillProof,
+	) -> Result<Option<ExecutionTransaction>, SettlementError> {
+		ensure_scalar_settlement_supported(order)?;
+		let implementation = self.find_settlement_for_order(order)?;
+		implementation
+			.generate_pre_claim_execution_transaction(order, fill_proof)
+			.await
+	}
+
+	/// Generates a settlement-owned claim transaction when supported.
+	pub async fn generate_claim_transaction(
+		&self,
+		order: &Order,
+		fill_proof: &FillProof,
+	) -> Result<Option<Transaction>, SettlementError> {
+		ensure_scalar_settlement_supported(order)?;
+		let implementation = self.find_settlement_for_order(order)?;
+		implementation
+			.generate_claim_transaction(order, fill_proof)
+			.await
+	}
+
+	/// Generates a typed settlement-owned claim execution transaction when supported.
+	pub async fn generate_claim_execution_transaction(
+		&self,
+		order: &Order,
+		fill_proof: &FillProof,
+	) -> Result<Option<ExecutionTransaction>, SettlementError> {
+		ensure_scalar_settlement_supported(order)?;
+		let implementation = self.find_settlement_for_order(order)?;
+		implementation
+			.generate_claim_execution_transaction(order, fill_proof)
+			.await
+	}
+
+	/// Generates all typed settlement-owned claim execution transactions when
+	/// supported. Non-Hyperlane standards remain on the scalar settlement path.
+	pub async fn generate_claim_execution_transactions(
+		&self,
+		order: &Order,
+		fill_proof: &FillProof,
+	) -> Result<Vec<ExecutionTransaction>, SettlementError> {
+		if order.standard != HYPERLANE7683_STANDARD {
+			ensure_scalar_settlement_supported(order)?;
+		}
+		let implementation = self.find_settlement_for_order(order)?;
+		implementation
+			.generate_claim_execution_transactions(order, fill_proof)
 			.await
 	}
 }
@@ -932,6 +1091,8 @@ mod tests {
 		buffer_coverage: Option<(PusherDirection, u64)>,
 		post_fill_tx: Option<Transaction>,
 		pre_claim_tx: Option<Transaction>,
+		claim_tx: Option<Transaction>,
+		claim_execution_txs: Option<Vec<ExecutionTransaction>>,
 		post_fill_fee_quote: Option<SettlementFeeQuote>,
 		post_fill_fee_should_fail: bool,
 	}
@@ -1019,6 +1180,31 @@ mod tests {
 		) -> Result<Option<Transaction>, SettlementError> {
 			Ok(self.pre_claim_tx.clone())
 		}
+
+		async fn generate_claim_transaction(
+			&self,
+			_order: &Order,
+			_fill_proof: &FillProof,
+		) -> Result<Option<Transaction>, SettlementError> {
+			Ok(self.claim_tx.clone())
+		}
+
+		async fn generate_claim_execution_transactions(
+			&self,
+			_order: &Order,
+			_fill_proof: &FillProof,
+		) -> Result<Vec<ExecutionTransaction>, SettlementError> {
+			if let Some(txs) = &self.claim_execution_txs {
+				return Ok(txs.clone());
+			}
+
+			Ok(self
+				.claim_tx
+				.clone()
+				.map(ExecutionTransaction::from)
+				.into_iter()
+				.collect())
+		}
 	}
 
 	fn addr(byte: u8) -> Address {
@@ -1061,6 +1247,8 @@ mod tests {
 			buffer_coverage: None,
 			post_fill_tx: None,
 			pre_claim_tx: None,
+			claim_tx: None,
+			claim_execution_txs: None,
 			post_fill_fee_quote: None,
 			post_fill_fee_should_fail: false,
 		}
@@ -1699,6 +1887,143 @@ mod tests {
 		);
 	}
 
+	fn assert_multi_fill_validation<T>(result: Result<T, SettlementError>) {
+		match result {
+			Err(SettlementError::ValidationFailed(message)) => {
+				assert!(message.contains("multi-fill settlement is not supported"));
+			},
+			Err(other) => panic!("Expected multi-fill validation error, got {other:?}"),
+			Ok(_) => panic!("Expected multi-fill validation error, got Ok"),
+		}
+	}
+
+	#[tokio::test]
+	async fn settlement_service_rejects_multi_fill_scalar_paths() {
+		let mut settlement = make_test_settlement(OracleConfig {
+			input_oracles: HashMap::new(),
+			output_oracles: HashMap::new(),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+		settlement.recover_post_fill = true;
+		settlement.can_claim = true;
+		settlement.post_fill_tx = Some(sample_tx(10));
+		settlement.pre_claim_tx = Some(sample_tx(11));
+		settlement.claim_tx = Some(sample_tx(12));
+		let service = SettlementService::new(
+			HashMap::from([(
+				"bound".to_string(),
+				Box::new(settlement) as Box<dyn SettlementInterface>,
+			)]),
+			"bound".to_string(),
+			20,
+		);
+		let order = OrderBuilder::new()
+			.with_settlement_name(Some("bound"))
+			.with_fill_tx_hash(Some(TransactionHash(vec![0x11; 32])))
+			.with_expected_fill_tx_count(Some(2))
+			.build();
+		let fill_proof = sample_fill_proof();
+		let receipt = TransactionReceipt {
+			hash: TransactionHash(vec![0x44; 32]),
+			block_number: 123,
+			success: true,
+			logs: vec![],
+			block_timestamp: None,
+		};
+
+		assert_multi_fill_validation(service.recover_post_fill_state(&order).await);
+		assert_multi_fill_validation(
+			service
+				.get_attestation(&order, &TransactionHash(vec![0x11; 32]))
+				.await,
+		);
+		assert_multi_fill_validation(
+			service
+				.generate_post_fill_transaction(&order, &receipt)
+				.await,
+		);
+		assert_multi_fill_validation(
+			service
+				.generate_post_fill_execution_transaction(&order, &receipt)
+				.await,
+		);
+		assert_multi_fill_validation(
+			service
+				.generate_pre_claim_transaction(&order, &fill_proof)
+				.await,
+		);
+		assert_multi_fill_validation(
+			service
+				.generate_pre_claim_execution_transaction(&order, &fill_proof)
+				.await,
+		);
+		assert_multi_fill_validation(
+			service
+				.generate_claim_transaction(&order, &fill_proof)
+				.await,
+		);
+		assert_multi_fill_validation(
+			service
+				.generate_claim_execution_transaction(&order, &fill_proof)
+				.await,
+		);
+		assert!(!service.can_claim(&order, &fill_proof).await);
+		assert!(matches!(
+			service.readiness(&order, &fill_proof).await,
+			SettlementReadiness::PermanentFailure(message)
+				if message.contains("multi-fill settlement is not supported")
+		));
+	}
+
+	#[tokio::test]
+	async fn settlement_service_allows_hyperlane7683_multi_fill_plural_claim_path() {
+		let mut settlement = make_test_settlement(OracleConfig {
+			input_oracles: HashMap::new(),
+			output_oracles: HashMap::new(),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+		settlement.claim_tx = Some(sample_tx(12));
+		settlement.claim_execution_txs = Some(vec![
+			ExecutionTransaction::from(sample_tx(12)),
+			ExecutionTransaction::from(sample_tx(13)),
+		]);
+		let service = SettlementService::new(
+			HashMap::from([(
+				"bound".to_string(),
+				Box::new(settlement) as Box<dyn SettlementInterface>,
+			)]),
+			"bound".to_string(),
+			20,
+		);
+		let order = OrderBuilder::new()
+			.with_standard(HYPERLANE7683_STANDARD)
+			.with_settlement_name(Some("bound"))
+			.with_fill_tx_hashes(vec![
+				TransactionHash(vec![0x11; 32]),
+				TransactionHash(vec![0x22; 32]),
+			])
+			.with_expected_fill_tx_count(Some(2))
+			.build();
+		let fill_proof = sample_fill_proof();
+
+		assert_multi_fill_validation(
+			service
+				.generate_claim_execution_transaction(&order, &fill_proof)
+				.await,
+		);
+
+		let claim_txs = service
+			.generate_claim_execution_transactions(&order, &fill_proof)
+			.await
+			.unwrap();
+
+		assert_eq!(claim_txs.len(), 2);
+		assert_eq!(claim_txs[0].network_id(), 12);
+		assert_eq!(claim_txs[1].network_id(), 13);
+	}
+
 	// ── Fix 3 Part C: SettlementService::get_attestation guard ─────────────
 
 	fn make_order_with_input_oracle(input_oracle_hex: &str) -> Order {
@@ -1779,5 +2104,25 @@ mod tests {
 		let tx_hash = TransactionHash(vec![0u8; 32]);
 		let result = service.get_attestation(&order, &tx_hash).await;
 		assert!(result.is_ok(), "expected Ok; got {:?}", result.err());
+	}
+
+	#[tokio::test]
+	async fn test_get_attestation_skips_bound_oracle_guard_for_hyperlane7683() {
+		let attesting_proof = fill_proof_with_oracle("0x0000000000000000000000000000000000000000");
+		let service = make_service_with_mock(attesting_proof);
+		let order = OrderBuilder::new()
+			.with_standard(HYPERLANE7683_STANDARD)
+			.with_settlement_name(Some("bound"))
+			.with_data(serde_json::json!({}))
+			.build();
+
+		let tx_hash = TransactionHash(vec![0u8; 32]);
+		let result = service.get_attestation(&order, &tx_hash).await;
+
+		assert!(
+			result.is_ok(),
+			"Hyperlane7683 has no order-bound input oracle; got {:?}",
+			result.err()
+		);
 	}
 }

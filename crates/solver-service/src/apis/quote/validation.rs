@@ -13,15 +13,15 @@
 //! 4. **Token Support** - Confirms tokens are supported on their respective chains
 //! 5. **Balance Checks** - Ensures solver has sufficient liquidity
 
-use alloy_primitives::{Address as AlloyAddress, U256};
+use alloy_primitives::U256;
 use futures::future::try_join_all;
 use solver_core::SolverEngine;
 use solver_types::{
 	standards::eip7683::{
 		MAX_CALLBACK_DATA_BYTES, MAX_STANDARD_ORDER_INPUTS, MAX_STANDARD_ORDER_OUTPUTS,
 	},
-	AuthScheme, CostContext, GetQuoteRequest, IntentRequest, IntentType, InteropAddress,
-	NetworksConfig, QuoteError, SwapType, ValidatedQuoteContext,
+	Address as SolverAddress, AuthScheme, CostContext, GetQuoteRequest, IntentRequest, IntentType,
+	InteropAddress, NetworksConfig, QuoteError, SwapType, ValidatedQuoteContext,
 };
 use std::collections::HashSet;
 
@@ -371,12 +371,11 @@ impl QuoteValidator {
 	fn is_token_supported(
 		networks: &NetworksConfig,
 		chain_id: u64,
-		address: &AlloyAddress,
+		address: &SolverAddress,
 	) -> bool {
-		let solver_address: solver_types::Address = (*address).into();
 		networks
 			.get(&chain_id)
-			.is_some_and(|network| network.tokens.iter().any(|t| t.address == solver_address))
+			.is_some_and(|network| network.tokens.iter().any(|t| &t.address == address))
 	}
 
 	/// Validates an ERC-7930 interoperable address.
@@ -405,20 +404,20 @@ impl QuoteValidator {
 		})
 	}
 
-	/// Extracts chain ID and EVM address components from an InteropAddress.
-	///
-	/// Decomposes an ERC-7930 interoperable address into its constituent parts
-	/// for use in chain-specific operations.
-	///
-	/// # Returns
-	///
-	/// A tuple of (chain_id, evm_address) on success
-	fn extract_chain_and_address(addr: &InteropAddress) -> Result<(u64, AlloyAddress), QuoteError> {
+	fn extract_chain_and_raw_address(
+		addr: &InteropAddress,
+	) -> Result<(u64, SolverAddress), QuoteError> {
 		let chain_id = Self::chain_id_from_interop(addr)?;
-		let evm_addr = addr
-			.ethereum_address()
-			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid asset address: {e}")))?;
-		Ok((chain_id, evm_addr))
+		if !matches!(
+			addr.address.len(),
+			SolverAddress::EVM_LENGTH | SolverAddress::BYTES32_LENGTH
+		) {
+			return Err(QuoteError::InvalidRequest(format!(
+				"Invalid asset address length: expected 20 or 32 bytes, got {}",
+				addr.address.len()
+			)));
+		}
+		Ok((chain_id, SolverAddress(addr.address.clone())))
 	}
 
 	/// Validates and collects input assets using calculated swap amounts from cost context.
@@ -449,14 +448,14 @@ impl QuoteValidator {
 
 		for asset_info in &request.intent.inputs {
 			let asset_addr = &asset_info.asset;
-			let (chain_id, evm_addr) = Self::extract_chain_and_address(asset_addr)?;
+			let (chain_id, token_addr) = Self::extract_chain_and_raw_address(asset_addr)?;
 
 			// ALL assets must be supported for proper pricing
-			if !Self::is_token_supported(networks, chain_id, &evm_addr) {
+			if !Self::is_token_supported(networks, chain_id, &token_addr) {
 				return Err(QuoteError::UnsupportedAsset(format!(
 					"Input token not supported on chain {}: {}",
 					chain_id,
-					alloy_primitives::hex::encode(evm_addr.as_slice())
+					alloy_primitives::hex::encode(&token_addr.0)
 				)));
 			}
 
@@ -512,14 +511,14 @@ impl QuoteValidator {
 
 		for asset_info in &request.intent.outputs {
 			let asset_addr = &asset_info.asset;
-			let (chain_id, evm_addr) = Self::extract_chain_and_address(asset_addr)?;
+			let (chain_id, token_addr) = Self::extract_chain_and_raw_address(asset_addr)?;
 
 			// ALL assets must be supported for proper pricing
-			if !Self::is_token_supported(networks, chain_id, &evm_addr) {
+			if !Self::is_token_supported(networks, chain_id, &token_addr) {
 				return Err(QuoteError::UnsupportedAsset(format!(
 					"Output token not supported on chain {}: {}",
 					chain_id,
-					alloy_primitives::hex::encode(evm_addr.as_slice())
+					alloy_primitives::hex::encode(&token_addr.0)
 				)));
 			}
 
@@ -582,8 +581,7 @@ impl QuoteValidator {
 		let balance_checks = outputs.iter().map(|output| {
 			let output = output.clone();
 			async move {
-				let (chain_id, evm_addr) = Self::extract_chain_and_address(&output.asset)?;
-				let token_addr: solver_types::Address = evm_addr.into();
+				let (chain_id, token_addr) = Self::extract_chain_and_raw_address(&output.asset)?;
 
 				let balance_str = token_manager
 					.check_balance(chain_id, &token_addr)
@@ -618,7 +616,7 @@ impl QuoteValidator {
 				};
 
 				if balance < required_amount {
-					let token_hex = alloy_primitives::hex::encode(evm_addr.as_slice());
+					let token_hex = alloy_primitives::hex::encode(&token_addr.0);
 					tracing::error!(
 						chain_id = chain_id,
 						required = %required_amount,
@@ -632,7 +630,7 @@ impl QuoteValidator {
 						chain_id = chain_id,
 						required = %required_amount,
 						available = %balance,
-						token = %alloy_primitives::hex::encode(evm_addr.as_slice()),
+						token = %alloy_primitives::hex::encode(&token_addr.0),
 						"Sufficient destination balance"
 					);
 				}
@@ -885,6 +883,29 @@ mod tests {
 			),
 			intent: create_exact_input_request(Some("1000000000000000000"), None),
 			supported_types: vec!["oif-escrow-v0".to_string()],
+		}
+	}
+
+	fn raw_interop_address(chain_id: u64, address: Vec<u8>) -> InteropAddress {
+		let chain_reference = if chain_id <= 255 {
+			vec![chain_id as u8]
+		} else if chain_id <= 65535 {
+			vec![(chain_id >> 8) as u8, chain_id as u8]
+		} else {
+			let mut bytes = Vec::new();
+			let mut id = chain_id;
+			while id > 0 {
+				bytes.insert(0, (id & 0xff) as u8);
+				id >>= 8;
+			}
+			bytes
+		};
+
+		InteropAddress {
+			version: InteropAddress::CURRENT_VERSION,
+			chain_type: solver_types::standards::eip7930::caip_namespaces::EIP155,
+			chain_reference,
+			address,
 		}
 	}
 
@@ -1324,6 +1345,21 @@ mod tests {
 		);
 	}
 
+	#[tokio::test]
+	async fn test_validate_quote_request_accepts_bytes32_output_interop_addresses() {
+		let solver = create_mock_solver().await;
+		let mut request = create_valid_get_quote_request();
+		request.intent.outputs[0].receiver = raw_interop_address(137, vec![0x33; 32]);
+		request.intent.outputs[0].asset = raw_interop_address(137, vec![0x44; 32]);
+
+		let result = QuoteValidator::validate_quote_request(&request, &solver);
+
+		assert!(
+			result.is_ok(),
+			"Should accept bytes32 output interop addresses: {result:?}"
+		);
+	}
+
 	// ========== validate_supported_networks Tests ==========
 
 	/// Helper function to create a network config with specified settler addresses
@@ -1337,6 +1373,7 @@ mod tests {
 		NetworkConfig {
 			name: Some("test-network".to_string()),
 			network_type: solver_types::networks::NetworkType::New,
+			kind: Default::default(),
 			rpc_urls: vec![RpcEndpoint::http_only("https://test.rpc".to_string())],
 			input_settler_address: if input_settler_empty {
 				Address(vec![]) // Empty address (empty vector)
@@ -1741,7 +1778,7 @@ mod tests {
 
 	/// Creates a mock networks config with specific token support configuration
 	fn create_mock_solver_with_token_support(
-		supported_tokens: HashMap<u64, Vec<AlloyAddress>>,
+		supported_tokens: HashMap<u64, Vec<alloy_primitives::Address>>,
 	) -> NetworksConfig {
 		use solver_types::networks::{NetworkConfig, RpcEndpoint, TokenConfig};
 		use solver_types::Address;
@@ -1765,6 +1802,7 @@ mod tests {
 				NetworkConfig {
 					name: Some(format!("chain-{chain_id}")),
 					network_type: solver_types::networks::NetworkType::New,
+					kind: Default::default(),
 					rpc_urls: vec![RpcEndpoint::http_only("https://test.rpc".to_string())],
 					input_settler_address: Address(vec![1u8; 20]),
 					output_settler_address: Address(vec![2u8; 20]),
@@ -2118,6 +2156,60 @@ mod tests {
 		assert_eq!(supported_assets.len(), 1);
 		assert_eq!(supported_assets[0].asset, output_token);
 		assert_eq!(supported_assets[0].amount, U256::from(1000000u64)); // Amount from cost context
+	}
+
+	#[test]
+	fn test_validate_and_collect_outputs_with_costs_accepts_bytes32_supported_token() {
+		use solver_types::networks::{
+			NetworkConfig, NetworkKind, NetworkType, RpcEndpoint, TokenConfig,
+		};
+		use solver_types::Address;
+
+		let input_token =
+			InteropAddress::new_ethereum(1, address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"));
+		let output_token = raw_interop_address(137, vec![0x44; 32]);
+		let networks = HashMap::from([(
+			137u64,
+			NetworkConfig {
+				name: Some("starknet-test".to_string()),
+				network_type: NetworkType::New,
+				kind: NetworkKind::Starknet,
+				rpc_urls: vec![RpcEndpoint::http_only("https://test.rpc".to_string())],
+				input_settler_address: Address(vec![1u8; 32]),
+				output_settler_address: Address(vec![2u8; 32]),
+				tokens: vec![TokenConfig {
+					address: Address(vec![0x44; 32]),
+					symbol: "STRK".to_string(),
+					name: None,
+					decimals: 18,
+				}],
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		)]);
+		let request = create_simple_test_quote_request(
+			input_token,
+			Some("1000000"),
+			output_token.clone(),
+			Some("950000"),
+			SwapType::ExactOutput,
+		);
+		let mut swap_amounts = HashMap::new();
+		swap_amounts.insert(output_token.clone(), (U256::from(1000000u64), 18));
+		let cost_context =
+			create_mock_cost_context(swap_amounts, HashMap::new(), SwapType::ExactOutput);
+
+		let supported_assets = QuoteValidator::validate_and_collect_outputs_with_costs(
+			&request,
+			&networks,
+			&cost_context,
+		)
+		.unwrap();
+
+		assert_eq!(supported_assets.len(), 1);
+		assert_eq!(supported_assets[0].asset, output_token);
+		assert_eq!(supported_assets[0].amount, U256::from(1000000u64));
 	}
 
 	#[test]

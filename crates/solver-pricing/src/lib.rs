@@ -77,6 +77,7 @@ pub const DEFAULT_TOKEN_MAPPINGS: &[(&str, &str)] = &[
 	("MATIC", "matic-network"),
 	("ARB", "arbitrum"),
 	("OP", "optimism"),
+	("STRK", "starknet"),
 ];
 
 /// Get all registered pricing implementations.
@@ -360,6 +361,7 @@ mod tests {
 		assert!(DEFAULT_TOKEN_MAPPINGS.contains(&("ETH", "ethereum")));
 		assert!(DEFAULT_TOKEN_MAPPINGS.contains(&("BTC", "bitcoin")));
 		assert!(DEFAULT_TOKEN_MAPPINGS.contains(&("USDC", "usd-coin")));
+		assert!(DEFAULT_TOKEN_MAPPINGS.contains(&("STRK", "starknet")));
 	}
 
 	// Tests for PricingService using mock implementation
@@ -497,6 +499,15 @@ mod tests {
 			// Mock returns 3000 for ETH/USD
 			let value: f64 = result.unwrap().parse().unwrap();
 			assert!(value > 0.0);
+		}
+
+		#[tokio::test]
+		async fn test_pricing_service_convert_strk_to_usd() {
+			let primary = create_test_pricing();
+			let service = PricingService::new(primary, Vec::new());
+			let result = service.convert_asset("STRK", "USD", "2.0").await;
+			assert!(result.is_ok());
+			assert_eq!(result.unwrap(), "1");
 		}
 
 		// Fallback tests

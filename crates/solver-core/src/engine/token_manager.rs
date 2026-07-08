@@ -954,6 +954,7 @@ mod tests {
 			solver_types::NetworkConfig {
 				name: None,
 				network_type: solver_types::NetworkType::New,
+				kind: Default::default(),
 				rpc_urls: vec![],
 				input_settler_address: parse_address("0x1111111111111111111111111111111111111111")
 					.unwrap(),
@@ -970,6 +971,7 @@ mod tests {
 			solver_types::NetworkConfig {
 				name: None,
 				network_type: solver_types::NetworkType::New,
+				kind: Default::default(),
 				rpc_urls: vec![],
 				input_settler_address: parse_address("0x3333333333333333333333333333333333333333")
 					.unwrap(),

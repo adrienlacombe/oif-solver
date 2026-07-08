@@ -1,0 +1,32 @@
+aws_region  = "us-east-1"
+project     = "oif-solver"
+environment = "dev"
+
+# Must match the solver_id in the bootstrap config JSON used by the seed task.
+solver_id = "oif-solver-dev"
+
+# First apply: keep at 0, push the image, fill secrets, run the seed task.
+# Second apply: set to 1 or more.
+service_desired_count = 0
+
+# Build and push this tag into the ECR repository created by Terraform.
+image_tag = "latest"
+
+# KMS signer deployments should build the image with Docker build arg FEATURES=kms
+# and include the signing key ARN here.
+kms_key_arns = [
+  # "arn:aws:kms:us-east-1:123456789012:key/00000000-0000-0000-0000-000000000000"
+]
+
+# If admin or orders auth is enabled in bootstrap config, create/fill JWT_SECRET.
+create_jwt_secret = true
+
+# For local-wallet deployments only. Prefer KMS for production.
+create_solver_private_key_secret = false
+
+# Use HTTPS if you already have an ACM cert in this region.
+acm_certificate_arn = null
+
+tags = {
+  Owner = "solver-team"
+}

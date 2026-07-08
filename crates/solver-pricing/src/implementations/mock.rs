@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use solver_types::utils::wei_string_to_eth_string;
 use solver_types::{
 	ConfigSchema, ImplementationRegistry, PricingError, TradingPair, ValidationError,
-	MOCK_ETH_SOL_PRICE, MOCK_ETH_USD_PRICE, MOCK_SOL_USD_PRICE, MOCK_TOKA_USD_PRICE,
-	MOCK_TOKB_USD_PRICE,
+	MOCK_ETH_SOL_PRICE, MOCK_ETH_USD_PRICE, MOCK_SOL_USD_PRICE, MOCK_STRK_USD_PRICE,
+	MOCK_TOKA_USD_PRICE, MOCK_TOKB_USD_PRICE,
 };
 use std::collections::HashMap;
 
@@ -28,6 +28,7 @@ impl MockPricing {
 		// Default prices
 		pair_prices.insert("ETH/USD".to_string(), MOCK_ETH_USD_PRICE.to_string());
 		pair_prices.insert("SOL/USD".to_string(), MOCK_SOL_USD_PRICE.to_string());
+		pair_prices.insert("STRK/USD".to_string(), MOCK_STRK_USD_PRICE.to_string());
 		pair_prices.insert("ETH/SOL".to_string(), MOCK_ETH_SOL_PRICE.to_string()); // ETH price / SOL price
 
 		// Demo token prices

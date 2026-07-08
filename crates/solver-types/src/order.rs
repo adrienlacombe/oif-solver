@@ -16,7 +16,7 @@ use crate::{
 };
 
 #[cfg(feature = "oif-interfaces")]
-use crate::Eip7683OrderData;
+use crate::{Eip7683OrderData, Hyperlane7683ResolvedOrder, HYPERLANE7683_STANDARD};
 
 /// Information about a chain and its associated settler contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,6 +232,18 @@ pub struct Order {
 	/// Transaction hash of the fill transaction.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub fill_tx_hash: Option<TransactionHash>,
+	/// Transaction hashes for all fill transactions.
+	///
+	/// `fill_tx_hash` remains the primary/legacy hash for existing consumers.
+	/// Multi-leg standards append every fill hash here.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub fill_tx_hashes: Vec<TransactionHash>,
+	/// Number of fill transactions expected for this order.
+	///
+	/// This is written before fill submission for multi-leg standards so fast
+	/// confirmations cannot advance the order before every leg has landed.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub expected_fill_tx_count: Option<usize>,
 	/// Transaction hash of the post-fill transaction (if applicable).
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub post_fill_tx_hash: Option<TransactionHash>,
@@ -241,6 +253,18 @@ pub struct Order {
 	/// Transaction hash of the claim transaction.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub claim_tx_hash: Option<TransactionHash>,
+	/// Transaction hashes for all claim transactions.
+	///
+	/// `claim_tx_hash` remains the primary/legacy hash for existing consumers.
+	/// Multi-leg settlement standards append every claim hash here.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub claim_tx_hashes: Vec<TransactionHash>,
+	/// Number of claim transactions expected for this order.
+	///
+	/// This mirrors `expected_fill_tx_count` for standards that settle one
+	/// destination leg at a time.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub expected_claim_tx_count: Option<usize>,
 	/// Fill proof data when available.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub fill_proof: Option<FillProof>,
@@ -252,6 +276,60 @@ pub struct Order {
 }
 
 impl Order {
+	/// Returns every known fill transaction hash, falling back to the legacy
+	/// single hash for orders stored before `fill_tx_hashes` existed.
+	pub fn fill_transaction_hashes(&self) -> Vec<TransactionHash> {
+		if self.fill_tx_hashes.is_empty() {
+			self.fill_tx_hash.iter().cloned().collect()
+		} else {
+			self.fill_tx_hashes.clone()
+		}
+	}
+
+	/// Returns the expected number of fill transactions, defaulting to the
+	/// hashes already known for legacy single-fill orders.
+	pub fn expected_fill_transaction_count(&self) -> usize {
+		self.expected_fill_tx_count
+			.unwrap_or_else(|| self.fill_transaction_hashes().len().max(1))
+	}
+
+	/// Records a fill transaction hash without losing the legacy primary hash.
+	pub fn add_fill_transaction_hash(&mut self, tx_hash: TransactionHash) {
+		if self.fill_tx_hash.is_none() {
+			self.fill_tx_hash = Some(tx_hash.clone());
+		}
+		if !self.fill_tx_hashes.contains(&tx_hash) {
+			self.fill_tx_hashes.push(tx_hash);
+		}
+	}
+
+	/// Returns every known claim transaction hash, falling back to the legacy
+	/// single hash for orders stored before `claim_tx_hashes` existed.
+	pub fn claim_transaction_hashes(&self) -> Vec<TransactionHash> {
+		if self.claim_tx_hashes.is_empty() {
+			self.claim_tx_hash.iter().cloned().collect()
+		} else {
+			self.claim_tx_hashes.clone()
+		}
+	}
+
+	/// Returns the expected number of claim transactions, defaulting to the
+	/// hashes already known for legacy single-claim orders.
+	pub fn expected_claim_transaction_count(&self) -> usize {
+		self.expected_claim_tx_count
+			.unwrap_or_else(|| self.claim_transaction_hashes().len().max(1))
+	}
+
+	/// Records a claim transaction hash without losing the legacy primary hash.
+	pub fn add_claim_transaction_hash(&mut self, tx_hash: TransactionHash) {
+		if self.claim_tx_hash.is_none() {
+			self.claim_tx_hash = Some(tx_hash.clone());
+		}
+		if !self.claim_tx_hashes.contains(&tx_hash) {
+			self.claim_tx_hashes.push(tx_hash);
+		}
+	}
+
 	/// Parse the order data based on its standard
 	#[cfg(feature = "oif-interfaces")]
 	pub fn parse_order_data(&self) -> Result<Box<dyn OrderParsable>, Box<dyn std::error::Error>> {
@@ -259,6 +337,13 @@ impl Order {
 			"eip7683" => {
 				let order_data: Eip7683OrderData = serde_json::from_value(self.data.clone())
 					.map_err(|e| format!("Failed to parse EIP-7683 order data: {e}"))?;
+				Ok(Box::new(order_data))
+			},
+			HYPERLANE7683_STANDARD => {
+				let order_data: Hyperlane7683ResolvedOrder =
+					serde_json::from_value(self.data.clone()).map_err(|e| {
+						format!("Failed to parse Hyperlane7683 resolved order data: {e}")
+					})?;
 				Ok(Box::new(order_data))
 			},
 			_ => Err(format!("Unsupported order standard: {}", self.standard).into()),
@@ -490,5 +575,150 @@ impl fmt::Debug for OrderStatus {
 			OrderStatus::Finalized => write!(f, "Finalized"),
 			OrderStatus::Failed(tx_type, _) => write!(f, "Failed({tx_type:?})"),
 		}
+	}
+}
+
+#[cfg(all(test, feature = "oif-interfaces"))]
+mod tests {
+	use super::*;
+	use crate::{Hyperlane7683FillInstruction, Hyperlane7683Output};
+	use alloy_primitives::U256;
+
+	#[test]
+	fn fill_transaction_hashes_falls_back_and_deduplicates() {
+		let first = TransactionHash(vec![0x11; 32]);
+		let second = TransactionHash(vec![0x22; 32]);
+		let mut order = Order {
+			id: "order-1".to_string(),
+			standard: "eip7683".to_string(),
+			created_at: 1,
+			updated_at: 1,
+			status: OrderStatus::Created,
+			data: serde_json::Value::Null,
+			solver_address: Address(vec![0xab; 20]),
+			quote_id: None,
+			input_chains: vec![],
+			output_chains: vec![],
+			execution_params: None,
+			prepare_tx_hash: None,
+			fill_tx_hash: Some(first.clone()),
+			fill_tx_hashes: Vec::new(),
+			expected_fill_tx_count: None,
+			post_fill_tx_hash: None,
+			pre_claim_tx_hash: None,
+			claim_tx_hash: None,
+			claim_tx_hashes: Vec::new(),
+			expected_claim_tx_count: None,
+			fill_proof: None,
+			settlement_name: None,
+		};
+
+		assert_eq!(order.fill_transaction_hashes(), vec![first.clone()]);
+
+		order.add_fill_transaction_hash(first.clone());
+		order.add_fill_transaction_hash(second.clone());
+		order.add_fill_transaction_hash(second.clone());
+
+		assert_eq!(order.fill_tx_hash, Some(first.clone()));
+		assert_eq!(order.fill_transaction_hashes(), vec![first, second]);
+	}
+
+	#[test]
+	fn claim_transaction_hashes_falls_back_and_deduplicates() {
+		let first = TransactionHash(vec![0x11; 32]);
+		let second = TransactionHash(vec![0x22; 32]);
+		let mut order = Order {
+			id: "order-1".to_string(),
+			standard: "eip7683".to_string(),
+			created_at: 1,
+			updated_at: 1,
+			status: OrderStatus::Created,
+			data: serde_json::Value::Null,
+			solver_address: Address(vec![0xab; 20]),
+			quote_id: None,
+			input_chains: vec![],
+			output_chains: vec![],
+			execution_params: None,
+			prepare_tx_hash: None,
+			fill_tx_hash: None,
+			fill_tx_hashes: Vec::new(),
+			expected_fill_tx_count: None,
+			post_fill_tx_hash: None,
+			pre_claim_tx_hash: None,
+			claim_tx_hash: Some(first.clone()),
+			claim_tx_hashes: Vec::new(),
+			expected_claim_tx_count: None,
+			fill_proof: None,
+			settlement_name: None,
+		};
+
+		assert_eq!(order.claim_transaction_hashes(), vec![first.clone()]);
+
+		order.add_claim_transaction_hash(first.clone());
+		order.add_claim_transaction_hash(second.clone());
+		order.add_claim_transaction_hash(second.clone());
+
+		assert_eq!(order.claim_tx_hash, Some(first.clone()));
+		assert_eq!(order.claim_transaction_hashes(), vec![first, second]);
+	}
+
+	#[test]
+	fn parse_order_data_supports_hyperlane7683() {
+		let resolved_order = Hyperlane7683ResolvedOrder {
+			user: [0x11; 32],
+			origin_chain_id: U256::from(700001),
+			open_deadline: 1,
+			fill_deadline: 2,
+			order_id: [0x22; 32],
+			max_spent: vec![Hyperlane7683Output {
+				token: [0x33; 32],
+				amount: U256::from(1000),
+				recipient: [0x44; 32],
+				chain_id: U256::from(700002),
+			}],
+			min_received: vec![Hyperlane7683Output {
+				token: [0x55; 32],
+				amount: U256::from(900),
+				recipient: [0x66; 32],
+				chain_id: U256::from(700003),
+			}],
+			fill_instructions: vec![Hyperlane7683FillInstruction {
+				destination_chain_id: U256::from(700004),
+				destination_settler: [0x77; 32],
+				origin_data: vec![],
+			}],
+		};
+		let order = Order {
+			id: "order-1".to_string(),
+			standard: HYPERLANE7683_STANDARD.to_string(),
+			created_at: 1,
+			updated_at: 1,
+			status: OrderStatus::Created,
+			data: serde_json::to_value(resolved_order).unwrap(),
+			solver_address: Address(vec![0xab; 20]),
+			quote_id: None,
+			input_chains: vec![],
+			output_chains: vec![],
+			execution_params: None,
+			prepare_tx_hash: None,
+			fill_tx_hash: None,
+			fill_tx_hashes: Vec::new(),
+			expected_fill_tx_count: None,
+			post_fill_tx_hash: None,
+			pre_claim_tx_hash: None,
+			claim_tx_hash: None,
+			claim_tx_hashes: Vec::new(),
+			expected_claim_tx_count: None,
+			fill_proof: None,
+			settlement_name: None,
+		};
+
+		let parsed = order
+			.parse_order_data()
+			.expect("Hyperlane7683 order data should parse");
+
+		assert_eq!(parsed.origin_chain_id(), 700001);
+		assert_eq!(parsed.destination_chain_ids(), vec![700002, 700004]);
+		assert_eq!(parsed.fill_deadline_secs(), Some(2));
 	}
 }

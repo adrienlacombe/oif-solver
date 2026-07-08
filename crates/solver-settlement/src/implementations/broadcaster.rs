@@ -1747,6 +1747,7 @@ pub fn create_settlement(
 	config: &serde_json::Value,
 	networks: &NetworksConfig,
 	storage: Arc<StorageService>,
+	_solver_identities: &solver_types::SolverIdentityAddresses,
 ) -> Result<Box<dyn SettlementInterface>, SettlementError> {
 	BroadcasterSettlementSchema::validate_config(config)
 		.map_err(|e| SettlementError::ValidationFailed(format!("Invalid configuration: {e}")))?;
@@ -2046,6 +2047,7 @@ mod tests {
 					NetworkConfig {
 						name: Some(format!("chain-{chain_id}")),
 						network_type: NetworkType::New,
+						kind: Default::default(),
 						rpc_urls: vec![RpcEndpoint::http_only(url.to_string())],
 						input_settler_address: solver_types::Address(vec![0x11; 20]),
 						output_settler_address: solver_types::Address(vec![0x22; 20]),
@@ -2166,7 +2168,11 @@ mod tests {
 			execution_params: None,
 			prepare_tx_hash: None,
 			fill_tx_hash: None,
+			fill_tx_hashes: Vec::new(),
+			expected_fill_tx_count: None,
 			claim_tx_hash: None,
+			claim_tx_hashes: Vec::new(),
+			expected_claim_tx_count: None,
 			post_fill_tx_hash: None,
 			pre_claim_tx_hash: None,
 			fill_proof: None,

@@ -71,7 +71,7 @@ pub use events::*;
 pub use finality::{
 	select_finality_head, select_source_finality_head, SourceFinalityMode, SourceFinalityRule,
 };
-pub use networks::{NetworkConfig, NetworkType, NetworksConfig, TokenConfig};
+pub use networks::{NetworkConfig, NetworkKind, NetworkType, NetworksConfig, TokenConfig};
 pub use operator_config::{
 	OperatorAccountConfig, OperatorAdminConfig, OperatorBroadcasterConfig, OperatorConfig,
 	OperatorDirectConfig, OperatorGasConfig, OperatorGasFlowUnits, OperatorHyperlaneConfig,
@@ -99,16 +99,30 @@ pub use seed_overrides::{
 pub use standards::{
 	eip7683::{Eip7683OrderData, MandateOutput as Eip7683Output},
 	eip7930::{InteropAddress, InteropAddressError},
+	hyperlane7683::{
+		Hyperlane7683Error, Hyperlane7683FillInstruction, Hyperlane7683OrderStatus,
+		Hyperlane7683Output, Hyperlane7683ResolvedOrder, HYPERLANE7683_OPEN_TOPIC0,
+		HYPERLANE7683_STANDARD, STARKNET_HYPERLANE7683_OPEN_SELECTOR,
+	},
 };
 pub use storage::*;
 pub use transaction_attempt::{
 	TransactionAttempt, TransactionAttemptScope, TransactionAttemptStatus,
 };
 pub use utils::{
-	bytes32_to_address, current_timestamp, format_token_amount, normalize_bytes32_address,
-	order_id_to_bytes32, parse_address, truncate_id, wei_string_to_eth_string, with_0x_prefix,
-	without_0x_prefix, DEFAULT_GAS_PRICE_WEI, MOCK_ETH_SOL_PRICE, MOCK_ETH_USD_PRICE,
-	MOCK_SOL_USD_PRICE, MOCK_TOKA_USD_PRICE, MOCK_TOKB_USD_PRICE,
+	append_cairo_u128_bytes_calldata, build_hyperlane7683_starknet_fill_calldata,
+	build_hyperlane7683_starknet_settle_calldata, bytes32_to_address, current_timestamp,
+	format_token_amount, normalize_bytes32_address, normalize_starknet_chain_id,
+	order_id_to_bytes32, parse_address, parse_starknet_address, parse_starknet_felt,
+	solidity_order_id_to_starknet_u256, starknet_origin_evm_settlement_enabled,
+	starknet_origin_evm_settlement_enabled_for, starknet_selector, truncate_id,
+	u256_to_starknet_felts, wei_string_to_eth_string, with_0x_prefix, without_0x_prefix,
+	StarknetConversionError, StarknetU256Felts, DEFAULT_GAS_PRICE_WEI, IS_DEVNET_ENV,
+	MAINNET_PRODUCTION_ENV, MAINNET_PROOF_ENV, MOCK_ETH_SOL_PRICE, MOCK_ETH_USD_PRICE,
+	MOCK_SOL_USD_PRICE, MOCK_STRK_USD_PRICE, MOCK_TOKA_USD_PRICE, MOCK_TOKB_USD_PRICE,
+	NETWORK_PROFILE_ENV, STARKNET_FELT_BYTES, STARKNET_MAINNET_CHAIN_ID,
+	STARKNET_MAINNET_CHAIN_ID_HEX, STARKNET_ORIGIN_EVM_SETTLE_ENV, STARKNET_SEPOLIA_CHAIN_ID,
+	STARKNET_SEPOLIA_CHAIN_ID_HEX, STARKNET_U128_WORD_BYTES, STARKNET_U256_LIMB_BITS,
 };
 pub use validation::*;
 pub use versioned::Versioned;

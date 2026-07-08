@@ -58,6 +58,8 @@ pub enum InteropAddressError {
 	InvalidChainReferenceLength { expected: u8, actual: usize },
 	#[error("Invalid address length: expected {expected}, got {actual}")]
 	InvalidAddressLength { expected: u8, actual: usize },
+	#[error("Invalid address length: expected 20 or 32, got {actual}")]
+	InvalidSolverAddressLength { actual: usize },
 	#[error("Unsupported chain type: {0:?}")]
 	UnsupportedChainType([u8; 2]),
 }
@@ -68,6 +70,8 @@ impl InteropAddress {
 
 	/// Standard Ethereum address length
 	pub const ETH_ADDRESS_LENGTH: u8 = 20;
+	/// Bytes32 address length used by cross-chain protocols and Starknet felts.
+	pub const BYTES32_ADDRESS_LENGTH: u8 = 32;
 
 	/// Create a new ERC-7930 interoperable address for Ethereum
 	pub fn new_ethereum(chain_id: u64, address: Address) -> Self {
@@ -227,12 +231,17 @@ impl InteropAddress {
 			return Err(InteropAddressError::UnsupportedVersion(self.version));
 		}
 
-		// For Ethereum addresses, validate standard length
-		if self.is_ethereum() && self.address.len() != Self::ETH_ADDRESS_LENGTH as usize {
-			return Err(InteropAddressError::InvalidAddressLength {
-				expected: Self::ETH_ADDRESS_LENGTH,
-				actual: self.address.len(),
-			});
+		// EIP-155 is used for EVM chains with 20-byte addresses and by the
+		// Hyperlane7683/Starknet path as a domain envelope carrying bytes32
+		// contract/token identifiers. Keep `ethereum_address()` strict; this
+		// format-level validation only checks sizes accepted by the solver.
+		if self.is_ethereum() {
+			let len = self.address.len();
+			if len != Self::ETH_ADDRESS_LENGTH as usize
+				&& len != Self::BYTES32_ADDRESS_LENGTH as usize
+			{
+				return Err(InteropAddressError::InvalidSolverAddressLength { actual: len });
+			}
 		}
 
 		Ok(())
@@ -299,8 +308,26 @@ pub mod utils {
 /// Convenient conversion from (chain_id, custom_address) tuple to InteropAddress
 impl From<(u64, crate::Address)> for InteropAddress {
 	fn from((chain_id, custom_address): (u64, crate::Address)) -> Self {
-		let alloy_address = Address::from_slice(&custom_address.0);
-		InteropAddress::new_ethereum(chain_id, alloy_address)
+		let chain_reference = if chain_id <= 255 {
+			vec![chain_id as u8]
+		} else if chain_id <= 65535 {
+			vec![(chain_id >> 8) as u8, chain_id as u8]
+		} else {
+			let mut bytes = Vec::new();
+			let mut id = chain_id;
+			while id > 0 {
+				bytes.insert(0, (id & 0xFF) as u8);
+				id >>= 8;
+			}
+			bytes
+		};
+
+		InteropAddress {
+			version: InteropAddress::CURRENT_VERSION,
+			chain_type: caip_namespaces::EIP155,
+			chain_reference,
+			address: custom_address.0,
+		}
 	}
 }
 
@@ -367,6 +394,35 @@ mod tests {
 		let eth_address = address!("D8dA6BF26964aF9D7eEd9e03E53415D37aA96045");
 		let interop_addr = InteropAddress::new_ethereum(1, eth_address);
 
+		assert!(interop_addr.validate().is_ok());
+	}
+
+	#[test]
+	fn test_validation_accepts_bytes32_solver_payload() {
+		let interop_addr = InteropAddress {
+			version: InteropAddress::CURRENT_VERSION,
+			chain_type: caip_namespaces::EIP155,
+			chain_reference: vec![137],
+			address: vec![0x22; 32],
+		};
+
+		assert!(interop_addr.validate().is_ok());
+		assert_eq!(interop_addr.ethereum_chain_id().unwrap(), 137);
+		assert!(matches!(
+			interop_addr.ethereum_address(),
+			Err(InteropAddressError::InvalidAddressLength { .. })
+		));
+	}
+
+	#[test]
+	fn tuple_conversion_preserves_bytes32_solver_payload() {
+		let address = crate::Address(vec![0x22; 32]);
+		let interop_addr = InteropAddress::from((137, address.clone()));
+
+		assert_eq!(interop_addr.version, InteropAddress::CURRENT_VERSION);
+		assert_eq!(interop_addr.chain_type, caip_namespaces::EIP155);
+		assert_eq!(interop_addr.chain_reference, vec![137]);
+		assert_eq!(interop_addr.address, address.0);
 		assert!(interop_addr.validate().is_ok());
 	}
 

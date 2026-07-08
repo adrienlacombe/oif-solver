@@ -62,6 +62,21 @@ pub enum NetworkType {
 	New,
 }
 
+/// Execution environment for a configured network.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkKind {
+	#[default]
+	Evm,
+	Starknet,
+}
+
+impl NetworkKind {
+	pub fn is_evm(&self) -> bool {
+		matches!(self, Self::Evm)
+	}
+}
+
 /// Configuration for a token on a specific network.
 ///
 /// Defines the essential properties of a token that the solver needs
@@ -100,6 +115,9 @@ pub struct NetworkConfig {
 	/// Network role classification.
 	#[serde(default, rename = "type")]
 	pub network_type: NetworkType,
+	/// Blockchain execution environment for this network.
+	#[serde(default, skip_serializing_if = "NetworkKind::is_evm")]
+	pub kind: NetworkKind,
 	pub rpc_urls: Vec<RpcEndpoint>,
 	pub input_settler_address: Address,
 	pub output_settler_address: Address,
@@ -253,6 +271,19 @@ mod tests {
 		let json = serde_json::to_string(&ws_only).unwrap();
 		assert!(!json.contains("\"http\""));
 		assert!(json.contains("\"ws\""));
+	}
+
+	#[test]
+	fn test_network_kind_serialization() {
+		assert_eq!(serde_json::to_string(&NetworkKind::Evm).unwrap(), "\"evm\"");
+		assert_eq!(
+			serde_json::to_string(&NetworkKind::Starknet).unwrap(),
+			"\"starknet\""
+		);
+		assert_eq!(
+			serde_json::from_str::<NetworkKind>("\"starknet\"").unwrap(),
+			NetworkKind::Starknet
+		);
 	}
 
 	#[test]

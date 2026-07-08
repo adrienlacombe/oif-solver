@@ -367,6 +367,7 @@ pub fn create_settlement(
 	config: &serde_json::Value,
 	networks: &NetworksConfig,
 	_storage: std::sync::Arc<solver_storage::StorageService>,
+	_solver_identities: &solver_types::SolverIdentityAddresses,
 ) -> Result<Box<dyn SettlementInterface>, SettlementError> {
 	// Validate configuration first
 	DirectSettlementSchema::validate_config(config)
@@ -676,7 +677,12 @@ mod tests {
 
 		let networks = create_test_networks();
 		let storage = create_mock_storage();
-		let result = create_settlement(&config, &networks, storage);
+		let result = create_settlement(
+			&config,
+			&networks,
+			storage,
+			&solver_types::SolverIdentityAddresses::default(),
+		);
 		assert!(result.is_ok());
 	}
 
@@ -694,7 +700,12 @@ mod tests {
 
 		let networks = create_test_networks();
 		let storage = create_mock_storage();
-		let result = create_settlement(&config, &networks, storage);
+		let result = create_settlement(
+			&config,
+			&networks,
+			storage,
+			&solver_types::SolverIdentityAddresses::default(),
+		);
 		assert!(matches!(result, Err(SettlementError::ValidationFailed(_))));
 	}
 
@@ -830,7 +841,12 @@ mod tests {
 
 		let networks = create_test_networks();
 		let storage = create_mock_storage();
-		let result = factory(&config, &networks, storage);
+		let result = factory(
+			&config,
+			&networks,
+			storage,
+			&solver_types::SolverIdentityAddresses::default(),
+		);
 		assert!(result.is_ok());
 	}
 

@@ -1802,6 +1802,7 @@ mod tests {
 					mailboxes: HashMap::new(),
 					igp_addresses: HashMap::new(),
 					domains: HashMap::new(),
+					starknet_fee_token_addresses: HashMap::new(),
 					oracles: OperatorOracleConfig {
 						input: HashMap::new(),
 						output: HashMap::new(),
@@ -2057,6 +2058,7 @@ mod tests {
 				chain_id: 1,
 				name: "chain-1".to_string(),
 				network_type: NetworkType::Parent,
+				kind: Default::default(),
 				tokens: vec![],
 				rpc_urls: vec![OperatorRpcEndpoint {
 					http: "http://localhost:8545".to_string(),
@@ -2075,6 +2077,7 @@ mod tests {
 				chain_id: 137,
 				name: "chain-137".to_string(),
 				network_type: NetworkType::Hub,
+				kind: Default::default(),
 				tokens: vec![],
 				rpc_urls: vec![OperatorRpcEndpoint {
 					http: "http://localhost:8546".to_string(),
@@ -2151,6 +2154,7 @@ mod tests {
 				chain_id: 1,
 				name: "chain-1".to_string(),
 				network_type: NetworkType::Parent,
+				kind: Default::default(),
 				tokens: vec![],
 				rpc_urls: vec![OperatorRpcEndpoint {
 					http: "http://localhost:8545".to_string(),
@@ -2169,6 +2173,7 @@ mod tests {
 				chain_id: 137,
 				name: "chain-137".to_string(),
 				network_type: NetworkType::Hub,
+				kind: Default::default(),
 				tokens: vec![],
 				rpc_urls: vec![OperatorRpcEndpoint {
 					http: "http://localhost:8546".to_string(),
@@ -2257,6 +2262,7 @@ mod tests {
 				chain_id: 1,
 				name: "chain-1".to_string(),
 				network_type: NetworkType::Parent,
+				kind: Default::default(),
 				tokens: vec![],
 				rpc_urls: vec![OperatorRpcEndpoint {
 					http: "http://localhost:8545".to_string(),
@@ -2275,6 +2281,7 @@ mod tests {
 				chain_id: 137,
 				name: "chain-137".to_string(),
 				network_type: NetworkType::Hub,
+				kind: Default::default(),
 				tokens: vec![],
 				rpc_urls: vec![OperatorRpcEndpoint {
 					http: "http://localhost:8546".to_string(),
@@ -2365,6 +2372,7 @@ mod tests {
 				chain_id: 1,
 				name: "chain-1".to_string(),
 				network_type: NetworkType::Parent,
+				kind: Default::default(),
 				tokens: vec![],
 				rpc_urls: vec![OperatorRpcEndpoint {
 					http: "http://localhost:8545".to_string(),
@@ -2383,6 +2391,7 @@ mod tests {
 				chain_id: 137,
 				name: "chain-137".to_string(),
 				network_type: NetworkType::Hub,
+				kind: Default::default(),
 				tokens: vec![],
 				rpc_urls: vec![OperatorRpcEndpoint {
 					http: "http://localhost:8546".to_string(),
@@ -2472,6 +2481,7 @@ mod tests {
 				chain_id: 1,
 				name: "chain-1".to_string(),
 				network_type: NetworkType::Parent,
+				kind: Default::default(),
 				tokens: vec![],
 				rpc_urls: vec![OperatorRpcEndpoint {
 					http: "http://localhost:8545".to_string(),
@@ -2529,6 +2539,7 @@ mod tests {
 				chain_id: 1,
 				name: "chain-1".to_string(),
 				network_type: NetworkType::Parent,
+				kind: Default::default(),
 				tokens: vec![],
 				rpc_urls: vec![OperatorRpcEndpoint {
 					http: "http://localhost:8545".to_string(),
@@ -2600,6 +2611,7 @@ mod tests {
 				chain_id: 1,
 				name: "chain-1".to_string(),
 				network_type: NetworkType::Parent,
+				kind: Default::default(),
 				tokens: vec![],
 				rpc_urls: vec![OperatorRpcEndpoint {
 					http: "http://localhost:8545".to_string(),
@@ -2867,6 +2879,7 @@ mod tests {
 				chain_id: 1,
 				name: "chain-1".to_string(),
 				network_type: NetworkType::Parent,
+				kind: Default::default(),
 				tokens: vec![],
 				rpc_urls: vec![OperatorRpcEndpoint {
 					http: "http://localhost:8545".to_string(),
@@ -2885,6 +2898,7 @@ mod tests {
 				chain_id: 137,
 				name: "chain-137".to_string(),
 				network_type: NetworkType::Hub,
+				kind: Default::default(),
 				tokens: vec![],
 				rpc_urls: vec![OperatorRpcEndpoint {
 					http: "http://localhost:8546".to_string(),
@@ -3018,6 +3032,7 @@ mod tests {
 				chain_id: 1,
 				name: "chain-1".to_string(),
 				network_type: NetworkType::Parent,
+				kind: Default::default(),
 				tokens: vec![],
 				rpc_urls: vec![OperatorRpcEndpoint {
 					http: "http://localhost:8545".to_string(),
@@ -3036,6 +3051,7 @@ mod tests {
 				chain_id: 137,
 				name: "chain-137".to_string(),
 				network_type: NetworkType::Hub,
+				kind: Default::default(),
 				tokens: vec![],
 				rpc_urls: vec![OperatorRpcEndpoint {
 					http: "http://localhost:8546".to_string(),
@@ -3319,6 +3335,7 @@ mod tests {
 			RuntimeNetworkConfig {
 				name: Some("chain-1".to_string()),
 				network_type: solver_types::NetworkType::Parent,
+				kind: Default::default(),
 				rpc_urls: vec![RpcEndpoint {
 					http: Some("http://localhost:8545".to_string()),
 					ws: None,
@@ -3530,6 +3547,7 @@ mod tests {
 			RuntimeNetworkConfig {
 				name: Some("chain-1".to_string()),
 				network_type: solver_types::NetworkType::Parent,
+				kind: Default::default(),
 				rpc_urls: vec![RpcEndpoint {
 					http: Some("http://localhost:8545".to_string()),
 					ws: None,
@@ -3554,6 +3572,7 @@ mod tests {
 			RuntimeNetworkConfig {
 				name: Some("chain-2".to_string()),
 				network_type: solver_types::NetworkType::New,
+				kind: Default::default(),
 				rpc_urls: vec![RpcEndpoint {
 					http: Some("http://localhost:8546".to_string()),
 					ws: None,

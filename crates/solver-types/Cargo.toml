@@ -26,6 +26,7 @@ rust_decimal = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha3 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = "0.1"

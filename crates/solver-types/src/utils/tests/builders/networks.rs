@@ -3,7 +3,9 @@
 //! Provides fluent APIs for constructing network configuration instances with
 //! proper validation and sensible defaults.
 
-use crate::networks::{NetworkConfig, NetworkType, NetworksConfig, RpcEndpoint, TokenConfig};
+use crate::networks::{
+	NetworkConfig, NetworkKind, NetworkType, NetworksConfig, RpcEndpoint, TokenConfig,
+};
 use crate::{parse_address, Address};
 use std::collections::HashMap;
 
@@ -146,6 +148,7 @@ impl TokenConfigBuilder {
 pub struct NetworkConfigBuilder {
 	name: Option<String>,
 	network_type: NetworkType,
+	kind: NetworkKind,
 	rpc_urls: Vec<RpcEndpoint>,
 	input_settler_address: Option<Address>,
 	output_settler_address: Option<Address>,
@@ -167,6 +170,7 @@ impl NetworkConfigBuilder {
 		Self {
 			name: None,
 			network_type: NetworkType::New,
+			kind: NetworkKind::Evm,
 			rpc_urls: vec![RpcEndpoint::both(
 				"https://eth.llamarpc.com".to_string(),
 				"wss://eth.llamarpc.com".to_string(),
@@ -207,6 +211,12 @@ impl NetworkConfigBuilder {
 	/// Sets the network role classification.
 	pub fn network_type(mut self, network_type: NetworkType) -> Self {
 		self.network_type = network_type;
+		self
+	}
+
+	/// Sets the network execution environment.
+	pub fn kind(mut self, kind: NetworkKind) -> Self {
+		self.kind = kind;
 		self
 	}
 
@@ -341,6 +351,7 @@ impl NetworkConfigBuilder {
 		Ok(NetworkConfig {
 			name: self.name,
 			network_type: self.network_type,
+			kind: self.kind,
 			rpc_urls: self.rpc_urls,
 			input_settler_address: self.input_settler_address.unwrap(),
 			output_settler_address: self.output_settler_address.unwrap(),

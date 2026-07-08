@@ -31,8 +31,9 @@ use solver_config::{
 	SolverIngressMode, StorageConfig, StrategyConfig,
 };
 use solver_types::seed_overrides::OracleSelectionStrategyOverride;
+use solver_types::utils::{STARKNET_MAINNET_CHAIN_ID, STARKNET_SEPOLIA_CHAIN_ID};
 use solver_types::{
-	networks::{NetworkType, RpcEndpoint},
+	networks::{NetworkKind, NetworkType, RpcEndpoint},
 	BroadcasterSettlementOverride, DirectSettlementOverride, HyperlaneSettlementOverride,
 	NetworkConfig, NetworkOverride, NetworksConfig, OperatorAccountConfig, OperatorAdminConfig,
 	OperatorBroadcasterConfig, OperatorConfig, OperatorDirectConfig, OperatorGasConfig,
@@ -648,6 +649,7 @@ fn build_operator_network_config(
 		chain_id: override_.chain_id,
 		name,
 		network_type: override_.network_type.unwrap_or(NetworkType::New),
+		kind: override_.kind.unwrap_or(NetworkKind::Evm),
 		tokens,
 		rpc_urls,
 		input_settler_address,
@@ -861,6 +863,7 @@ fn build_operator_hyperlane_config_from_seed(
 		mailboxes,
 		igp_addresses,
 		domains,
+		starknet_fee_token_addresses: HashMap::new(),
 		oracles: OperatorOracleConfig {
 			input: input_oracles,
 			output: output_oracles,
@@ -1073,6 +1076,7 @@ fn build_operator_hyperlane_config_from_override(
 		mailboxes: override_cfg.mailboxes.clone(),
 		igp_addresses: override_cfg.igp_addresses.clone(),
 		domains,
+		starknet_fee_token_addresses: override_cfg.starknet_fee_token_addresses.clone(),
 		oracles: OperatorOracleConfig {
 			input: override_cfg.oracles.input.clone(),
 			output: override_cfg.oracles.output.clone(),
@@ -1250,7 +1254,7 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 		networks,
 		storage: build_storage_config_from_operator(&operator_config.solver_id),
 		delivery: build_delivery_config_from_operator(
-			&chain_ids,
+			&operator_config.networks,
 			operator_config.fee_policy.as_ref(),
 		),
 		account: build_account_config_from_operator(operator_config.account.as_ref()),
@@ -1441,6 +1445,7 @@ fn build_networks_from_operator_config(operator_config: &OperatorConfig) -> Netw
 		let network_config = NetworkConfig {
 			name: Some(op_network.name.clone()),
 			network_type: op_network.network_type,
+			kind: op_network.kind,
 			rpc_urls,
 			input_settler_address: solver_types::Address(
 				op_network.input_settler_address.as_slice().to_vec(),
@@ -1557,7 +1562,7 @@ fn build_storage_config_from_operator(solver_id: &str) -> StorageConfig {
 /// config (see `SeedOverrides::fee_policy`); whatever fields they specify
 /// replace the defaults, whatever they omit keeps the default.
 fn build_delivery_config_from_operator(
-	chain_ids: &[u64],
+	networks: &HashMap<u64, OperatorNetworkConfig>,
 	override_: Option<&solver_types::FeePolicyOverride>,
 ) -> DeliveryConfig {
 	// Absolute floor — kicks in only if RPC fee history returned all zeros.
@@ -1569,9 +1574,21 @@ fn build_delivery_config_from_operator(
 	const DEFAULT_SPEED: &str = "fast";
 
 	let mut implementations = HashMap::new();
+	let mut evm_chain_ids = networks
+		.iter()
+		.filter_map(|(chain_id, network)| (network.kind == NetworkKind::Evm).then_some(*chain_id))
+		.collect::<Vec<_>>();
+	evm_chain_ids.sort_unstable();
+	let mut starknet_chain_ids = networks
+		.iter()
+		.filter_map(|(chain_id, network)| {
+			(network.kind == NetworkKind::Starknet).then_some(*chain_id)
+		})
+		.collect::<Vec<_>>();
+	starknet_chain_ids.sort_unstable();
 
-	let network_ids_array =
-		serde_json::Value::Array(chain_ids.iter().map(|id| int(*id as i64)).collect());
+	let evm_network_ids_array =
+		serde_json::Value::Array(evm_chain_ids.iter().map(|id| int(*id as i64)).collect());
 
 	// Pre-resolve the per-chain overrides into a name-keyed lookup so we can
 	// merge them into the auto-generated entries below.
@@ -1585,7 +1602,7 @@ fn build_delivery_config_from_operator(
 		.unwrap_or_default();
 
 	let mut fee_policy_chains = serde_json::Map::new();
-	for chain_id in chain_ids {
+	for chain_id in &evm_chain_ids {
 		let mut entry = serde_json::Map::new();
 		let key = chain_id.to_string();
 		let override_entry = chain_overrides.get(key.as_str()).copied();
@@ -1646,16 +1663,65 @@ fn build_delivery_config_from_operator(
 		("chains", serde_json::Value::Object(fee_policy_chains)),
 	]);
 
-	let evm_alloy_config = json_object(vec![
-		("network_ids", network_ids_array),
-		("fee_policy", fee_policy),
-	]);
-	implementations.insert("evm_alloy".to_string(), evm_alloy_config);
+	if !evm_chain_ids.is_empty() {
+		let evm_alloy_config = json_object(vec![
+			("network_ids", evm_network_ids_array),
+			("fee_policy", fee_policy),
+		]);
+		implementations.insert("evm_alloy".to_string(), evm_alloy_config);
+	}
+	if !starknet_chain_ids.is_empty() {
+		let starknet_max_fee_fri = std::env::var("MAX_STARKNET_FEE_FRI")
+			.map(|value| value.trim().to_string())
+			.unwrap_or_else(|_| "${MAX_STARKNET_FEE_FRI}".to_string());
+		let mut starknet_entries = vec![
+			(
+				"network_ids",
+				serde_json::Value::Array(
+					starknet_chain_ids
+						.iter()
+						.map(|id| int(*id as i64))
+						.collect(),
+				),
+			),
+			(
+				"max_fee_fri",
+				serde_json::Value::String(starknet_max_fee_fri),
+			),
+		];
+		let starknet_rpc_chain_ids = starknet_chain_ids
+			.iter()
+			.filter_map(|network_id| {
+				default_starknet_rpc_chain_id_for_network_id(*network_id).map(|chain_id| {
+					(
+						network_id.to_string(),
+						serde_json::Value::String(chain_id.to_string()),
+					)
+				})
+			})
+			.collect::<serde_json::Map<_, _>>();
+		if !starknet_rpc_chain_ids.is_empty() {
+			starknet_entries.push((
+				"chain_ids",
+				serde_json::Value::Object(starknet_rpc_chain_ids),
+			));
+		}
+		let starknet_config = json_object(starknet_entries);
+		implementations.insert("starknet".to_string(), starknet_config);
+	}
 
 	DeliveryConfig {
 		implementations,
 		min_confirmations: 3,
 		tx_confirmation_timeout_seconds: 600,
+	}
+}
+
+fn default_starknet_rpc_chain_id_for_network_id(network_id: u64) -> Option<&'static str> {
+	match network_id {
+		23448591 => Some(STARKNET_SEPOLIA_CHAIN_ID),
+		358974494 => Some(STARKNET_MAINNET_CHAIN_ID),
+		_ => None,
 	}
 }
 
@@ -1979,6 +2045,20 @@ fn build_hyperlane_json_from_operator(
 		"igp_addresses".to_string(),
 		serde_json::Value::Object(igp_addresses),
 	);
+
+	if !hyperlane.starknet_fee_token_addresses.is_empty() {
+		let mut starknet_fee_token_addresses = serde_json::Map::new();
+		for (chain_id, address) in &hyperlane.starknet_fee_token_addresses {
+			starknet_fee_token_addresses.insert(
+				chain_id.to_string(),
+				serde_json::Value::String(address.clone()),
+			);
+		}
+		table.insert(
+			"starknet_fee_token_addresses".to_string(),
+			serde_json::Value::Object(starknet_fee_token_addresses),
+		);
+	}
 
 	let resolved_domains = resolve_operator_hyperlane_domains(hyperlane, chain_ids)?;
 	let mut domains = serde_json::Map::new();
@@ -2584,6 +2664,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 				.filter(|n| !n.trim().is_empty())
 				.unwrap_or_else(|| format!("chain-{chain_id}")),
 			network_type: network_config.network_type,
+			kind: network_config.kind,
 			tokens,
 			rpc_urls,
 			input_settler_address: Address::from(input_settler_bytes),
@@ -3121,6 +3202,19 @@ fn extract_hyperlane_config(
 		}
 	}
 
+	let mut starknet_fee_token_addresses = HashMap::new();
+	if let Some(json_fee_tokens) = hyperlane_json
+		.and_then(|h| h.get("starknet_fee_token_addresses"))
+		.and_then(|v| v.as_object())
+	{
+		for (chain_id_str, addr_val) in json_fee_tokens {
+			if let (Ok(chain_id), Some(addr_str)) = (chain_id_str.parse::<u64>(), addr_val.as_str())
+			{
+				starknet_fee_token_addresses.insert(chain_id, addr_str.to_string());
+			}
+		}
+	}
+
 	let mut domains = HashMap::new();
 	if let Some(json_domains) = hyperlane_json
 		.and_then(|h| h.get("domains"))
@@ -3228,6 +3322,7 @@ fn extract_hyperlane_config(
 		mailboxes,
 		igp_addresses,
 		domains,
+		starknet_fee_token_addresses,
 		oracles: OperatorOracleConfig {
 			input: input_oracles,
 			output: output_oracles,
@@ -3780,6 +3875,7 @@ mod tests {
 					chain_id: 11155420, // Optimism Sepolia
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
@@ -3797,6 +3893,7 @@ mod tests {
 					chain_id: 84532, // Base Sepolia
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
@@ -4159,6 +4256,7 @@ mod tests {
 					chain_id: 999999, // Unknown chain
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "TEST".to_string(),
 						name: None,
@@ -4176,6 +4274,7 @@ mod tests {
 					chain_id: 11155420,
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
@@ -4228,6 +4327,7 @@ mod tests {
 					chain_id: 11155420,
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![], // No tokens
 					rpc_urls: None,
 					input_settler_address: None,
@@ -4240,6 +4340,7 @@ mod tests {
 					chain_id: 84532,
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
@@ -4291,6 +4392,7 @@ mod tests {
 					chain_id: 11155420,
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![],
 					rpc_urls: None,
 					input_settler_address: None,
@@ -4303,6 +4405,7 @@ mod tests {
 					chain_id: 84532,
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![],
 					rpc_urls: None,
 					input_settler_address: None,
@@ -4348,6 +4451,7 @@ mod tests {
 				chain_id: 11155420,
 				name: None,
 				network_type: None,
+				kind: None,
 				tokens: vec![solver_types::seed_overrides::Token {
 					symbol: "USDC".to_string(),
 					name: None,
@@ -4425,6 +4529,7 @@ mod tests {
 					chain_id: 11155420,
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
@@ -4442,6 +4547,7 @@ mod tests {
 					chain_id: 84532,
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
@@ -4657,6 +4763,7 @@ mod tests {
 					chain_id: 11155420,
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
@@ -4674,6 +4781,7 @@ mod tests {
 					chain_id: 11155420, // Duplicate!
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "DAI".to_string(),
 						name: None,
@@ -4727,6 +4835,7 @@ mod tests {
 					chain_id: 11155420,
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
@@ -4744,6 +4853,7 @@ mod tests {
 					chain_id: 84532,
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
@@ -4822,6 +4932,7 @@ mod tests {
 					chain_id: 11155420,
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
@@ -4839,6 +4950,7 @@ mod tests {
 					chain_id: 84532,
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
@@ -4892,6 +5004,7 @@ mod tests {
 					chain_id: 11155420,
 					name: Some("Optimism Sepolia Parent".to_string()),
 					network_type: Some(NetworkType::Parent),
+					kind: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: Some("USD Coin".to_string()),
@@ -4909,6 +5022,7 @@ mod tests {
 					chain_id: 84532,
 					name: Some("Base Sepolia Hub".to_string()),
 					network_type: Some(NetworkType::Hub),
+					kind: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: Some("USD Coin".to_string()),
@@ -4968,6 +5082,7 @@ mod tests {
 					chain_id: 999999,
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "TEST".to_string(),
 						name: None,
@@ -4985,6 +5100,7 @@ mod tests {
 					chain_id: 11155420,
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
@@ -5038,6 +5154,7 @@ mod tests {
 					chain_id: 11155420,
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
@@ -5055,6 +5172,7 @@ mod tests {
 					chain_id: non_seed_chain_id,
 					name: Some("custom-l2".to_string()),
 					network_type: Some(NetworkType::New),
+					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.custom-l2.example".to_string()]),
 					input_settler_address: Some(address!(
@@ -5093,6 +5211,7 @@ mod tests {
 						),
 					]),
 					domains: HashMap::from([(11155420, 11155420), (non_seed_chain_id, 654321)]),
+					starknet_fee_token_addresses: HashMap::new(),
 					oracles: solver_types::OracleOverrides {
 						input: HashMap::from([
 							(
@@ -5179,6 +5298,7 @@ mod tests {
 					chain_id: chain_a,
 					name: Some("seedless-a".to_string()),
 					network_type: Some(NetworkType::Parent),
+					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-a.example".to_string()]),
 					input_settler_address: Some(address!(
@@ -5195,6 +5315,7 @@ mod tests {
 					chain_id: chain_b,
 					name: Some("seedless-b".to_string()),
 					network_type: Some(NetworkType::Hub),
+					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-b.example".to_string()]),
 					input_settler_address: Some(address!(
@@ -5233,6 +5354,7 @@ mod tests {
 						),
 					]),
 					domains: HashMap::from([(chain_a, 1001), (chain_b, 1002)]),
+					starknet_fee_token_addresses: HashMap::new(),
 					oracles: solver_types::OracleOverrides {
 						input: HashMap::from([
 							(
@@ -5312,6 +5434,7 @@ mod tests {
 					chain_id: 600001,
 					name: Some("seedless-a".to_string()),
 					network_type: Some(NetworkType::Parent),
+					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-a.example".to_string()]),
 					input_settler_address: None,
@@ -5326,6 +5449,7 @@ mod tests {
 					chain_id: 600002,
 					name: Some("seedless-b".to_string()),
 					network_type: Some(NetworkType::Hub),
+					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-b.example".to_string()]),
 					input_settler_address: Some(address!(
@@ -5378,6 +5502,7 @@ mod tests {
 					chain_id: 700001,
 					name: Some("seedless-a".to_string()),
 					network_type: Some(NetworkType::Parent),
+					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-a.example".to_string()]),
 					input_settler_address: Some(address!(
@@ -5394,6 +5519,7 @@ mod tests {
 					chain_id: 700002,
 					name: Some("seedless-b".to_string()),
 					network_type: Some(NetworkType::Hub),
+					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-b.example".to_string()]),
 					input_settler_address: Some(address!(
@@ -5448,6 +5574,7 @@ mod tests {
 					chain_id: chain_a,
 					name: Some("seedless-a".to_string()),
 					network_type: Some(NetworkType::Parent),
+					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-a.example".to_string()]),
 					input_settler_address: Some(address!(
@@ -5464,6 +5591,7 @@ mod tests {
 					chain_id: chain_b,
 					name: Some("seedless-b".to_string()),
 					network_type: Some(NetworkType::Hub),
+					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-b.example".to_string()]),
 					input_settler_address: Some(address!(
@@ -5553,6 +5681,7 @@ mod tests {
 					chain_id: chain_a,
 					name: Some("seedless-a".to_string()),
 					network_type: Some(NetworkType::Parent),
+					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-a.example".to_string()]),
 					input_settler_address: Some(address!(
@@ -5569,6 +5698,7 @@ mod tests {
 					chain_id: chain_b,
 					name: Some("seedless-b".to_string()),
 					network_type: Some(NetworkType::Hub),
+					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-b.example".to_string()]),
 					input_settler_address: Some(address!(
@@ -5673,6 +5803,7 @@ mod tests {
 					chain_id: chain_a,
 					name: Some("seedless-a".to_string()),
 					network_type: Some(NetworkType::Parent),
+					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-a.example".to_string()]),
 					input_settler_address: Some(address!(
@@ -5689,6 +5820,7 @@ mod tests {
 					chain_id: chain_b,
 					name: Some("seedless-b".to_string()),
 					network_type: Some(NetworkType::Hub),
+					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-b.example".to_string()]),
 					input_settler_address: Some(address!(
@@ -5730,6 +5862,7 @@ mod tests {
 						),
 					]),
 					domains: HashMap::from([(chain_a, chain_a as u32), (chain_b, chain_b as u32)]),
+					starknet_fee_token_addresses: HashMap::new(),
 					oracles: solver_types::OracleOverrides {
 						input: HashMap::from([
 							(
@@ -5851,6 +5984,7 @@ mod tests {
 					chain_id: chain_a,
 					name: Some("seedless-a".to_string()),
 					network_type: Some(NetworkType::Parent),
+					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-a.example".to_string()]),
 					input_settler_address: Some(address!(
@@ -5867,6 +6001,7 @@ mod tests {
 					chain_id: chain_b,
 					name: Some("seedless-b".to_string()),
 					network_type: Some(NetworkType::Hub),
+					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-b.example".to_string()]),
 					input_settler_address: Some(address!(
@@ -5908,6 +6043,7 @@ mod tests {
 						),
 					]),
 					domains: HashMap::from([(chain_a, chain_a as u32), (chain_b, chain_b as u32)]),
+					starknet_fee_token_addresses: HashMap::new(),
 					oracles: solver_types::OracleOverrides {
 						input: HashMap::from([
 							(
@@ -5979,6 +6115,7 @@ mod tests {
 					chain_id: chain_a,
 					name: Some("seedless-a".to_string()),
 					network_type: Some(NetworkType::Parent),
+					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-a.example".to_string()]),
 					input_settler_address: Some(address!(
@@ -5995,6 +6132,7 @@ mod tests {
 					chain_id: chain_b,
 					name: Some("seedless-b".to_string()),
 					network_type: Some(NetworkType::Hub),
+					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-b.example".to_string()]),
 					input_settler_address: Some(address!(
@@ -6088,6 +6226,7 @@ mod tests {
 					chain_id: chain_a,
 					name: Some("seedless-a".to_string()),
 					network_type: Some(NetworkType::Parent),
+					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-a.example".to_string()]),
 					input_settler_address: Some(address!(
@@ -6104,6 +6243,7 @@ mod tests {
 					chain_id: chain_b,
 					name: Some("seedless-b".to_string()),
 					network_type: Some(NetworkType::Hub),
+					kind: None,
 					tokens: vec![],
 					rpc_urls: Some(vec!["https://rpc.seedless-b.example".to_string()]),
 					input_settler_address: Some(address!(
@@ -6142,6 +6282,7 @@ mod tests {
 						),
 					]),
 					domains: HashMap::from([(chain_a, chain_a as u32), (chain_b, chain_b as u32)]),
+					starknet_fee_token_addresses: HashMap::new(),
 					oracles: solver_types::OracleOverrides {
 						input: HashMap::from([
 							(
@@ -6304,6 +6445,7 @@ mod tests {
 					chain_id: 11155420,
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
@@ -6321,6 +6463,7 @@ mod tests {
 					chain_id: 11155420, // Duplicate
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "DAI".to_string(),
 						name: None,
@@ -6373,6 +6516,7 @@ mod tests {
 				chain_id: 11155420,
 				name: None,
 				network_type: None,
+				kind: None,
 				tokens: vec![solver_types::seed_overrides::Token {
 					symbol: "USDC".to_string(),
 					name: None,
@@ -6425,6 +6569,7 @@ mod tests {
 					chain_id: 11155420,
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![], // No tokens
 					rpc_urls: None,
 					input_settler_address: None,
@@ -6437,6 +6582,7 @@ mod tests {
 					chain_id: 84532,
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
@@ -6488,6 +6634,7 @@ mod tests {
 					chain_id: 11155420,
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![],
 					rpc_urls: None,
 					input_settler_address: None,
@@ -6500,6 +6647,7 @@ mod tests {
 					chain_id: 84532,
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![],
 					rpc_urls: None,
 					input_settler_address: None,
@@ -6546,6 +6694,7 @@ mod tests {
 					chain_id: 11155420,
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
@@ -6563,6 +6712,7 @@ mod tests {
 					chain_id: 84532,
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
@@ -6725,6 +6875,7 @@ mod tests {
 					(84532, address!("6000000000000000000000000000000000000006")),
 				]),
 				domains: HashMap::new(),
+				starknet_fee_token_addresses: HashMap::new(),
 				oracles: solver_types::OracleOverrides {
 					input: HashMap::from([
 						(
@@ -6800,6 +6951,43 @@ mod tests {
 	}
 
 	#[test]
+	fn test_build_runtime_config_preserves_starknet_fee_token_addresses() {
+		let overrides = test_seed_overrides();
+		let mut op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
+		let fee_token = "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d";
+		op_config
+			.settlement
+			.hyperlane
+			.as_mut()
+			.unwrap()
+			.starknet_fee_token_addresses
+			.insert(11155420, fee_token.to_string());
+
+		let config = build_runtime_config(&op_config).unwrap();
+		let hyperlane = config.settlement.implementations.get("hyperlane").unwrap();
+		assert_eq!(
+			hyperlane
+				.get("starknet_fee_token_addresses")
+				.and_then(|value| value.get("11155420"))
+				.and_then(|value| value.as_str()),
+			Some(fee_token)
+		);
+
+		let roundtrip = config_to_operator_config(&config).unwrap();
+		assert_eq!(
+			roundtrip
+				.settlement
+				.hyperlane
+				.as_ref()
+				.unwrap()
+				.starknet_fee_token_addresses
+				.get(&11155420)
+				.map(String::as_str),
+			Some(fee_token)
+		);
+	}
+
+	#[test]
 	fn test_build_runtime_config_backfills_legacy_empty_hyperlane_domains() {
 		let overrides = test_seed_overrides();
 		let mut op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -6840,6 +7028,7 @@ mod tests {
 					mailboxes: HashMap::new(),
 					igp_addresses: HashMap::new(),
 					domains: HashMap::new(),
+					starknet_fee_token_addresses: HashMap::new(),
 					oracles: OperatorOracleConfig {
 						input: HashMap::new(),
 						output: HashMap::new(),
@@ -6889,6 +7078,7 @@ mod tests {
 				chain_id: 1,
 				name: "test".to_string(),
 				network_type: NetworkType::New,
+				kind: NetworkKind::Evm,
 				tokens: vec![],
 				rpc_urls: vec![],
 				input_settler_address: address!("0000000000000000000000000000000000000001"),
@@ -7159,10 +7349,47 @@ mod tests {
 		assert!(t.get("key3").unwrap().as_bool().unwrap());
 	}
 
+	fn delivery_networks(chain_ids: &[u64]) -> HashMap<u64, OperatorNetworkConfig> {
+		delivery_networks_with_starknet(chain_ids, &[])
+	}
+
+	fn delivery_networks_with_starknet(
+		chain_ids: &[u64],
+		starknet_chain_ids: &[u64],
+	) -> HashMap<u64, OperatorNetworkConfig> {
+		chain_ids
+			.iter()
+			.map(|chain_id| {
+				(
+					*chain_id,
+					OperatorNetworkConfig {
+						chain_id: *chain_id,
+						name: format!("chain-{chain_id}"),
+						network_type: NetworkType::New,
+						kind: if starknet_chain_ids.contains(chain_id) {
+							NetworkKind::Starknet
+						} else {
+							NetworkKind::Evm
+						},
+						tokens: Vec::new(),
+						rpc_urls: Vec::new(),
+						input_settler_address: address!("1111111111111111111111111111111111111111"),
+						output_settler_address: address!(
+							"2222222222222222222222222222222222222222"
+						),
+						input_settler_compact_address: None,
+						the_compact_address: None,
+						allocator_address: None,
+					},
+				)
+			})
+			.collect()
+	}
+
 	#[test]
 	fn test_build_delivery_config_from_operator() {
 		let chain_ids = vec![1, 10, 137];
-		let delivery = build_delivery_config_from_operator(&chain_ids, None);
+		let delivery = build_delivery_config_from_operator(&delivery_networks(&chain_ids), None);
 
 		assert!(delivery.implementations.contains_key("evm_alloy"));
 		let evm_config = delivery.implementations.get("evm_alloy").unwrap();
@@ -7233,9 +7460,61 @@ mod tests {
 	}
 
 	#[test]
+	fn test_build_delivery_config_splits_starknet_networks() {
+		let chain_ids = vec![1, 11155111, 137];
+		let delivery = build_delivery_config_from_operator(
+			&delivery_networks_with_starknet(&chain_ids, &[11155111]),
+			None,
+		);
+
+		let evm = delivery.implementations.get("evm_alloy").unwrap();
+		let evm_network_ids = evm.get("network_ids").unwrap().as_array().unwrap();
+		assert_eq!(
+			evm_network_ids
+				.iter()
+				.filter_map(|value| value.as_i64())
+				.collect::<Vec<_>>(),
+			vec![1, 137]
+		);
+		let starknet = delivery.implementations.get("starknet").unwrap();
+		let starknet_network_ids = starknet.get("network_ids").unwrap().as_array().unwrap();
+		assert_eq!(
+			starknet_network_ids
+				.iter()
+				.filter_map(|value| value.as_i64())
+				.collect::<Vec<_>>(),
+			vec![11155111]
+		);
+		assert!(starknet.get("fee_policy").is_none());
+	}
+
+	#[test]
+	fn test_build_delivery_config_emits_public_starknet_chain_ids() {
+		let chain_ids = vec![23448591, 358974494];
+		let delivery = build_delivery_config_from_operator(
+			&delivery_networks_with_starknet(&chain_ids, &chain_ids),
+			None,
+		);
+
+		let starknet = delivery.implementations.get("starknet").unwrap();
+		let chain_ids = starknet
+			.get("chain_ids")
+			.and_then(|value| value.as_object())
+			.expect("known Starknet networks should emit chain_ids");
+		assert_eq!(
+			chain_ids.get("23448591").and_then(|value| value.as_str()),
+			Some(STARKNET_SEPOLIA_CHAIN_ID)
+		);
+		assert_eq!(
+			chain_ids.get("358974494").and_then(|value| value.as_str()),
+			Some(STARKNET_MAINNET_CHAIN_ID)
+		);
+	}
+
+	#[test]
 	fn test_build_delivery_config_defaults_extra_native_fee_for_known_op_stack_chains() {
 		let chain_ids = vec![10, 8453, 11155420, 84532, 747474, 1, 137, 42161];
-		let delivery = build_delivery_config_from_operator(&chain_ids, None);
+		let delivery = build_delivery_config_from_operator(&delivery_networks(&chain_ids), None);
 		let evm = delivery.implementations.get("evm_alloy").unwrap();
 		let chains = evm
 			.get("fee_policy")
@@ -7303,7 +7582,8 @@ mod tests {
 		};
 
 		let chain_ids = vec![1, 10, 747474];
-		let delivery = build_delivery_config_from_operator(&chain_ids, Some(&override_));
+		let delivery =
+			build_delivery_config_from_operator(&delivery_networks(&chain_ids), Some(&override_));
 		let evm = delivery.implementations.get("evm_alloy").unwrap();
 		let fee_policy = evm.get("fee_policy").unwrap();
 
@@ -7983,6 +8263,7 @@ mod tests {
 			chain_id: 11155420,
 			name: Some("   ".to_string()),
 			network_type: None,
+			kind: Some(NetworkKind::Starknet),
 			tokens: vec![solver_types::seed_overrides::Token {
 				symbol: "USDC".to_string(),
 				name: None,
@@ -8000,6 +8281,7 @@ mod tests {
 		let network = build_operator_network_config(Some(network_seed), &override_).unwrap();
 		assert_eq!(network.name, network_seed.name);
 		assert_eq!(network.network_type, NetworkType::New);
+		assert_eq!(network.kind, NetworkKind::Starknet);
 		assert_eq!(network.tokens[0].name, Some("USDC".to_string()));
 		assert_eq!(network.rpc_urls.len(), network_seed.default_rpc_urls.len());
 	}
@@ -8217,6 +8499,7 @@ mod tests {
 					chain_id: 11155420,
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,
@@ -8234,6 +8517,7 @@ mod tests {
 					chain_id: 84532,
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![solver_types::seed_overrides::Token {
 						symbol: "USDC".to_string(),
 						name: None,

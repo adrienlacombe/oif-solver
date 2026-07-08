@@ -34,5 +34,8 @@ pub const MOCK_TOKB_USD_PRICE: &str = "10.0";
 /// Default SOL/USD price used in mock pricing implementation.
 pub const MOCK_SOL_USD_PRICE: &str = "240.50";
 
+/// Default STRK/USD price used in mock pricing implementation.
+pub const MOCK_STRK_USD_PRICE: &str = "0.50";
+
 /// Default ETH/SOL price used in mock pricing implementation.
 pub const MOCK_ETH_SOL_PRICE: &str = "19.20";

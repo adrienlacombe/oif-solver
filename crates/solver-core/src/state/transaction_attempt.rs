@@ -431,7 +431,7 @@ mod tests {
 			scope: TransactionAttemptScope::order("order-1"),
 			signer: Some(Address(vec![9; 20])),
 			tx_type: TransactionType::Fill,
-			tx: sample_tx(),
+			tx: sample_tx().into(),
 			attempt_id_override: Some("forced-id".into()),
 			replacement_of: Some("parent-id".into()),
 		};
@@ -449,7 +449,7 @@ mod tests {
 			scope: TransactionAttemptScope::order("order-1"),
 			signer: None,
 			tx_type: TransactionType::Fill,
-			tx: sample_tx(),
+			tx: sample_tx().into(),
 			attempt_id_override: None,
 			replacement_of: None,
 		};
@@ -469,7 +469,7 @@ mod tests {
 				scope: TransactionAttemptScope::order("o"),
 				signer: None,
 				tx_type: TransactionType::Fill,
-				tx: sample_tx(),
+				tx: sample_tx().into(),
 				attempt_id_override: Some("parent".into()),
 				replacement_of: None,
 			})
@@ -499,7 +499,7 @@ mod tests {
 				scope: TransactionAttemptScope::order("o"),
 				signer: None,
 				tx_type: TransactionType::Fill,
-				tx: sample_tx(),
+				tx: sample_tx().into(),
 				attempt_id_override: Some("parent".into()),
 				replacement_of: None,
 			})
@@ -535,7 +535,7 @@ mod tests {
 				scope: TransactionAttemptScope::order("o"),
 				signer: None,
 				tx_type: TransactionType::Fill,
-				tx: sample_tx(),
+				tx: sample_tx().into(),
 				attempt_id_override: Some("loser".into()),
 				replacement_of: Some("parent".into()),
 			})
@@ -577,7 +577,7 @@ mod tests {
 				scope: TransactionAttemptScope::order("o"),
 				signer: None,
 				tx_type: TransactionType::Fill,
-				tx: sample_tx(),
+				tx: sample_tx().into(),
 				attempt_id_override: Some("loser".into()),
 				replacement_of: Some("parent".into()),
 			})

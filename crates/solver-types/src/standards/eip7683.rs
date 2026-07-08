@@ -1138,9 +1138,13 @@ impl QuoteParsable for Eip7683OrderData {
 			execution_params: None,
 			prepare_tx_hash: None,
 			fill_tx_hash: None,
+			fill_tx_hashes: Vec::new(),
+			expected_fill_tx_count: None,
 			post_fill_tx_hash: None,
 			pre_claim_tx_hash: None,
 			claim_tx_hash: None,
+			claim_tx_hashes: Vec::new(),
+			expected_claim_tx_count: None,
 			fill_proof: None,
 			settlement_name: None,
 		}

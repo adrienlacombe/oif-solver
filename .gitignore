@@ -28,6 +28,18 @@ out/
 cache/
 data/
 
+# Terraform local state/cache
+.terraform/
+terraform.tfstate
+terraform.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
 # Demo output
 .pids/
 .logs/

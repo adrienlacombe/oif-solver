@@ -1844,7 +1844,7 @@ fn build_seed_overrides(
 	options: &HarnessOptions,
 	deny_list_path: Option<String>,
 ) -> Result<solver_types::SeedOverrides> {
-	use solver_types::networks::NetworkType;
+	use solver_types::networks::{NetworkKind, NetworkType};
 	use solver_types::seed_overrides::{
 		AdminOverride, BroadcasterSettlementOverride, DirectSettlementOverride,
 		HyperlaneSettlementOverride, NetworkOverride, OracleOverrides, SettlementOverride,
@@ -1868,6 +1868,7 @@ fn build_seed_overrides(
 			// test chains as `Parent` — the variant doesn't affect the
 			// settlement flow we exercise here.
 			network_type: Some(NetworkType::Parent),
+			kind: Some(NetworkKind::Evm),
 			tokens: vec![token("TOKA", d.token_a), token("TOKB", d.token_b)],
 			rpc_urls: Some(vec![d.rpc_http.clone()]),
 			input_settler_address: Some(d.input_settler),
@@ -1927,6 +1928,7 @@ fn build_seed_overrides(
 			message_timeout_seconds: None,
 			finalization_required: None,
 			intent_min_expiry_seconds: None,
+			starknet_fee_token_addresses: HashMap::new(),
 		};
 		SettlementOverride {
 			settlement_type: SettlementTypeOverride::Hyperlane,

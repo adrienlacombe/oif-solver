@@ -321,6 +321,7 @@ mod tests {
 		let network_config = NetworkConfig {
 			name: Some("test-network".to_string()),
 			network_type: crate::networks::NetworkType::New,
+			kind: Default::default(),
 			rpc_urls: vec![], // Empty RPC URLs
 			input_settler_address: crate::parse_address(
 				"0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9",

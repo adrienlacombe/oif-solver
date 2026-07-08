@@ -38,12 +38,14 @@ pub type OrderFactory = fn(
 	&serde_json::Value,
 	&NetworksConfig,
 	&solver_types::oracle::OracleRoutes,
+	&solver_types::SolverIdentityAddresses,
 ) -> Result<Box<dyn OrderInterface>, OrderError>;
 pub type PricingFactory = fn(&serde_json::Value) -> Result<Box<dyn PricingInterface>, PricingError>;
 pub type SettlementFactory = fn(
 	&serde_json::Value,
 	&NetworksConfig,
 	std::sync::Arc<solver_storage::StorageService>,
+	&solver_types::SolverIdentityAddresses,
 ) -> Result<Box<dyn SettlementInterface>, SettlementError>;
 pub type StrategyFactory =
 	fn(&serde_json::Value) -> Result<Box<dyn ExecutionStrategy>, StrategyError>;

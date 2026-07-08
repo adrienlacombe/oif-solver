@@ -915,7 +915,11 @@ impl OrderInterface for Eip7683OrderImpl {
 			execution_params: None,
 			prepare_tx_hash: None,
 			fill_tx_hash: None,
+			fill_tx_hashes: Vec::new(),
+			expected_fill_tx_count: None,
 			claim_tx_hash: None,
+			claim_tx_hashes: Vec::new(),
+			expected_claim_tx_count: None,
 			post_fill_tx_hash: None,
 			pre_claim_tx_hash: None,
 			fill_proof: None,
@@ -949,6 +953,7 @@ pub fn create_order_impl(
 	config: &serde_json::Value,
 	networks: &NetworksConfig,
 	oracle_routes: &solver_types::oracle::OracleRoutes,
+	_solver_identities: &solver_types::SolverIdentityAddresses,
 ) -> Result<Box<dyn OrderInterface>, OrderError> {
 	// Validate configuration first
 	Eip7683OrderSchema::validate_config(config)
@@ -1367,7 +1372,12 @@ mod tests {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
 
-		let result = create_order_impl(&config, &networks, &oracle_routes);
+		let result = create_order_impl(
+			&config,
+			&networks,
+			&oracle_routes,
+			&solver_types::SolverIdentityAddresses::default(),
+		);
 		assert!(result.is_ok());
 	}
 

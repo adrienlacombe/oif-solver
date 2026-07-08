@@ -8,8 +8,8 @@ use alloy_primitives::Bytes;
 use async_trait::async_trait;
 use solver_types::{
 	standards::eip7683::interfaces::StandardOrder, Address, ConfigSchema, ExecutionContext,
-	ExecutionDecision, ExecutionParams, FillProof, ImplementationRegistry, NetworksConfig, Order,
-	OrderIdCallback, Transaction,
+	ExecutionDecision, ExecutionParams, ExecutionTransaction, FillProof, ImplementationRegistry,
+	NetworksConfig, Order, OrderIdCallback, Transaction,
 };
 use std::collections::HashMap;
 use thiserror::Error;
@@ -18,6 +18,7 @@ use thiserror::Error;
 pub mod implementations {
 	pub mod standards {
 		pub mod _7683;
+		pub mod hyperlane7683;
 	}
 	pub mod strategies {
 		pub mod simple;
@@ -39,6 +40,9 @@ pub enum OrderError {
 	/// Error that occurs when the order configuration is invalid.
 	#[error("Invalid order: {0}")]
 	InvalidOrder(String),
+	/// Error that occurs when an order operation is intentionally not supported.
+	#[error("Unsupported operation: {0}")]
+	UnsupportedOperation(String),
 }
 
 /// Errors that can occur during strategy creation and execution.
@@ -97,6 +101,37 @@ pub trait OrderInterface: Send + Sync {
 		params: &ExecutionParams,
 	) -> Result<Transaction, OrderError>;
 
+	/// Generates a typed execution transaction for filling the given order.
+	///
+	/// Existing EVM implementations can rely on the default wrapper. Non-EVM
+	/// standards override this to return their native execution payload.
+	async fn generate_fill_execution_transaction(
+		&self,
+		order: &Order,
+		params: &ExecutionParams,
+	) -> Result<ExecutionTransaction, OrderError> {
+		self.generate_fill_transaction(order, params)
+			.await
+			.map(ExecutionTransaction::from)
+	}
+
+	/// Generates typed execution transactions for filling the given order.
+	///
+	/// Most standards produce a single fill transaction. Standards with
+	/// multiple independent fill legs can override this and return one scoped
+	/// transaction per leg while existing scalar handlers continue to use
+	/// `generate_fill_execution_transaction`.
+	async fn generate_fill_execution_transactions(
+		&self,
+		order: &Order,
+		params: &ExecutionParams,
+	) -> Result<Vec<ExecutionTransaction>, OrderError> {
+		Ok(vec![
+			self.generate_fill_execution_transaction(order, params)
+				.await?,
+		])
+	}
+
 	/// Generates a transaction to claim rewards for a filled order.
 	///
 	/// Creates a blockchain transaction that will claim any rewards or fees
@@ -106,6 +141,17 @@ pub trait OrderInterface: Send + Sync {
 		order: &Order,
 		fill_proof: &FillProof,
 	) -> Result<Transaction, OrderError>;
+
+	/// Generates a typed execution transaction for claiming rewards.
+	async fn generate_claim_execution_transaction(
+		&self,
+		order: &Order,
+		fill_proof: &FillProof,
+	) -> Result<ExecutionTransaction, OrderError> {
+		self.generate_claim_transaction(order, fill_proof)
+			.await
+			.map(ExecutionTransaction::from)
+	}
 
 	/// Validates raw order bytes for this standard.
 	async fn validate_order(&self, _order_bytes: &Bytes) -> Result<StandardOrder, OrderError> {
@@ -167,6 +213,7 @@ pub type OrderFactory = fn(
 	&serde_json::Value,
 	&NetworksConfig,
 	&solver_types::oracle::OracleRoutes,
+	&solver_types::SolverIdentityAddresses,
 ) -> Result<Box<dyn OrderInterface>, OrderError>;
 
 /// Type alias for strategy factory functions.
@@ -193,9 +240,16 @@ pub trait StrategyRegistry: ImplementationRegistry<Factory = StrategyFactory> {}
 /// Returns a vector of (name, factory) tuples for all available order implementations.
 /// This is used by the factory registry to automatically register all implementations.
 pub fn get_all_order_implementations() -> Vec<(&'static str, OrderFactory)> {
+	use implementations::standards::hyperlane7683;
 	use implementations::standards::_7683;
 
-	vec![(_7683::Registry::NAME, _7683::Registry::factory())]
+	vec![
+		(_7683::Registry::NAME, _7683::Registry::factory()),
+		(
+			hyperlane7683::Registry::NAME,
+			hyperlane7683::Registry::factory(),
+		),
+	]
 }
 
 /// Get all registered strategy implementations.
@@ -277,6 +331,39 @@ impl OrderService {
 			.await
 	}
 
+	/// Generates a typed execution transaction for filling the given order.
+	pub async fn generate_fill_execution_transaction(
+		&self,
+		order: &Order,
+		params: &ExecutionParams,
+	) -> Result<ExecutionTransaction, OrderError> {
+		let implementation = self
+			.implementations
+			.get(&order.standard)
+			.ok_or_else(|| OrderError::ValidationFailed("Unknown standard".into()))?;
+
+		implementation
+			.generate_fill_execution_transaction(order, params)
+			.await
+	}
+
+	/// Generates typed execution transactions for standards that may have
+	/// multiple independent fill legs.
+	pub async fn generate_fill_execution_transactions(
+		&self,
+		order: &Order,
+		params: &ExecutionParams,
+	) -> Result<Vec<ExecutionTransaction>, OrderError> {
+		let implementation = self
+			.implementations
+			.get(&order.standard)
+			.ok_or_else(|| OrderError::ValidationFailed("Unknown standard".into()))?;
+
+		implementation
+			.generate_fill_execution_transactions(order, params)
+			.await
+	}
+
 	/// Generates a claim transaction for a filled order.
 	///
 	/// Uses the appropriate standard implementation to create the transaction.
@@ -292,6 +379,22 @@ impl OrderService {
 
 		implementation
 			.generate_claim_transaction(order, proof)
+			.await
+	}
+
+	/// Generates a typed execution transaction for claiming rewards.
+	pub async fn generate_claim_execution_transaction(
+		&self,
+		order: &Order,
+		proof: &FillProof,
+	) -> Result<ExecutionTransaction, OrderError> {
+		let implementation = self
+			.implementations
+			.get(&order.standard)
+			.ok_or_else(|| OrderError::ValidationFailed("Unknown standard".into()))?;
+
+		implementation
+			.generate_claim_execution_transaction(order, proof)
 			.await
 	}
 
@@ -339,5 +442,21 @@ impl OrderService {
 				quote_id,
 			)
 			.await
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn order_registry_includes_hyperlane7683() {
+		let names = get_all_order_implementations()
+			.into_iter()
+			.map(|(name, _factory)| name)
+			.collect::<Vec<_>>();
+
+		assert!(names.contains(&"eip7683"));
+		assert!(names.contains(&solver_types::HYPERLANE7683_STANDARD));
 	}
 }

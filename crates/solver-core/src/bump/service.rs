@@ -271,6 +271,16 @@ impl TransactionBumpService {
 		) {
 			return;
 		}
+		let Some(tip_tx) = tip.tx.as_evm() else {
+			tracing::debug!(
+				%order_id,
+				attempt_id = %tip.id,
+				chain_id,
+				?tx_type,
+				"tx_bump: skipping non-EVM transaction attempt"
+			);
+			return;
+		};
 
 		// 4. Age threshold.
 		let now = current_timestamp();
@@ -377,12 +387,12 @@ impl TransactionBumpService {
 		//    then apply `bump_percent`.
 		let (max_fee, max_priority, gas_price) = highest_fees_in_lineage(component);
 		let floor_tx = solver_types::Transaction {
-			to: tip.tx.to.clone(),
-			data: tip.tx.data.clone(),
-			value: tip.tx.value,
-			chain_id: tip.tx.chain_id,
-			nonce: tip.tx.nonce,
-			gas_limit: tip.tx.gas_limit,
+			to: tip_tx.to.clone(),
+			data: tip_tx.data.clone(),
+			value: tip_tx.value,
+			chain_id: tip_tx.chain_id,
+			nonce: tip_tx.nonce,
+			gas_limit: tip_tx.gas_limit,
 			gas_price,
 			max_fee_per_gas: max_fee,
 			max_priority_fee_per_gas: max_priority,
@@ -467,7 +477,7 @@ impl TransactionBumpService {
 		match self.delivery.get_balance(chain_id, &signer_hex, None).await {
 			Ok(balance_str) => match balance_str.parse::<U256>() {
 				Ok(balance) => {
-					let required = required_balance_wei(&bumped, &tip.tx);
+					let required = required_balance_wei(&bumped, tip_tx);
 					if balance < required {
 						tracing::warn!(
 							%order_id,
@@ -533,7 +543,7 @@ impl TransactionBumpService {
 		//     transaction labeled as a replacement. Refuse to bump in that
 		//     case rather than relying on the debug_assert below (which is a
 		//     no-op in release builds).
-		if tip.tx.nonce.is_none() {
+		if tip_tx.nonce.is_none() {
 			tracing::warn!(
 				%order_id,
 				attempt_id = %tip.id,
@@ -695,24 +705,24 @@ impl TransactionBumpService {
 		}
 
 		// 13. Build replacement_tx: clone tip.tx and override fee fields.
-		let mut replacement_tx = tip.tx.clone();
+		let mut replacement_tx = tip_tx.clone();
 		replacement_tx.max_fee_per_gas = bumped.max_fee_per_gas;
 		replacement_tx.max_priority_fee_per_gas = bumped.max_priority_fee_per_gas;
 		replacement_tx.gas_price = bumped.gas_price;
 
 		// 14. Invariants: same nonce/chain/to/data/value as parent.
 		debug_assert_eq!(
-			replacement_tx.nonce, tip.tx.nonce,
+			replacement_tx.nonce, tip_tx.nonce,
 			"bump must preserve nonce"
 		);
 		debug_assert_eq!(
-			replacement_tx.chain_id, tip.tx.chain_id,
+			replacement_tx.chain_id, tip_tx.chain_id,
 			"bump must preserve chain_id"
 		);
-		debug_assert_eq!(replacement_tx.to, tip.tx.to, "bump must preserve to");
-		debug_assert_eq!(replacement_tx.data, tip.tx.data, "bump must preserve data");
+		debug_assert_eq!(replacement_tx.to, tip_tx.to, "bump must preserve to");
+		debug_assert_eq!(replacement_tx.data, tip_tx.data, "bump must preserve data");
 		debug_assert_eq!(
-			replacement_tx.value, tip.tx.value,
+			replacement_tx.value, tip_tx.value,
 			"bump must preserve value"
 		);
 
@@ -1074,7 +1084,23 @@ impl TransactionBumpService {
 		let cb = &stored.cost_context.cost_breakdown;
 
 		// Fail-open: tip has no gas_limit → cannot compute cost.
-		let Some(gas_units) = tip.tx.gas_limit else {
+		let Some(tip_tx) = tip.tx.as_evm() else {
+			tracing::warn!(
+				order_id = %order.id,
+				tip_id = %tip.id,
+				"tx_bump: non-EVM tip cannot be costed; skipping profitability gate (fail-open)"
+			);
+			self.emit_profitability_check_skipped(
+				&order.id,
+				&tip.id,
+				chain_id,
+				tx_type,
+				"tip is non-EVM",
+			);
+			return fail_closed;
+		};
+
+		let Some(gas_units) = tip_tx.gas_limit else {
 			tracing::warn!(
 				order_id = %order.id,
 				tip_id = %tip.id,
@@ -1337,7 +1363,7 @@ mod tests {
 			scope,
 			signer,
 			tx_type: tracking.tracking.tx_type,
-			tx: tx.clone(),
+			tx: tx.clone().into(),
 			attempt_id_override: tracking.tracking.attempt_id.clone(),
 			replacement_of: tracking.tracking.replacement_of.clone(),
 		};
@@ -1453,7 +1479,7 @@ mod tests {
 			scope: TransactionAttemptScope::order("order-1"),
 			signer,
 			tx_type: TransactionType::Fill,
-			tx: tx_with_fees(max_fee),
+			tx: tx_with_fees(max_fee).into(),
 			attempt_id_override: Some(id.into()),
 			replacement_of: replacement_of.map(String::from),
 		};
@@ -1732,7 +1758,10 @@ mod tests {
 		let child = all.iter().find(|a| a.id != "parent-1").unwrap();
 		assert_eq!(child.replacement_of.as_deref(), Some("parent-1"));
 		// 15% bump default: 10 gwei -> 11.5 gwei
-		assert_eq!(child.tx.max_fee_per_gas, Some(11_500_000_000));
+		assert_eq!(
+			child.tx.as_evm().unwrap().max_fee_per_gas,
+			Some(11_500_000_000)
+		);
 	}
 
 	#[tokio::test]
@@ -1824,7 +1853,7 @@ mod tests {
 				scope: TransactionAttemptScope::system(scope_id),
 				signer: Some(signer.clone()),
 				tx_type: TransactionType::Approval,
-				tx: tx_with_fees(10_000_000_000),
+				tx: tx_with_fees(10_000_000_000).into(),
 				attempt_id_override: Some("system-parent-1".into()),
 				replacement_of: None,
 			})
@@ -1893,7 +1922,10 @@ mod tests {
 			.unwrap();
 		assert_eq!(child.replacement_of.as_deref(), Some("system-parent-1"));
 		assert_eq!(child.scope.scope_id(), scope_id);
-		assert_eq!(child.tx.max_fee_per_gas, Some(11_500_000_000));
+		assert_eq!(
+			child.tx.as_evm().unwrap().max_fee_per_gas,
+			Some(11_500_000_000)
+		);
 	}
 
 	// =====================================================================
@@ -2142,10 +2174,11 @@ mod tests {
 		assert_eq!(all.len(), 2);
 		let child = all.iter().find(|a| a.id != "parent-1").unwrap();
 		assert_eq!(child.status, TransactionAttemptStatus::SubmitRejected);
+		let child_tx = child.tx.as_evm().unwrap();
 		assert!(
-			child.tx.max_fee_per_gas.unwrap() > 10_000_000_000,
+			child_tx.max_fee_per_gas.unwrap() > 10_000_000_000,
 			"child fee {} must be > parent 10 gwei (proof of 15% bump preserved)",
-			child.tx.max_fee_per_gas.unwrap()
+			child_tx.max_fee_per_gas.unwrap()
 		);
 	}
 
@@ -3029,7 +3062,7 @@ mod tests {
 				scope: TransactionAttemptScope::order("order-1"),
 				signer: Some(signer),
 				tx_type: TransactionType::Fill,
-				tx,
+				tx: tx.into(),
 				attempt_id_override: Some("parent-1".into()),
 				replacement_of: None,
 			})
@@ -3229,7 +3262,7 @@ mod tests {
 				scope: TransactionAttemptScope::system(scope_id),
 				signer: Some(signer),
 				tx_type: TransactionType::Approval,
-				tx: tx_with_fees(10_000_000_000),
+				tx: tx_with_fees(10_000_000_000).into(),
 				attempt_id_override: Some("system-parent-preflight".into()),
 				replacement_of: None,
 			})

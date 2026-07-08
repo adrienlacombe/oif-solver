@@ -985,6 +985,7 @@ mod tests {
 						chain_id: 1,
 						name: "ethereum".to_string(),
 						network_type: NetworkType::Parent,
+						kind: Default::default(),
 						tokens: vec![],
 						rpc_urls: vec![OperatorRpcEndpoint::http_only(
 							"http://localhost:8545".to_string(),
@@ -1006,6 +1007,7 @@ mod tests {
 						chain_id: 747474,
 						name: "katana".to_string(),
 						network_type: NetworkType::New,
+						kind: Default::default(),
 						tokens: vec![],
 						rpc_urls: vec![OperatorRpcEndpoint::http_only(
 							"http://localhost:9545".to_string(),
@@ -1033,6 +1035,7 @@ mod tests {
 					mailboxes: HashMap::new(),
 					igp_addresses: HashMap::new(),
 					domains: HashMap::new(),
+					starknet_fee_token_addresses: HashMap::new(),
 					oracles: OperatorOracleConfig {
 						input: HashMap::new(),
 						output: HashMap::new(),

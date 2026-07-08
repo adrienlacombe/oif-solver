@@ -35,7 +35,7 @@
 //! ```
 
 use crate::auth::AdminWhitelistEntry;
-use crate::networks::NetworkType;
+use crate::networks::{NetworkKind, NetworkType};
 use alloy_primitives::{Address, B256};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -295,6 +295,10 @@ pub struct HyperlaneSettlementOverride {
 	/// Hyperlane domains by canonical chain ID.
 	#[serde(default)]
 	pub domains: HashMap<u64, u32>,
+
+	/// Starknet protocol fee token addresses by chain ID.
+	#[serde(default)]
+	pub starknet_fee_token_addresses: HashMap<u64, String>,
 
 	/// Oracle maps.
 	#[serde(default)]
@@ -556,6 +560,10 @@ pub struct NetworkOverride {
 	#[serde(default, rename = "type")]
 	pub network_type: Option<NetworkType>,
 
+	/// Blockchain execution environment for this network.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub kind: Option<NetworkKind>,
+
 	/// Tokens this solver will support on this network.
 	/// Required - different solvers support different tokens.
 	pub tokens: Vec<Token>,
@@ -688,6 +696,23 @@ mod tests {
 	}
 
 	#[test]
+	fn test_parse_network_kind_override() {
+		let json = r#"{
+            "networks": [
+                {
+                    "chain_id": 11155111,
+                    "kind": "starknet",
+                    "tokens": []
+                }
+            ]
+        }"#;
+
+		let config: SeedOverrides = serde_json::from_str(json).unwrap();
+
+		assert_eq!(config.networks[0].kind, Some(NetworkKind::Starknet));
+	}
+
+	#[test]
 	fn test_parse_full_config() {
 		let json = r#"{
             "networks": [
@@ -733,6 +758,7 @@ mod tests {
 					chain_id: 10,
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![],
 					rpc_urls: None,
 					input_settler_address: None,
@@ -745,6 +771,7 @@ mod tests {
 					chain_id: 8453,
 					name: None,
 					network_type: None,
+					kind: None,
 					tokens: vec![],
 					rpc_urls: None,
 					input_settler_address: None,
@@ -788,6 +815,7 @@ mod tests {
 				chain_id: 10,
 				name: None,
 				network_type: None,
+				kind: None,
 				tokens: vec![],
 				rpc_urls: None,
 				input_settler_address: None,
@@ -830,6 +858,7 @@ mod tests {
 				chain_id: 10,
 				name: None,
 				network_type: None,
+				kind: None,
 				tokens: vec![Token {
 					symbol: "USDC".to_string(),
 					name: Some("USD Coin".to_string()),
@@ -883,6 +912,7 @@ mod tests {
 			}],
 			name: None,
 			network_type: None,
+			kind: None,
 			rpc_urls: None,
 			input_settler_address: None,
 			output_settler_address: None,
@@ -896,6 +926,7 @@ mod tests {
 			tokens: vec![],
 			name: None,
 			network_type: None,
+			kind: None,
 			rpc_urls: None,
 			input_settler_address: None,
 			output_settler_address: None,
@@ -917,6 +948,7 @@ mod tests {
 				chain_id: 10,
 				name: Some("optimism".to_string()),
 				network_type: Some(NetworkType::Parent),
+				kind: None,
 				tokens: vec![Token {
 					symbol: "USDC".to_string(),
 					name: Some("USD Coin".to_string()),

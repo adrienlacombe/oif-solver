@@ -7,6 +7,7 @@ use crate::with_0x_prefix;
 use alloy_primitives::{Address as AlloyAddress, Bytes, Signature as PrimitiveSignature, U256};
 use alloy_rpc_types::TransactionRequest;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
 use std::fmt;
 
 /// Blockchain address representation.
@@ -14,6 +15,39 @@ use std::fmt;
 /// Stores addresses as raw bytes to support different blockchain formats.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Address(pub Vec<u8>);
+
+impl Address {
+	/// Standard EVM address length.
+	pub const EVM_LENGTH: usize = 20;
+	/// Bytes32 address length used by cross-chain protocols and Starknet felts.
+	pub const BYTES32_LENGTH: usize = 32;
+
+	pub fn is_evm_address(&self) -> bool {
+		self.0.len() == Self::EVM_LENGTH
+	}
+
+	pub fn is_bytes32_address(&self) -> bool {
+		self.0.len() == Self::BYTES32_LENGTH
+	}
+}
+
+/// Chain-family-specific solver identities used where protocols need both EVM
+/// and Starknet account addresses in the same order lifecycle.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SolverIdentityAddresses {
+	pub evm: Option<Address>,
+	pub starknet: Option<Address>,
+}
+
+impl SolverIdentityAddresses {
+	pub fn new(evm: Option<Address>, starknet: Option<Address>) -> Self {
+		Self { evm, starknet }
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.evm.is_none() && self.starknet.is_none()
+	}
+}
 
 /// Custom serialization for Address - serializes as hex string
 impl Serialize for Address {
@@ -37,10 +71,10 @@ impl<'de> Deserialize<'de> for Address {
 		let bytes = hex::decode(hex_str)
 			.map_err(|e| serde::de::Error::custom(format!("Invalid hex address: {e}")))?;
 
-		// Validate address length (should be 20 bytes for Ethereum addresses)
-		if bytes.len() != 20 {
+		// Accept 20-byte EVM addresses and 32-byte cross-chain/Starknet addresses.
+		if !matches!(bytes.len(), Address::EVM_LENGTH | Address::BYTES32_LENGTH) {
 			return Err(serde::de::Error::custom(format!(
-				"Invalid address length: expected 20 bytes, got {}",
+				"Invalid address length: expected 20 or 32 bytes, got {}",
 				bytes.len()
 			)));
 		}
@@ -86,7 +120,7 @@ impl From<PrimitiveSignature> for Signature {
 ///
 /// Contains all fields necessary for constructing and submitting transactions
 /// to various blockchain networks.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
 	/// Recipient address (None for contract creation).
 	pub to: Option<Address>,
@@ -106,6 +140,229 @@ pub struct Transaction {
 	pub max_fee_per_gas: Option<u128>,
 	/// Maximum priority fee per gas (EIP-1559).
 	pub max_priority_fee_per_gas: Option<u128>,
+}
+
+/// Starknet contract call inside an account invoke transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StarknetCall {
+	/// Contract address being called, encoded as a Starknet felt/bytes32 address.
+	pub contract_address: Address,
+	/// Entry point selector as a Starknet felt.
+	pub entry_point_selector: [u8; 32],
+	/// Cairo calldata felts.
+	pub calldata: Vec<U256>,
+}
+
+/// Starknet resource bounds used by invoke v3 transactions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StarknetResourceBounds {
+	pub max_amount: U256,
+	pub max_price_per_unit: U256,
+}
+
+/// Starknet resource-bound map for l1 gas, l1 data gas, and l2 gas.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StarknetResourceBoundsMapping {
+	pub l1_gas: StarknetResourceBounds,
+	pub l1_data_gas: StarknetResourceBounds,
+	pub l2_gas: StarknetResourceBounds,
+}
+
+impl StarknetResourceBoundsMapping {
+	pub fn zero() -> Self {
+		let zero = StarknetResourceBounds {
+			max_amount: U256::ZERO,
+			max_price_per_unit: U256::ZERO,
+		};
+		Self {
+			l1_gas: zero.clone(),
+			l1_data_gas: zero.clone(),
+			l2_gas: zero,
+		}
+	}
+}
+
+/// Starknet invoke transaction payload used by Starknet delivery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StarknetInvokeTransaction {
+	/// Solver network id used to route this invoke to the configured Starknet delivery backend.
+	pub network_id: u64,
+	/// Starknet account address submitting the invoke.
+	pub sender_address: Address,
+	/// Logical calls before account-level calldata formatting.
+	pub calls: Vec<StarknetCall>,
+	/// Account-formatted calldata ready for a Starknet invoke v3 broadcast transaction.
+	///
+	/// This is distinct from `calls`: formatting logical calls depends on the
+	/// Starknet account contract implementation, so delivery only broadcasts a
+	/// transaction when this field is already populated and signed.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub account_calldata: Vec<U256>,
+	/// Account nonce as a felt-compatible integer.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub nonce: Option<U256>,
+	/// Resource bounds. Delivery starts with zero bounds for estimation, then
+	/// fills this with estimated/capped bounds before final signing.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub resource_bounds: Option<StarknetResourceBoundsMapping>,
+	/// Starknet account signature felts for the final invoke transaction.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub signature: Vec<U256>,
+	/// Starknet transaction tip.
+	pub tip: U256,
+	/// Invoke transaction version. Hyperlane Starknet sends v3 transactions.
+	pub version: u8,
+	/// Paymaster data felts for v3 invoke transactions. Empty for native-fee transactions.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub paymaster_data: Vec<U256>,
+	/// Account deployment data felts for v3 invoke transactions. Empty for deployed accounts.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub account_deployment_data: Vec<U256>,
+	/// Starknet nonce data availability mode. Defaults to `L1` at broadcast time.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub nonce_data_availability_mode: Option<String>,
+	/// Starknet fee data availability mode. Defaults to `L1` at broadcast time.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub fee_data_availability_mode: Option<String>,
+	/// Starknet RPC chain id/domain selected for signing.
+	#[serde(
+		rename = "chain_id",
+		alias = "starknet_chain_id",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub starknet_chain_id: Option<String>,
+}
+
+/// Chain execution transaction envelope.
+///
+/// `Transaction` remains EVM-shaped. Starknet invokes carry account-call data
+/// and are routed by `network_id`, so Starknet addresses are not overloaded into
+/// EVM transaction fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionTransaction {
+	Evm(Box<Transaction>),
+	StarknetInvoke(Box<StarknetInvokeTransaction>),
+}
+
+impl Serialize for ExecutionTransaction {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		match self {
+			Self::Evm(tx) => tx.serialize(serializer),
+			Self::StarknetInvoke(tx) => {
+				let mut value = serde_json::to_value(tx).map_err(serde::ser::Error::custom)?;
+				let Value::Object(ref mut object) = value else {
+					return Err(serde::ser::Error::custom(
+						"Starknet invoke transaction must serialize as an object",
+					));
+				};
+				object.insert(
+					"kind".to_string(),
+					Value::String("starknetInvoke".to_string()),
+				);
+				value.serialize(serializer)
+			},
+		}
+	}
+}
+
+impl<'de> Deserialize<'de> for ExecutionTransaction {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		let value = Value::deserialize(deserializer)?;
+		if let Value::Object(mut object) = value {
+			if let Some(kind) = object
+				.remove("kind")
+				.and_then(|kind| kind.as_str().map(str::to_owned))
+			{
+				let value = Value::Object(object);
+				return match kind.as_str() {
+					"evm" => serde_json::from_value(value)
+						.map(|tx| Self::Evm(Box::new(tx)))
+						.map_err(serde::de::Error::custom),
+					"starknetInvoke" | "starknet_invoke" => serde_json::from_value(value)
+						.map(|tx| Self::StarknetInvoke(Box::new(tx)))
+						.map_err(serde::de::Error::custom),
+					other => Err(serde::de::Error::custom(format!(
+						"unknown execution transaction kind: {other}"
+					))),
+				};
+			}
+
+			let value = Value::Object(object);
+			if looks_like_starknet_invoke(&value) {
+				serde_json::from_value(value)
+					.map(|tx| Self::StarknetInvoke(Box::new(tx)))
+					.map_err(serde::de::Error::custom)
+			} else {
+				serde_json::from_value(value)
+					.map(|tx| Self::Evm(Box::new(tx)))
+					.map_err(serde::de::Error::custom)
+			}
+		} else {
+			Err(serde::de::Error::custom(
+				"execution transaction must be a JSON object",
+			))
+		}
+	}
+}
+
+fn looks_like_starknet_invoke(value: &Value) -> bool {
+	let Value::Object(object) = value else {
+		return false;
+	};
+	object.contains_key("sender_address")
+		|| object.contains_key("calls")
+		|| object.contains_key("resource_bounds")
+		|| object.contains_key("starknet_chain_id")
+}
+
+impl ExecutionTransaction {
+	pub fn network_id(&self) -> u64 {
+		match self {
+			Self::Evm(tx) => tx.chain_id,
+			Self::StarknetInvoke(tx) => tx.network_id,
+		}
+	}
+
+	pub fn nonce(&self) -> Option<u64> {
+		match self {
+			Self::Evm(tx) => tx.nonce,
+			Self::StarknetInvoke(tx) => tx
+				.nonce
+				.and_then(|nonce| (nonce <= U256::from(u64::MAX)).then(|| nonce.to::<u64>())),
+		}
+	}
+
+	pub fn as_evm(&self) -> Option<&Transaction> {
+		match self {
+			Self::Evm(tx) => Some(tx.as_ref()),
+			Self::StarknetInvoke(_) => None,
+		}
+	}
+
+	pub fn into_evm(self) -> Option<Transaction> {
+		match self {
+			Self::Evm(tx) => Some(*tx),
+			Self::StarknetInvoke(_) => None,
+		}
+	}
+}
+
+impl From<Transaction> for ExecutionTransaction {
+	fn from(value: Transaction) -> Self {
+		Self::Evm(Box::new(value))
+	}
+}
+
+impl From<StarknetInvokeTransaction> for ExecutionTransaction {
+	fn from(value: StarknetInvokeTransaction) -> Self {
+		Self::StarknetInvoke(Box::new(value))
+	}
 }
 
 /// Conversion from Alloy's TransactionRequest to our Transaction type.
@@ -133,7 +390,18 @@ impl From<Transaction> for TransactionRequest {
 	fn from(tx: Transaction) -> Self {
 		let to = tx.to.map(|to| {
 			let mut addr_bytes = [0u8; 20];
-			addr_bytes.copy_from_slice(&to.0[..20]);
+			match to.0.len() {
+				Address::EVM_LENGTH => addr_bytes.copy_from_slice(&to.0),
+				Address::BYTES32_LENGTH => {
+					if to.0[..12].iter().any(|byte| *byte != 0) {
+						panic!(
+							"Cannot convert non-EVM bytes32 transaction recipient address into Alloy TransactionRequest"
+						);
+					}
+					addr_bytes.copy_from_slice(&to.0[12..]);
+				},
+				len => panic!("Unsupported transaction recipient address length: {len}"),
+			}
 			alloy_primitives::TxKind::Call(AlloyAddress::from(addr_bytes))
 		});
 
@@ -210,6 +478,15 @@ mod tests {
 		let json_no_prefix = "\"a0b86a33e6776fb78b3e1e6b2d0d2e8f0c1d2a3b\"";
 		let address_no_prefix: Address = serde_json::from_str(json_no_prefix).unwrap();
 		assert_eq!(address_no_prefix, expected);
+	}
+
+	#[test]
+	fn test_address_deserialization_valid_bytes32() {
+		let json = "\"0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"";
+		let address: Address = serde_json::from_str(json).unwrap();
+
+		assert!(address.is_bytes32_address());
+		assert_eq!(address.0.len(), Address::BYTES32_LENGTH);
 	}
 
 	#[test]
@@ -429,6 +706,139 @@ mod tests {
 		assert_eq!(req.max_fee_per_gas, Some(40_000_000_000));
 		assert_eq!(req.max_priority_fee_per_gas, Some(2_000_000_000));
 		assert_eq!(req.input.input.unwrap().to_vec(), vec![0xff, 0xee]);
+	}
+
+	#[test]
+	fn test_transaction_to_alloy_request_bytes32_address_uses_rightmost_20_bytes() {
+		use alloy_primitives::{address, TxKind};
+
+		let alloy_addr = address!("A0b86a33E6776Fb78B3e1E6B2D0d2E8F0C1D2A3B");
+		let mut bytes32_address = vec![0u8; 12];
+		bytes32_address.extend_from_slice(alloy_addr.as_slice());
+		let tx = Transaction {
+			to: Some(Address(bytes32_address)),
+			data: Vec::new(),
+			value: U256::ZERO,
+			chain_id: 1,
+			nonce: None,
+			gas_limit: None,
+			gas_price: None,
+			max_fee_per_gas: None,
+			max_priority_fee_per_gas: None,
+		};
+
+		let req: TransactionRequest = tx.into();
+
+		assert_eq!(req.to, Some(TxKind::Call(alloy_addr)));
+	}
+
+	#[test]
+	#[should_panic(
+		expected = "Cannot convert non-EVM bytes32 transaction recipient address into Alloy TransactionRequest"
+	)]
+	fn test_transaction_to_alloy_request_rejects_non_evm_bytes32_recipient() {
+		let tx = Transaction {
+			to: Some(Address(vec![0x11; 32])),
+			data: Vec::new(),
+			value: U256::ZERO,
+			chain_id: 1,
+			nonce: None,
+			gas_limit: None,
+			gas_price: None,
+			max_fee_per_gas: None,
+			max_priority_fee_per_gas: None,
+		};
+
+		let _req: TransactionRequest = tx.into();
+	}
+
+	#[test]
+	fn test_starknet_resource_bounds_zero() {
+		let bounds = StarknetResourceBoundsMapping::zero();
+
+		assert_eq!(bounds.l1_gas.max_amount, U256::ZERO);
+		assert_eq!(bounds.l1_data_gas.max_price_per_unit, U256::ZERO);
+		assert_eq!(bounds.l2_gas.max_amount, U256::ZERO);
+	}
+
+	#[test]
+	fn test_starknet_invoke_transaction_serialization() {
+		let invoke = StarknetInvokeTransaction {
+			network_id: 11155111,
+			sender_address: Address(vec![0x11; 32]),
+			calls: vec![StarknetCall {
+				contract_address: Address(vec![0x22; 32]),
+				entry_point_selector: [0x33; 32],
+				calldata: vec![U256::from(1), U256::from(2)],
+			}],
+			account_calldata: Vec::new(),
+			nonce: Some(U256::from(7)),
+			resource_bounds: Some(StarknetResourceBoundsMapping::zero()),
+			signature: Vec::new(),
+			tip: U256::ZERO,
+			version: 3,
+			paymaster_data: Vec::new(),
+			account_deployment_data: Vec::new(),
+			nonce_data_availability_mode: None,
+			fee_data_availability_mode: None,
+			starknet_chain_id: Some("SN_SEPOLIA".to_string()),
+		};
+
+		let json = serde_json::to_string(&invoke).unwrap();
+		let decoded: StarknetInvokeTransaction = serde_json::from_str(&json).unwrap();
+
+		assert_eq!(decoded, invoke);
+		assert!(decoded.sender_address.is_bytes32_address());
+	}
+
+	#[test]
+	fn test_execution_transaction_evm_serializes_like_transaction() {
+		let tx = TransactionBuilder::new()
+			.chain_id(137)
+			.nonce(12)
+			.gas_price_gwei(20)
+			.build();
+		let envelope = ExecutionTransaction::from(tx.clone());
+
+		assert_eq!(envelope.network_id(), 137);
+		assert_eq!(envelope.nonce(), Some(12));
+		assert_eq!(
+			serde_json::to_value(&envelope).unwrap(),
+			serde_json::to_value(&tx).unwrap()
+		);
+
+		let decoded: ExecutionTransaction =
+			serde_json::from_value(serde_json::to_value(&tx).unwrap()).unwrap();
+		assert_eq!(decoded, envelope);
+	}
+
+	#[test]
+	fn test_execution_transaction_starknet_routes_by_network_id() {
+		let invoke = StarknetInvokeTransaction {
+			network_id: 11155111,
+			sender_address: Address(vec![0x11; 32]),
+			calls: vec![],
+			account_calldata: Vec::new(),
+			nonce: Some(U256::from(7)),
+			resource_bounds: None,
+			signature: Vec::new(),
+			tip: U256::ZERO,
+			version: 3,
+			paymaster_data: Vec::new(),
+			account_deployment_data: Vec::new(),
+			nonce_data_availability_mode: None,
+			fee_data_availability_mode: None,
+			starknet_chain_id: Some("SN_SEPOLIA".to_string()),
+		};
+		let envelope = ExecutionTransaction::from(invoke.clone());
+
+		assert_eq!(envelope.network_id(), 11155111);
+		assert_eq!(envelope.nonce(), Some(7));
+		assert!(envelope.as_evm().is_none());
+
+		let decoded: ExecutionTransaction =
+			serde_json::from_value(serde_json::to_value(&envelope).unwrap()).unwrap();
+		assert_eq!(decoded, ExecutionTransaction::from(invoke));
 	}
 
 	#[test]

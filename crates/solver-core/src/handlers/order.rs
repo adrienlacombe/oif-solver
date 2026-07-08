@@ -19,12 +19,16 @@ use solver_delivery::{
 use solver_order::OrderService;
 use solver_storage::StorageService;
 use solver_types::{
-	select_source_finality_head,
-	standards::eip7683::{interfaces::IInputSettlerEscrow, LockType},
+	current_timestamp, select_source_finality_head,
+	standards::{
+		eip7683::{interfaces::IInputSettlerEscrow, LockType},
+		hyperlane7683::{Hyperlane7683ResolvedOrder, HYPERLANE7683_STANDARD},
+	},
 	truncate_id,
 	utils::conversion::hex_to_alloy_address,
-	Address, DeliveryEvent, Eip7683OrderData, ExecutionParams, Order, OrderEvent, OrderStatus,
-	SolverEvent, StorageKey, Transaction, TransactionType,
+	Address, DeliveryEvent, Eip7683OrderData, ExecutionParams, FillProof, Order, OrderEvent,
+	OrderStatus, SettlementEvent, SolverEvent, StorageKey, Transaction, TransactionHash,
+	TransactionType,
 };
 use std::{sync::Arc, time::Duration};
 use thiserror::Error;
@@ -34,10 +38,19 @@ use tracing::instrument;
 const ESCROW_ORDER_STATUS_DEPOSITED: u8 = 1;
 const ESCROW_ORDER_STATUS_NONE: u8 = 0;
 const SOURCE_FINALITY_RETRY_AFTER: Duration = Duration::from_secs(5);
+const HYPERLANE7683_PREFLIGHT_RETRY_AFTER: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EscrowDepositReadiness {
 	Ready,
+	Defer(Duration),
+}
+
+#[derive(Debug)]
+enum Hyperlane7683FillPreflight {
+	Proceed,
+	ProceedWith(Box<Order>),
+	SkipToClaim(Box<Hyperlane7683ResolvedOrder>),
 	Defer(Duration),
 }
 
@@ -106,6 +119,64 @@ impl OrderHandler {
 
 	fn transaction_attempt_recorder(&self) -> Arc<dyn TransactionAttemptRecorder> {
 		Arc::new(TransactionAttemptStore::new(self.storage.clone()))
+	}
+
+	async fn handle_existing_fill_transaction(&self, order: &Order) -> Result<bool, OrderError> {
+		if order.expected_fill_transaction_count() > 1 || order.fill_transaction_hashes().len() > 1
+		{
+			tracing::debug!(
+				order_id = %truncate_id(&order.id),
+				"Skipping scalar existing-fill shortcut for multi-fill order"
+			);
+			return Ok(false);
+		};
+
+		let Some(fill_tx_hash) = order.fill_tx_hash.clone() else {
+			return Ok(false);
+		};
+		let chain_id = order
+			.output_chains
+			.first()
+			.map(|chain| chain.chain_id)
+			.ok_or_else(|| {
+				OrderError::Service(
+					"Order has fill_tx_hash but no output chain to check receipt".to_string(),
+				)
+			})?;
+
+		match self.delivery.get_receipt(&fill_tx_hash, chain_id).await {
+			Ok(receipt) if receipt.success => {
+				tracing::info!(
+					order_id = %truncate_id(&order.id),
+					tx_hash = %truncate_id(&hex::encode(&fill_tx_hash.0)),
+					chain_id,
+					"Existing fill transaction is already confirmed; republishing confirmation"
+				);
+				self.event_bus
+					.publish(SolverEvent::Delivery(DeliveryEvent::TransactionConfirmed {
+						order_id: order.id.clone(),
+						tx_hash: fill_tx_hash,
+						tx_type: TransactionType::Fill,
+						receipt,
+					}))
+					.ok();
+				Ok(true)
+			},
+			Ok(_receipt) => Err(OrderError::Service(format!(
+				"Existing fill transaction {} on chain {chain_id} reverted",
+				hex::encode_prefixed(&fill_tx_hash.0)
+			))),
+			Err(error) => {
+				tracing::info!(
+					order_id = %truncate_id(&order.id),
+					tx_hash = %truncate_id(&hex::encode(&fill_tx_hash.0)),
+					chain_id,
+					error = %error,
+					"Fill transaction hash already exists; skipping duplicate fill submission"
+				);
+				Ok(true)
+			},
+		}
 	}
 
 	/// Handles order preparation for off-chain orders.
@@ -534,6 +605,136 @@ impl OrderHandler {
 		Ok(EscrowDepositReadiness::Ready)
 	}
 
+	async fn check_hyperlane7683_fill_preflight(
+		&self,
+		order: &Order,
+	) -> Result<Hyperlane7683FillPreflight, OrderError> {
+		if order.standard != HYPERLANE7683_STANDARD {
+			return Ok(Hyperlane7683FillPreflight::Proceed);
+		}
+
+		let resolved: Hyperlane7683ResolvedOrder = serde_json::from_value(order.data.clone())
+			.map_err(|e| {
+				OrderError::Service(format!(
+					"Failed to parse Hyperlane7683 resolved order data: {e}"
+				))
+			})?;
+		if resolved.fill_instructions.is_empty() {
+			return Ok(Hyperlane7683FillPreflight::Proceed);
+		}
+
+		let mut complete = 0usize;
+		let mut incomplete = 0usize;
+		let mut incomplete_instructions = Vec::new();
+		for instruction in &resolved.fill_instructions {
+			let destination_chain_id = instruction.destination_domain().map_err(|e| {
+				OrderError::Service(format!(
+					"Invalid Hyperlane7683 destination chain id for preflight: {e}"
+				))
+			})?;
+			let destination_settler = Address(instruction.destination_settler.to_vec());
+			let status = match self
+				.delivery
+				.get_hyperlane7683_order_status(
+					u64::from(destination_chain_id),
+					&destination_settler,
+					resolved.order_id,
+				)
+				.await
+			{
+				Ok(status) => status,
+				Err(e) => {
+					tracing::warn!(
+						order_id = %truncate_id(&order.id),
+						destination_chain_id,
+						destination_settler = %destination_settler,
+						error = %e,
+						"Hyperlane7683 fill status preflight failed; deferring fill"
+					);
+					return Ok(Hyperlane7683FillPreflight::Defer(
+						HYPERLANE7683_PREFLIGHT_RETRY_AFTER,
+					));
+				},
+			};
+
+			tracing::debug!(
+				order_id = %truncate_id(&order.id),
+				destination_chain_id,
+				destination_settler = %destination_settler,
+				status = ?status,
+				"Hyperlane7683 destination fill status preflight result"
+			);
+			if status.is_fill_complete() {
+				complete += 1;
+			} else {
+				incomplete += 1;
+				incomplete_instructions.push(instruction.clone());
+			}
+		}
+
+		match (complete, incomplete) {
+			(0, _) => Ok(Hyperlane7683FillPreflight::Proceed),
+			(_, 0) => Ok(Hyperlane7683FillPreflight::SkipToClaim(Box::new(resolved))),
+			_ => {
+				tracing::info!(
+					order_id = %truncate_id(&order.id),
+					complete,
+					incomplete,
+					"Hyperlane7683 partial fill preflight will generate fills for incomplete destination legs only"
+				);
+				let mut filtered = resolved;
+				filtered.fill_instructions = incomplete_instructions;
+				let mut fill_order = order.clone();
+				fill_order.data = serde_json::to_value(filtered).map_err(|e| {
+					OrderError::Service(format!(
+						"Failed to serialize filtered Hyperlane7683 fill order: {e}"
+					))
+				})?;
+				Ok(Hyperlane7683FillPreflight::ProceedWith(Box::new(
+					fill_order,
+				)))
+			},
+		}
+	}
+
+	async fn mark_hyperlane7683_prefilled_order_claim_ready(
+		&self,
+		order: &Order,
+		resolved: &Hyperlane7683ResolvedOrder,
+	) -> Result<(), OrderError> {
+		let synthetic_fill_hash = TransactionHash(resolved.order_id.to_vec());
+		let hash_for_transition = synthetic_fill_hash.clone();
+		self.state_machine
+			.try_transition_order_status(&order.id, OrderStatus::Executed, move |stored| {
+				stored.add_fill_transaction_hash(hash_for_transition.clone());
+			})
+			.await
+			.map_err(|e| OrderError::State(e.to_string()))?;
+
+		let fill_proof = FillProof {
+			tx_hash: synthetic_fill_hash,
+			block_number: 0,
+			attestation_data: None,
+			filled_timestamp: current_timestamp(),
+			oracle_address: "0x0000000000000000000000000000000000000000".to_string(),
+		};
+		self.state_machine
+			.set_fill_proof(&order.id, fill_proof)
+			.await
+			.map_err(|e| OrderError::State(e.to_string()))?;
+		self.state_machine
+			.try_transition_order_status(&order.id, OrderStatus::Settled, |_| {})
+			.await
+			.map_err(|e| OrderError::State(e.to_string()))?;
+		self.event_bus
+			.publish(SolverEvent::Settlement(SettlementEvent::ClaimReady {
+				order_id: order.id.clone(),
+			}))
+			.ok();
+
+		Ok(())
+	}
+
 	/// Handles order execution by generating and submitting a fill transaction.
 	#[instrument(skip_all, fields(order_id = %truncate_id(&order.id)))]
 	pub async fn handle_execution(
@@ -546,6 +747,10 @@ impl OrderHandler {
 				"Order {} requires preparation before fill, but prepare_tx_hash is missing",
 				order.id
 			)));
+		}
+
+		if self.handle_existing_fill_transaction(&order).await? {
+			return Ok(());
 		}
 
 		// (C-03) Just-in-time forced-withdrawal guard for ResourceLock orders. This is
@@ -567,137 +772,190 @@ impl OrderHandler {
 			},
 		}
 
-		// Generate fill transaction
-		let tx = self
-			.order_service
-			.generate_fill_transaction(&order, &params)
-			.await
-			.map_err(|e| OrderError::Service(e.to_string()))?;
-
-		// Submit transaction with monitoring
-		let event_bus = self.event_bus.clone();
-		let callback = Box::new(move |event: TransactionMonitoringEvent| match event {
-			TransactionMonitoringEvent::Confirmed {
-				id,
-				tx_hash,
-				tx_type,
-				receipt,
-			} => {
-				event_bus
-					.publish(SolverEvent::Delivery(DeliveryEvent::TransactionConfirmed {
-						order_id: id,
-						tx_hash,
-						tx_type,
-						receipt,
+		let fill_order = match self.check_hyperlane7683_fill_preflight(&order).await? {
+			Hyperlane7683FillPreflight::Proceed => order.clone(),
+			Hyperlane7683FillPreflight::ProceedWith(fill_order) => *fill_order,
+			Hyperlane7683FillPreflight::SkipToClaim(resolved) => {
+				return self
+					.mark_hyperlane7683_prefilled_order_claim_ready(&order, &resolved)
+					.await;
+			},
+			Hyperlane7683FillPreflight::Defer(retry_after) => {
+				self.event_bus
+					.publish(SolverEvent::Order(OrderEvent::Deferred {
+						order_id: order.id,
+						retry_after,
 					}))
 					.ok();
+				return Ok(());
 			},
-			TransactionMonitoringEvent::Failed {
-				id,
-				tx_hash,
-				tx_type,
-				error,
-				classification,
-			} => match classification {
-				RevertClassification::StageComplete { reason } => {
-					tracing::info!(
-						order_id = %id,
-						?tx_type,
-						?reason,
-						?tx_hash,
-						"Revert classified as stage-complete; deferring to recovery for chain confirmation"
-					);
-				},
-				RevertClassification::Terminal { .. } | RevertClassification::Unknown => {
+		};
+
+		// Generate fill transactions. Most standards return one transaction;
+		// multi-leg standards return one scoped transaction per fill leg.
+		let fill_txs = self
+			.order_service
+			.generate_fill_execution_transactions(&fill_order, &params)
+			.await
+			.map_err(|e| OrderError::Service(e.to_string()))?;
+		if fill_txs.is_empty() {
+			return Err(OrderError::Service(
+				"Fill transaction generation returned no transactions".to_string(),
+			));
+		}
+		if fill_txs.len() > 1 {
+			self.state_machine
+				.update_order_with(&order.id, |stored| {
+					stored.expected_fill_tx_count = Some(fill_txs.len());
+				})
+				.await
+				.map_err(|e| OrderError::State(e.to_string()))?;
+		}
+
+		for tx in fill_txs {
+			// Submit transaction with monitoring
+			let event_bus = self.event_bus.clone();
+			let callback = Box::new(move |event: TransactionMonitoringEvent| match event {
+				TransactionMonitoringEvent::Confirmed {
+					id,
+					tx_hash,
+					tx_type,
+					receipt,
+				} => {
 					event_bus
-						.publish(SolverEvent::Delivery(DeliveryEvent::TransactionFailed {
+						.publish(SolverEvent::Delivery(DeliveryEvent::TransactionConfirmed {
 							order_id: id,
 							tx_hash,
 							tx_type,
-							error,
+							receipt,
 						}))
 						.ok();
 				},
-			},
-			TransactionMonitoringEvent::Indeterminate {
-				id: order_id,
-				tx_hash,
-				tx_type,
-				reason,
-			} => {
-				tracing::warn!(
-					%order_id,
-					?tx_hash,
-					?tx_type,
-					%reason,
-					"Live tx monitor indeterminate; order left in current status"
-				);
-			},
-			TransactionMonitoringEvent::AttemptLedgerConflict {
-				id,
-				attempt_id,
-				tx_type,
-				tx_hash,
-				attempted_status,
-				error,
-				context,
-			} => {
-				event_bus
-					.publish(SolverEvent::Delivery(
-						DeliveryEvent::TransactionAttemptLedgerConflict {
-							order_id: id,
-							attempt_id,
-							tx_type,
-							tx_hash,
-							attempted_status,
-							error,
-							context: context.to_string(),
-						},
-					))
-					.ok();
-			},
-		});
+				TransactionMonitoringEvent::Failed {
+					id,
+					tx_hash,
+					tx_type,
+					error,
+					classification,
+				} => match classification {
+					RevertClassification::StageComplete { reason } => {
+						tracing::info!(
+							order_id = %id,
+							?tx_type,
+							?reason,
+							?tx_hash,
+							"Revert classified as stage-complete; deferring to recovery for chain confirmation"
+						);
+					},
+					RevertClassification::Terminal { .. } | RevertClassification::Unknown => {
+						event_bus
+							.publish(SolverEvent::Delivery(DeliveryEvent::TransactionFailed {
+								order_id: id,
+								tx_hash,
+								tx_type,
+								error,
+							}))
+							.ok();
+					},
+				},
+				TransactionMonitoringEvent::Indeterminate {
+					id: order_id,
+					tx_hash,
+					tx_type,
+					reason,
+				} => {
+					tracing::warn!(
+						%order_id,
+						?tx_hash,
+						?tx_type,
+						%reason,
+						"Live tx monitor indeterminate; order left in current status"
+					);
+				},
+				TransactionMonitoringEvent::AttemptLedgerConflict {
+					id,
+					attempt_id,
+					tx_type,
+					tx_hash,
+					attempted_status,
+					error,
+					context,
+				} => {
+					event_bus
+						.publish(SolverEvent::Delivery(
+							DeliveryEvent::TransactionAttemptLedgerConflict {
+								order_id: id,
+								attempt_id,
+								tx_type,
+								tx_hash,
+								attempted_status,
+								error,
+								context: context.to_string(),
+							},
+						))
+						.ok();
+				},
+			});
 
-		let tracking = TransactionTracking {
-			id: order.id.clone(),
-			tx_type: TransactionType::Fill,
-			attempt_recorder: self.transaction_attempt_recorder(),
-			callback,
-			attempt_id: None,
-			replacement_of: None,
-		};
-
-		let tx_hash = self
-			.delivery
-			.deliver(tx.clone(), Some(tracking))
-			.await
-			.map_err(|e| OrderError::Service(e.to_string()))?;
-
-		self.event_bus
-			.publish(SolverEvent::Delivery(DeliveryEvent::TransactionPending {
-				order_id: order.id.clone(),
-				tx_hash: tx_hash.clone(),
+			let tracking = TransactionTracking {
+				id: order.id.clone(),
 				tx_type: TransactionType::Fill,
-				tx_chain_id: tx.chain_id,
-			}))
-			.ok();
+				attempt_recorder: self.transaction_attempt_recorder(),
+				callback,
+				attempt_id: None,
+				replacement_of: None,
+			};
 
-		// Store fill transaction
-		self.state_machine
-			.set_transaction_hash(&order.id, tx_hash.clone(), TransactionType::Fill)
-			.await
-			.map_err(|e| OrderError::State(e.to_string()))?;
+			let tx_hash = self
+				.delivery
+				.deliver_execution(tx.clone(), Some(tracking))
+				.await
+				.map_err(|e| OrderError::Service(e.to_string()))?;
 
-		// Store reverse mapping: tx_hash -> order_id
-		self.storage
-			.store(
-				StorageKey::OrderByTxHash.as_str(),
-				&hex::encode(&tx_hash.0),
-				&order.id,
-				None,
-			)
-			.await
-			.map_err(|e| OrderError::Storage(e.to_string()))?;
+			self.event_bus
+				.publish(SolverEvent::Delivery(DeliveryEvent::TransactionPending {
+					order_id: order.id.clone(),
+					tx_hash: tx_hash.clone(),
+					tx_type: TransactionType::Fill,
+					tx_chain_id: tx.network_id(),
+				}))
+				.ok();
+
+			// The fill transaction is now submitted. Keep metadata writes best-effort so
+			// a transient storage failure cannot terminally fail an order with a live tx.
+			if let Err(e) = self
+				.state_machine
+				.set_transaction_hash(&order.id, tx_hash.clone(), TransactionType::Fill)
+				.await
+			{
+				tracing::warn!(
+					order_id = %truncate_id(&order.id),
+					tx_type = ?TransactionType::Fill,
+					tx_hash = %truncate_id(&hex::encode(&tx_hash.0)),
+					error = %e,
+					"fill transaction submitted but tx hash persistence failed; recovery will use attempt ledger"
+				);
+			}
+
+			if let Err(e) = self
+				.storage
+				.store(
+					StorageKey::OrderByTxHash.as_str(),
+					&hex::encode(&tx_hash.0),
+					&order.id,
+					None,
+				)
+				.await
+			{
+				tracing::warn!(
+					order_id = %truncate_id(&order.id),
+					tx_type = ?TransactionType::Fill,
+					tx_hash = %truncate_id(&hex::encode(&tx_hash.0)),
+					error = %e,
+					"fill transaction submitted but reverse tx index persistence failed"
+				);
+			}
+		}
 
 		Ok(())
 	}
@@ -711,15 +969,18 @@ mod tests {
 	use alloy_primitives::U256;
 	use solver_delivery::{DeliveryService, MockDeliveryInterface};
 	use solver_order::{MockOrderInterface, OrderService};
-	use solver_storage::{MockStorageInterface, StorageService};
+	use solver_storage::{
+		implementations::memory::MemoryStorage, MockStorageInterface, StorageService,
+	};
 	use solver_types::networks::{NetworkConfig, NetworkType, RpcEndpoint};
 	use solver_types::utils::tests::builders::{
-		Eip7683OrderDataBuilder, OrderBuilder, TransactionBuilder,
+		Eip7683OrderDataBuilder, OrderBuilder, TransactionBuilder, TransactionReceiptBuilder,
 	};
 	use solver_types::{
-		ExecutionParams, Order, SolverEvent, Transaction, TransactionHash, TransactionType,
+		ExecutionParams, Hyperlane7683FillInstruction, Hyperlane7683OrderStatus,
+		Hyperlane7683Output, Order, SolverEvent, Transaction, TransactionType,
 	};
-	use std::collections::HashMap;
+	use std::collections::{HashMap, VecDeque};
 	use std::sync::Arc;
 	use tokio::sync::broadcast;
 
@@ -732,6 +993,57 @@ mod tests {
 			gas_price: U256::from(20_000_000_000u64),         // 20 gwei
 			priority_fee: Some(U256::from(1_000_000_000u64)), // 1 gwei
 		}
+	}
+
+	fn bytes32(byte: u8) -> [u8; 32] {
+		[byte; 32]
+	}
+
+	fn hyperlane_fill_instruction(
+		destination_chain_id: u64,
+		settler: [u8; 32],
+	) -> Hyperlane7683FillInstruction {
+		Hyperlane7683FillInstruction {
+			destination_chain_id: U256::from(destination_chain_id),
+			destination_settler: settler,
+			origin_data: vec![0x01, 0x02],
+		}
+	}
+
+	fn hyperlane_resolved_order(
+		order_id: [u8; 32],
+		fill_instructions: Vec<Hyperlane7683FillInstruction>,
+	) -> Hyperlane7683ResolvedOrder {
+		Hyperlane7683ResolvedOrder {
+			user: bytes32(0x11),
+			origin_chain_id: U256::from(1),
+			open_deadline: 1,
+			fill_deadline: 2,
+			order_id,
+			max_spent: vec![Hyperlane7683Output {
+				token: bytes32(0x22),
+				amount: U256::from(1000),
+				recipient: bytes32(0x33),
+				chain_id: U256::from(137),
+			}],
+			min_received: vec![Hyperlane7683Output {
+				token: bytes32(0x44),
+				amount: U256::from(900),
+				recipient: bytes32(0x55),
+				chain_id: U256::from(1),
+			}],
+			fill_instructions,
+		}
+	}
+
+	fn hyperlane_order(id: &str, resolved: &Hyperlane7683ResolvedOrder) -> Order {
+		OrderBuilder::new()
+			.with_id(id)
+			.with_standard(HYPERLANE7683_STANDARD)
+			.with_status(OrderStatus::Executing)
+			.with_data(serde_json::to_value(resolved).unwrap())
+			.with_output_chain_ids(vec![137])
+			.build()
 	}
 
 	fn create_test_transaction() -> Transaction {
@@ -754,6 +1066,7 @@ mod tests {
 		let network = NetworkConfig {
 			name: None,
 			network_type: NetworkType::default(),
+			kind: Default::default(),
 			rpc_urls: vec![RpcEndpoint::http_only("http://localhost:8545".to_string())],
 			input_settler_address: test_input_settler_address(),
 			output_settler_address: solver_types::Address(vec![0x22u8; 20]),
@@ -879,11 +1192,11 @@ mod tests {
 			|mock_order| {
 				let fill_tx_clone = fill_tx_clone.clone();
 				mock_order
-					.expect_generate_fill_transaction()
+					.expect_generate_fill_execution_transactions()
 					.times(1)
 					.returning(move |_, _| {
 						let tx = fill_tx_clone.clone();
-						Box::pin(async move { Ok(tx) })
+						Box::pin(async move { Ok(vec![tx.into()]) })
 					});
 			},
 			|mock_delivery| {
@@ -937,7 +1250,7 @@ mod tests {
 		.await;
 
 		let result = handler.handle_execution(order.clone(), params).await;
-		assert!(result.is_ok());
+		assert!(result.is_ok(), "unexpected execution error: {result:?}");
 
 		let event = tokio::time::timeout(std::time::Duration::from_millis(100), event_rx.recv())
 			.await
@@ -953,6 +1266,141 @@ mod tests {
 			}) => {
 				assert_eq!(order_id, order.id);
 				assert_eq!(tx_hash, fill_tx_hash);
+				assert_eq!(tx_type, TransactionType::Fill);
+				assert_eq!(tx_chain_id, fill_tx.chain_id);
+			},
+			_ => panic!("Expected TransactionPending event"),
+		}
+	}
+
+	#[tokio::test]
+	async fn handle_execution_replays_existing_successful_fill_confirmation() {
+		let params = create_test_execution_params();
+		let fill_tx_hash = create_test_tx_hash();
+		let receipt = TransactionReceiptBuilder::new()
+			.with_hash(fill_tx_hash.clone())
+			.with_success(true)
+			.build();
+		let order = OrderBuilder::new()
+			.with_fill_tx_hash(Some(fill_tx_hash.clone()))
+			.with_output_chain_ids(vec![137])
+			.build();
+		let receipt_clone = receipt.clone();
+		let hash_for_mock = fill_tx_hash.clone();
+
+		let (handler, mut event_rx) = create_test_handler_with_mocks(
+			|mock_order| {
+				mock_order
+					.expect_generate_fill_execution_transactions()
+					.times(0);
+			},
+			|mock_delivery| {
+				mock_delivery
+					.expect_get_receipt()
+					.times(1)
+					.withf(move |hash, chain_id| hash == &hash_for_mock && *chain_id == 137)
+					.returning(move |_, _| {
+						let receipt = receipt_clone.clone();
+						Box::pin(async move { Ok(receipt) })
+					});
+				mock_delivery.expect_submit().times(0);
+			},
+			|_mock_storage| {},
+		)
+		.await;
+
+		let result = handler.handle_execution(order.clone(), params).await;
+		assert!(result.is_ok(), "unexpected execution error: {result:?}");
+
+		let event = tokio::time::timeout(std::time::Duration::from_millis(100), event_rx.recv())
+			.await
+			.expect("Should receive event")
+			.expect("Event should be valid");
+
+		match event {
+			SolverEvent::Delivery(DeliveryEvent::TransactionConfirmed {
+				order_id,
+				tx_hash,
+				tx_type,
+				receipt: actual_receipt,
+			}) => {
+				assert_eq!(order_id, order.id);
+				assert_eq!(tx_hash, fill_tx_hash);
+				assert_eq!(tx_type, TransactionType::Fill);
+				assert_eq!(actual_receipt.hash, receipt.hash);
+				assert!(actual_receipt.success);
+			},
+			_ => panic!("Expected TransactionConfirmed event"),
+		}
+	}
+
+	#[tokio::test]
+	async fn handle_execution_does_not_use_scalar_existing_fill_shortcut_for_multi_fill_order() {
+		let params = create_test_execution_params();
+		let existing_fill_hash = create_test_tx_hash();
+		let submitted_fill_hash = TransactionHash(vec![0x77; 32]);
+		let fill_tx = create_test_transaction();
+		let order = OrderBuilder::new()
+			.with_fill_tx_hash(Some(existing_fill_hash))
+			.with_expected_fill_tx_count(Some(2))
+			.with_output_chain_ids(vec![137])
+			.build();
+		let fill_tx_for_mock = fill_tx.clone();
+		let submitted_fill_hash_for_mock = submitted_fill_hash.clone();
+		let order_for_storage = order.clone();
+
+		let (handler, mut event_rx) = create_test_handler_with_mocks(
+			|mock_order| {
+				mock_order
+					.expect_generate_fill_execution_transactions()
+					.times(1)
+					.returning(move |_, _| {
+						let tx = fill_tx_for_mock.clone();
+						Box::pin(async move { Ok(vec![tx.into()]) })
+					});
+			},
+			|mock_delivery| {
+				mock_delivery.expect_get_receipt().times(0);
+				mock_delivery
+					.expect_submit()
+					.times(1)
+					.returning(move |_tx, _tracking| {
+						let hash = submitted_fill_hash_for_mock.clone();
+						Box::pin(async move { Ok(hash) })
+					});
+			},
+			|mock_storage| {
+				mock_storage
+					.expect_set_bytes()
+					.times(1)
+					.returning(|_, _, _, _| Box::pin(async { Ok(()) }));
+				mock_storage
+					.expect_exists()
+					.returning(|_| Box::pin(async { Ok(true) }));
+				mock_storage.expect_get_bytes().returning(move |_| {
+					let order = order_for_storage.clone();
+					Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+				});
+			},
+		)
+		.await;
+
+		let result = handler.handle_execution(order.clone(), params).await;
+		assert!(result.is_ok(), "unexpected execution error: {result:?}");
+
+		let event = tokio::time::timeout(std::time::Duration::from_millis(100), event_rx.recv())
+			.await
+			.expect("Should receive event")
+			.expect("Event should be valid");
+		match event {
+			SolverEvent::Delivery(DeliveryEvent::TransactionPending {
+				order_id,
+				tx_hash,
+				tx_type,
+				tx_chain_id,
+			}) => {
+				assert_eq!(order_id, order.id);
+				assert_eq!(tx_hash, submitted_fill_hash);
 				assert_eq!(tx_type, TransactionType::Fill);
 				assert_eq!(tx_chain_id, fill_tx.chain_id);
 			},
@@ -1039,6 +1487,214 @@ mod tests {
 		);
 
 		(handler, event_rx)
+	}
+
+	async fn create_memory_handler_with_order<F1, F2>(
+		order: &Order,
+		setup_order: F1,
+		setup_delivery: F2,
+	) -> (
+		OrderHandler,
+		broadcast::Receiver<SolverEvent>,
+		Arc<StorageService>,
+	)
+	where
+		F1: FnOnce(&mut MockOrderInterface),
+		F2: FnOnce(&mut MockDeliveryInterface),
+	{
+		let mut mock_order = MockOrderInterface::new();
+		let mut mock_delivery = MockDeliveryInterface::new();
+		setup_order(&mut mock_order);
+		setup_delivery(&mut mock_delivery);
+		mock_delivery
+			.expect_get_finality_tag_block_number()
+			.returning(|_, _| Box::pin(async { Ok(None) }));
+
+		let order_service = Arc::new(OrderService::new(
+			HashMap::from([(
+				order.standard.clone(),
+				Box::new(mock_order) as Box<dyn solver_order::OrderInterface>,
+			)]),
+			Box::new(solver_order::MockExecutionStrategy::new()),
+		));
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([(
+				137u64,
+				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]),
+			1,
+			20,
+			60,
+		));
+		let storage = Arc::new(StorageService::new(Box::new(MemoryStorage::new())));
+		storage
+			.store(StorageKey::Orders.as_str(), &order.id, order, None)
+			.await
+			.unwrap();
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let event_rx = event_bus.subscribe();
+		let handler = OrderHandler::new(
+			order_service,
+			delivery,
+			storage.clone(),
+			state_machine,
+			event_bus,
+			Arc::new(RwLock::new(create_test_config())),
+		);
+
+		(handler, event_rx, storage)
+	}
+
+	#[tokio::test]
+	async fn handle_execution_hyperlane_filled_preflight_skips_fill_and_emits_claim_ready() {
+		let params = create_test_execution_params();
+		let order_id = bytes32(0x42);
+		let destination_settler = bytes32(0x77);
+		let resolved = hyperlane_resolved_order(
+			order_id,
+			vec![hyperlane_fill_instruction(137, destination_settler)],
+		);
+		let order = hyperlane_order("hyperlane-prefilled", &resolved);
+		let expected_order_id = order.id.clone();
+		let expected_settler = Address(destination_settler.to_vec());
+
+		let (handler, mut event_rx, storage) = create_memory_handler_with_order(
+			&order,
+			|mock_order| {
+				mock_order
+					.expect_generate_fill_execution_transactions()
+					.times(0);
+			},
+			|mock_delivery| {
+				mock_delivery
+					.expect_get_hyperlane7683_order_status()
+					.times(1)
+					.withf(move |chain_id, settler, actual_order_id| {
+						*chain_id == 137
+							&& settler == &expected_settler
+							&& actual_order_id == &order_id
+					})
+					.returning(|_, _, _| Box::pin(async { Ok(Hyperlane7683OrderStatus::Filled) }));
+			},
+		)
+		.await;
+
+		let result = handler.handle_execution(order.clone(), params).await;
+		assert!(result.is_ok(), "unexpected execution error: {result:?}");
+
+		let stored: Order = storage
+			.retrieve(StorageKey::Orders.as_str(), &order.id)
+			.await
+			.unwrap();
+		assert_eq!(stored.status, OrderStatus::Settled);
+		assert_eq!(
+			stored.fill_transaction_hashes(),
+			vec![TransactionHash(order_id.to_vec())]
+		);
+		assert_eq!(
+			stored
+				.fill_proof
+				.as_ref()
+				.map(|proof| proof.tx_hash.clone()),
+			Some(TransactionHash(order_id.to_vec()))
+		);
+
+		let event = tokio::time::timeout(std::time::Duration::from_millis(100), event_rx.recv())
+			.await
+			.expect("Should receive event")
+			.expect("Event should be valid");
+		match event {
+			SolverEvent::Settlement(SettlementEvent::ClaimReady { order_id }) => {
+				assert_eq!(order_id, expected_order_id);
+			},
+			_ => panic!("Expected ClaimReady event, got {event:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn handle_execution_hyperlane_mixed_preflight_fills_only_incomplete_legs() {
+		let params = create_test_execution_params();
+		let resolved = hyperlane_resolved_order(
+			bytes32(0x43),
+			vec![
+				hyperlane_fill_instruction(137, bytes32(0x77)),
+				hyperlane_fill_instruction(137, bytes32(0x78)),
+			],
+		);
+		let order = hyperlane_order("hyperlane-partial-prefill", &resolved);
+		let statuses = Arc::new(std::sync::Mutex::new(VecDeque::from([
+			Hyperlane7683OrderStatus::Filled,
+			Hyperlane7683OrderStatus::Unknown,
+		])));
+		let fill_tx_hash = create_test_tx_hash();
+
+		let (handler, mut event_rx, storage) = create_memory_handler_with_order(
+			&order,
+			|mock_order| {
+				mock_order
+					.expect_generate_fill_execution_transactions()
+					.times(1)
+					.withf(|order, _| {
+						let resolved: Hyperlane7683ResolvedOrder =
+							serde_json::from_value(order.data.clone()).unwrap();
+						resolved.fill_instructions.len() == 1
+							&& resolved.fill_instructions[0].destination_settler == bytes32(0x78)
+					})
+					.returning(|_, _| {
+						Box::pin(async { Ok(vec![create_test_transaction().into()]) })
+					});
+			},
+			|mock_delivery| {
+				let statuses = statuses.clone();
+				let fill_tx_hash = fill_tx_hash.clone();
+				mock_delivery
+					.expect_get_hyperlane7683_order_status()
+					.times(2)
+					.returning(move |_, _, _| {
+						let status = statuses.lock().unwrap().pop_front().unwrap();
+						Box::pin(async move { Ok(status) })
+					});
+				mock_delivery
+					.expect_submit()
+					.times(1)
+					.returning(move |_, _| {
+						let hash = fill_tx_hash.clone();
+						Box::pin(async move { Ok(hash) })
+					});
+			},
+		)
+		.await;
+
+		let result = handler.handle_execution(order.clone(), params).await;
+		assert!(result.is_ok(), "unexpected execution error: {result:?}");
+
+		let stored: Order = storage
+			.retrieve(StorageKey::Orders.as_str(), &order.id)
+			.await
+			.unwrap();
+		assert_eq!(stored.status, OrderStatus::Executing);
+		assert!(stored.fill_proof.is_none());
+		assert_eq!(stored.fill_transaction_hashes(), vec![fill_tx_hash.clone()]);
+
+		let event = tokio::time::timeout(std::time::Duration::from_millis(100), event_rx.recv())
+			.await
+			.expect("Should receive event")
+			.expect("Event should be valid");
+		match event {
+			SolverEvent::Delivery(DeliveryEvent::TransactionPending {
+				order_id,
+				tx_hash,
+				tx_type,
+				tx_chain_id,
+			}) => {
+				assert_eq!(order_id, order.id);
+				assert_eq!(tx_hash, fill_tx_hash);
+				assert_eq!(tx_type, TransactionType::Fill);
+				assert_eq!(tx_chain_id, 137);
+			},
+			_ => panic!("Expected TransactionPending event, got {event:?}"),
+		}
 	}
 
 	#[tokio::test]
@@ -1333,11 +1989,11 @@ mod tests {
 			|mock_order| {
 				let fill_tx_clone = fill_tx_clone.clone();
 				mock_order
-					.expect_generate_fill_transaction()
+					.expect_generate_fill_execution_transactions()
 					.times(1)
 					.returning(move |_, _| {
 						let tx = fill_tx_clone.clone();
-						Box::pin(async move { Ok(tx) })
+						Box::pin(async move { Ok(vec![tx.into()]) })
 					});
 			},
 			|mock_delivery| {
@@ -1402,6 +2058,124 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn handle_execution_submits_all_generated_fill_transactions() {
+		let order = create_test_order();
+		let params = create_test_execution_params();
+		let tx1 = create_test_transaction();
+		let mut tx2 = create_test_transaction();
+		tx2.gas_limit = Some(42_000);
+		let hash1 = TransactionHash(vec![0xa1; 32]);
+		let hash2 = TransactionHash(vec![0xb2; 32]);
+
+		let order_for_storage = order.clone();
+		let tx1_for_order = tx1.clone();
+		let tx2_for_order = tx2.clone();
+		let hashes = Arc::new(std::sync::Mutex::new(VecDeque::from([
+			hash1.clone(),
+			hash2.clone(),
+		])));
+
+		let (handler, mut event_rx) = create_test_handler_with_mocks(
+			|mock_order| {
+				let tx1 = tx1_for_order.clone();
+				let tx2 = tx2_for_order.clone();
+				mock_order
+					.expect_generate_fill_execution_transactions()
+					.times(1)
+					.returning(move |_, _| {
+						let tx1 = tx1.clone();
+						let tx2 = tx2.clone();
+						Box::pin(async move { Ok(vec![tx1.into(), tx2.into()]) })
+					});
+			},
+			|mock_delivery| {
+				let hashes = hashes.clone();
+				mock_delivery
+					.expect_submit()
+					.times(2)
+					.returning(move |_, _| {
+						let hash = hashes.lock().unwrap().pop_front().unwrap();
+						Box::pin(async move { Ok(hash) })
+					});
+			},
+			|mock_storage| {
+				let order_for_storage = order_for_storage.clone();
+				mock_storage
+					.expect_set_bytes()
+					.times(2)
+					.returning(|_, _, _, _| Box::pin(async { Ok(()) }));
+				mock_storage
+					.expect_exists()
+					.returning(|_| Box::pin(async { Ok(true) }));
+				mock_storage.expect_get_bytes().returning(move |_| {
+					let order = order_for_storage.clone();
+					Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+				});
+				mock_storage
+					.expect_compare_and_swap_with_indexes()
+					.times(3)
+					.returning(|_, _, _, _, _| Box::pin(async { Ok(true) }));
+			},
+		)
+		.await;
+
+		handler
+			.handle_execution(order.clone(), params)
+			.await
+			.unwrap();
+
+		let first = event_rx.recv().await.unwrap();
+		let second = event_rx.recv().await.unwrap();
+		let pending = [first, second]
+			.into_iter()
+			.map(|event| match event {
+				SolverEvent::Delivery(DeliveryEvent::TransactionPending {
+					order_id,
+					tx_hash,
+					tx_type,
+					tx_chain_id,
+				}) => {
+					assert_eq!(order_id, order.id);
+					assert_eq!(tx_type, TransactionType::Fill);
+					(tx_hash, tx_chain_id)
+				},
+				_ => panic!("Expected TransactionPending event"),
+			})
+			.collect::<Vec<_>>();
+
+		assert_eq!(pending, vec![(hash1, tx1.chain_id), (hash2, tx2.chain_id)]);
+	}
+
+	#[tokio::test]
+	async fn handle_execution_rejects_empty_generated_fill_transactions() {
+		let order = create_test_order();
+		let params = create_test_execution_params();
+
+		let (handler, _event_rx) = create_test_handler_with_mocks(
+			|mock_order| {
+				mock_order
+					.expect_generate_fill_execution_transactions()
+					.times(1)
+					.returning(|_, _| Box::pin(async { Ok(Vec::new()) }));
+			},
+			|mock_delivery| {
+				mock_delivery.expect_submit().times(0);
+			},
+			|_mock_storage| {},
+		)
+		.await;
+
+		let error = handler
+			.handle_execution(order, params)
+			.await
+			.expect_err("empty fill transaction set should be rejected");
+
+		assert!(error
+			.to_string()
+			.contains("Fill transaction generation returned no transactions"));
+	}
+
+	#[tokio::test]
 	async fn test_handle_execution_order_service_error() {
 		let order = create_test_order();
 		let params = create_test_execution_params();
@@ -1409,7 +2183,7 @@ mod tests {
 		let (handler, _event_rx) = create_test_handler_with_mocks(
 			|mock_order| {
 				mock_order
-					.expect_generate_fill_transaction()
+					.expect_generate_fill_execution_transactions()
 					.times(1)
 					.returning(|_, _| {
 						Box::pin(async {
@@ -1440,7 +2214,9 @@ mod tests {
 
 		let (handler, _event_rx) = create_test_handler_with_mocks(
 			|mock_order| {
-				mock_order.expect_generate_fill_transaction().times(0);
+				mock_order
+					.expect_generate_fill_execution_transactions()
+					.times(0);
 			},
 			|mock_delivery| {
 				mock_delivery.expect_submit().times(0);
@@ -1487,7 +2263,9 @@ mod tests {
 
 		let (handler, _event_rx) = create_test_handler_with_config(
 			|mock_order| {
-				mock_order.expect_generate_fill_transaction().times(0);
+				mock_order
+					.expect_generate_fill_execution_transactions()
+					.times(0);
 			},
 			|mock_delivery| {
 				mock_delivery
@@ -1527,7 +2305,9 @@ mod tests {
 
 		let (handler, mut event_rx) = create_test_handler_with_config(
 			|mock_order| {
-				mock_order.expect_generate_fill_transaction().times(0);
+				mock_order
+					.expect_generate_fill_execution_transactions()
+					.times(0);
 			},
 			|mock_delivery| {
 				mock_delivery
@@ -1569,7 +2349,9 @@ mod tests {
 
 		let (handler, mut event_rx) = create_test_handler_with_config(
 			|mock_order| {
-				mock_order.expect_generate_fill_transaction().times(0);
+				mock_order
+					.expect_generate_fill_execution_transactions()
+					.times(0);
 			},
 			|mock_delivery| {
 				mock_delivery
@@ -1621,7 +2403,9 @@ mod tests {
 
 		let (handler, mut event_rx) = create_test_handler_with_config(
 			|mock_order| {
-				mock_order.expect_generate_fill_transaction().times(0);
+				mock_order
+					.expect_generate_fill_execution_transactions()
+					.times(0);
 			},
 			|mock_delivery| {
 				mock_delivery
@@ -1684,7 +2468,9 @@ mod tests {
 
 		let (handler, mut event_rx) = create_test_handler_with_config(
 			|mock_order| {
-				mock_order.expect_generate_fill_transaction().times(0);
+				mock_order
+					.expect_generate_fill_execution_transactions()
+					.times(0);
 			},
 			|mock_delivery| {
 				mock_delivery
@@ -1737,7 +2523,9 @@ mod tests {
 
 		let (handler, mut event_rx) = create_test_handler_with_config(
 			|mock_order| {
-				mock_order.expect_generate_fill_transaction().times(0);
+				mock_order
+					.expect_generate_fill_execution_transactions()
+					.times(0);
 			},
 			|mock_delivery| {
 				mock_delivery
@@ -1795,7 +2583,9 @@ mod tests {
 
 		let (handler, mut event_rx) = create_test_handler_with_config(
 			|mock_order| {
-				mock_order.expect_generate_fill_transaction().times(0);
+				mock_order
+					.expect_generate_fill_execution_transactions()
+					.times(0);
 			},
 			|mock_delivery| {
 				mock_delivery
@@ -1860,7 +2650,9 @@ mod tests {
 
 		let (handler, _event_rx) = create_test_handler_with_config(
 			|mock_order| {
-				mock_order.expect_generate_fill_transaction().times(0);
+				mock_order
+					.expect_generate_fill_execution_transactions()
+					.times(0);
 			},
 			|mock_delivery| {
 				mock_delivery
@@ -1909,7 +2701,9 @@ mod tests {
 
 		let (handler, _event_rx) = create_test_handler_with_config(
 			|mock_order| {
-				mock_order.expect_generate_fill_transaction().times(0);
+				mock_order
+					.expect_generate_fill_execution_transactions()
+					.times(0);
 			},
 			|mock_delivery| {
 				mock_delivery
@@ -1951,7 +2745,9 @@ mod tests {
 
 		let (handler, _event_rx) = create_test_handler_with_config(
 			|mock_order| {
-				mock_order.expect_generate_fill_transaction().times(0);
+				mock_order
+					.expect_generate_fill_execution_transactions()
+					.times(0);
 			},
 			|mock_delivery| {
 				mock_delivery
@@ -2017,11 +2813,11 @@ mod tests {
 			|mock_order| {
 				let fill_tx = fill_tx.clone();
 				mock_order
-					.expect_generate_fill_transaction()
+					.expect_generate_fill_execution_transactions()
 					.times(1)
 					.returning(move |_, _| {
 						let tx = fill_tx.clone();
-						Box::pin(async move { Ok(tx) })
+						Box::pin(async move { Ok(vec![tx.into()]) })
 					});
 			},
 			|mock_delivery| {
@@ -2114,6 +2910,7 @@ mod tests {
 		let network = NetworkConfig {
 			name: None,
 			network_type: NetworkType::default(),
+			kind: Default::default(),
 			rpc_urls: vec![RpcEndpoint::http_only("http://localhost:8545".to_string())],
 			input_settler_address: Address(vec![0x11u8; 20]),
 			output_settler_address: Address(vec![0x22u8; 20]),
@@ -2130,11 +2927,11 @@ mod tests {
 			|mock_order| {
 				let fill_tx_clone = fill_tx_clone.clone();
 				mock_order
-					.expect_generate_fill_transaction()
+					.expect_generate_fill_execution_transactions()
 					.times(1)
 					.returning(move |_, _| {
 						let tx = fill_tx_clone.clone();
-						Box::pin(async move { Ok(tx) })
+						Box::pin(async move { Ok(vec![tx.into()]) })
 					});
 			},
 			|mock_delivery| {
@@ -2212,7 +3009,9 @@ mod tests {
 
 		let (handler, _event_rx) = create_test_handler_with_mocks(
 			|mock_order| {
-				mock_order.expect_generate_fill_transaction().times(0);
+				mock_order
+					.expect_generate_fill_execution_transactions()
+					.times(0);
 			},
 			|mock_delivery| {
 				mock_delivery.expect_submit().times(0);
@@ -2270,6 +3069,7 @@ mod tests {
 		let network = NetworkConfig {
 			name: None,
 			network_type: NetworkType::default(),
+			kind: Default::default(),
 			rpc_urls: vec![RpcEndpoint::http_only("http://localhost:8545".to_string())],
 			input_settler_address: Address(vec![0x11u8; 20]),
 			output_settler_address: Address(vec![0x22u8; 20]),
@@ -2287,7 +3087,9 @@ mod tests {
 		let (handler, _event_rx) = create_test_handler_with_config(
 			|mock_order| {
 				// Fill generation must NOT run — the guard aborts first.
-				mock_order.expect_generate_fill_transaction().times(0);
+				mock_order
+					.expect_generate_fill_execution_transactions()
+					.times(0);
 			},
 			|mock_delivery| {
 				// `getForcedWithdrawalStatus` reports Enabled (status 2).
@@ -2334,11 +3136,11 @@ mod tests {
 		let (handler, _event_rx) = create_test_handler_with_mocks(
 			|mock_order| {
 				mock_order
-					.expect_generate_fill_transaction()
+					.expect_generate_fill_execution_transactions()
 					.times(1)
 					.returning(move |_, _| {
 						let tx = fill_tx.clone();
-						Box::pin(async move { Ok(tx) })
+						Box::pin(async move { Ok(vec![tx.into()]) })
 					});
 			},
 			|mock_delivery| {
@@ -2367,7 +3169,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_handle_execution_state_machine_error() {
+	async fn handle_execution_ignores_post_submit_fill_hash_persistence_error() {
 		let order = create_test_order();
 		let params = create_test_execution_params();
 		let fill_tx = create_test_transaction();
@@ -2376,11 +3178,11 @@ mod tests {
 		let (handler, _event_rx) = create_test_handler_with_mocks(
 			|mock_order| {
 				mock_order
-					.expect_generate_fill_transaction()
+					.expect_generate_fill_execution_transactions()
 					.times(1)
 					.returning(move |_, _| {
 						let tx = fill_tx.clone();
-						Box::pin(async move { Ok(tx) })
+						Box::pin(async move { Ok(vec![tx.into()]) })
 					});
 			},
 			|mock_delivery| {
@@ -2394,7 +3196,7 @@ mod tests {
 					});
 			},
 			|mock_storage| {
-				// Mock for state machine storage operations - simulate error
+				// Simulate state-machine hash persistence failure after broadcast.
 				mock_storage.expect_get_bytes().returning(|_| {
 					Box::pin(async {
 						Err(solver_storage::StorageError::Backend(
@@ -2402,16 +3204,76 @@ mod tests {
 						))
 					})
 				});
+				mock_storage
+					.expect_set_bytes()
+					.times(1)
+					.returning(|_, _, _, _| Box::pin(async { Ok(()) }));
 			},
 		)
 		.await;
 
 		let result = handler.handle_execution(order, params).await;
 
-		assert!(result.is_err());
-		match result.unwrap_err() {
-			OrderError::State(msg) => assert!(msg.contains("State machine error")),
-			_ => panic!("Expected State error"),
-		}
+		assert!(result.is_ok());
+	}
+
+	#[tokio::test]
+	async fn handle_execution_ignores_post_submit_reverse_index_error() {
+		let order = create_test_order();
+		let params = create_test_execution_params();
+		let fill_tx = create_test_transaction();
+		let fill_tx_hash = create_test_tx_hash();
+		let order_for_storage = order.clone();
+
+		let (handler, _event_rx) = create_test_handler_with_mocks(
+			|mock_order| {
+				mock_order
+					.expect_generate_fill_execution_transactions()
+					.times(1)
+					.returning(move |_, _| {
+						let tx = fill_tx.clone();
+						Box::pin(async move { Ok(vec![tx.into()]) })
+					});
+			},
+			|mock_delivery| {
+				let fill_tx_hash_clone = fill_tx_hash.clone();
+				mock_delivery
+					.expect_submit()
+					.times(1)
+					.returning(move |_tx, _tracking| {
+						let hash = fill_tx_hash_clone.clone();
+						Box::pin(async move { Ok(hash) })
+					});
+			},
+			|mock_storage| {
+				let order_for_storage = order_for_storage.clone();
+				mock_storage
+					.expect_exists()
+					.returning(|_| Box::pin(async { Ok(true) }));
+				mock_storage.expect_get_bytes().returning(move |_| {
+					let order = order_for_storage.clone();
+					Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+				});
+				mock_storage
+					.expect_compare_and_swap_with_indexes()
+					.times(1)
+					.returning(|_, _, _, _, _| Box::pin(async { Ok(true) }));
+				mock_storage
+					.expect_set_bytes()
+					.times(1)
+					.returning(|_, _, _, _| {
+						Box::pin(async {
+							Err(solver_storage::StorageError::Backend(
+								"Reverse index error".to_string(),
+							))
+						})
+					});
+			},
+		)
+		.await;
+
+		let result = handler.handle_execution(order, params).await;
+
+		assert!(result.is_ok());
 	}
 }

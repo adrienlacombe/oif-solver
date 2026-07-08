@@ -17,9 +17,10 @@ use solver_delivery::DeliveryService;
 use solver_settlement::{SettlementReadiness, SettlementService};
 use solver_storage::{QueryFilter, StorageService};
 use solver_types::{
-	with_0x_prefix, DeliveryEvent, Intent, Order, OrderEvent, OrderStatus, SettlementEvent,
-	SolverEvent, StorageKey, TransactionAttempt, TransactionAttemptStatus, TransactionHash,
-	TransactionReceipt, TransactionType,
+	with_0x_prefix, DeliveryEvent, Hyperlane7683ResolvedOrder, Intent, Order, OrderEvent,
+	OrderStatus, SettlementEvent, SolverEvent, StorageKey, TransactionAttempt,
+	TransactionAttemptStatus, TransactionHash, TransactionReceipt, TransactionType,
+	HYPERLANE7683_STANDARD,
 };
 use std::sync::Arc;
 use thiserror::Error;
@@ -150,12 +151,137 @@ fn order_stage_hash(order: &Order, tx_type: TransactionType) -> Option<Transacti
 		TransactionType::Fill => order.fill_tx_hash.clone(),
 		TransactionType::PostFill => order.post_fill_tx_hash.clone(),
 		TransactionType::PreClaim => order.pre_claim_tx_hash.clone(),
-		TransactionType::Claim => order.claim_tx_hash.clone(),
+		TransactionType::Claim => order.claim_transaction_hashes().first().cloned(),
 		TransactionType::Approval
 		| TransactionType::Withdrawal
 		| TransactionType::Bridge
 		| TransactionType::Pusher => None,
 	}
+}
+
+fn push_unique_fill_candidate(
+	candidates: &mut Vec<(TransactionHash, u64)>,
+	tx_hash: TransactionHash,
+	chain_id: u64,
+) {
+	if !candidates
+		.iter()
+		.any(|(candidate, _)| candidate == &tx_hash)
+	{
+		candidates.push((tx_hash, chain_id));
+	}
+}
+
+fn fill_recovery_candidates(
+	order: &Order,
+	attempts: &[TransactionAttempt],
+	fallback_chain_id: u64,
+	initial_hash: TransactionHash,
+) -> Vec<(TransactionHash, u64)> {
+	let mut candidates = Vec::new();
+
+	for attempt in attempts.iter().filter(|attempt| {
+		attempt.tx_type == TransactionType::Fill
+			&& matches!(
+				attempt.status,
+				TransactionAttemptStatus::Confirmed
+					| TransactionAttemptStatus::Broadcast
+					| TransactionAttemptStatus::Indeterminate
+			)
+	}) {
+		if let Some(tx_hash) = attempt.tx_hash.clone() {
+			push_unique_fill_candidate(&mut candidates, tx_hash, attempt.chain_id);
+		}
+	}
+
+	push_unique_fill_candidate(&mut candidates, initial_hash, fallback_chain_id);
+	for tx_hash in order.fill_transaction_hashes() {
+		push_unique_fill_candidate(&mut candidates, tx_hash, fallback_chain_id);
+	}
+
+	candidates
+}
+
+fn push_unique_claim_candidate(
+	candidates: &mut Vec<(TransactionHash, u64)>,
+	tx_hash: TransactionHash,
+	chain_id: u64,
+) {
+	if !candidates.iter().any(|(candidate, candidate_chain_id)| {
+		candidate == &tx_hash && *candidate_chain_id == chain_id
+	}) {
+		candidates.push((tx_hash, chain_id));
+	}
+}
+
+fn push_unique_chain_id(chain_ids: &mut Vec<u64>, chain_id: u64) {
+	if !chain_ids.contains(&chain_id) {
+		chain_ids.push(chain_id);
+	}
+}
+
+fn claim_recovery_fallback_chain_ids(order: &Order) -> Vec<u64> {
+	let mut chain_ids = Vec::new();
+
+	if order.standard == HYPERLANE7683_STANDARD {
+		if let Ok(resolved_order) =
+			serde_json::from_value::<Hyperlane7683ResolvedOrder>(order.data.clone())
+		{
+			for instruction in resolved_order.fill_instructions {
+				if let Ok(domain) = instruction.destination_domain() {
+					push_unique_chain_id(&mut chain_ids, u64::from(domain));
+				}
+			}
+		}
+
+		for chain in &order.output_chains {
+			push_unique_chain_id(&mut chain_ids, chain.chain_id);
+		}
+
+		if !chain_ids.is_empty() {
+			return chain_ids;
+		}
+	}
+
+	if let Some(chain) = order.input_chains.first() {
+		push_unique_chain_id(&mut chain_ids, chain.chain_id);
+	}
+
+	chain_ids
+}
+
+fn claim_recovery_candidates(
+	order: &Order,
+	attempts: &[TransactionAttempt],
+	fallback_chain_ids: &[u64],
+	initial_hash: TransactionHash,
+) -> Vec<(TransactionHash, u64)> {
+	let mut candidates = Vec::new();
+
+	for attempt in attempts.iter().filter(|attempt| {
+		attempt.tx_type == TransactionType::Claim
+			&& matches!(
+				attempt.status,
+				TransactionAttemptStatus::Confirmed
+					| TransactionAttemptStatus::Broadcast
+					| TransactionAttemptStatus::Indeterminate
+			)
+	}) {
+		if let Some(tx_hash) = attempt.tx_hash.clone() {
+			push_unique_claim_candidate(&mut candidates, tx_hash, attempt.chain_id);
+		}
+	}
+
+	for chain_id in fallback_chain_ids {
+		push_unique_claim_candidate(&mut candidates, initial_hash.clone(), *chain_id);
+	}
+	for tx_hash in order.claim_transaction_hashes() {
+		for chain_id in fallback_chain_ids {
+			push_unique_claim_candidate(&mut candidates, tx_hash.clone(), *chain_id);
+		}
+	}
+
+	candidates
 }
 
 /// Result of resolving a stage's transaction hash via the three-layer
@@ -173,10 +299,20 @@ enum StageResolution {
 fn set_order_stage_hash(order: &mut Order, tx_type: TransactionType, tx_hash: TransactionHash) {
 	match tx_type {
 		TransactionType::Prepare => order.prepare_tx_hash = Some(tx_hash),
-		TransactionType::Fill => order.fill_tx_hash = Some(tx_hash),
+		TransactionType::Fill => {
+			order.fill_tx_hash = Some(tx_hash.clone());
+			if !order.fill_tx_hashes.contains(&tx_hash) {
+				order.fill_tx_hashes.push(tx_hash);
+			}
+		},
 		TransactionType::PostFill => order.post_fill_tx_hash = Some(tx_hash),
 		TransactionType::PreClaim => order.pre_claim_tx_hash = Some(tx_hash),
-		TransactionType::Claim => order.claim_tx_hash = Some(tx_hash),
+		TransactionType::Claim => {
+			order.claim_tx_hash = Some(tx_hash.clone());
+			if !order.claim_tx_hashes.contains(&tx_hash) {
+				order.claim_tx_hashes.push(tx_hash);
+			}
+		},
 		TransactionType::Approval
 		| TransactionType::Withdrawal
 		| TransactionType::Bridge
@@ -394,9 +530,12 @@ impl RecoveryService {
 		tx_hash: TransactionHash,
 	) {
 		set_order_stage_hash(order, tx_type, tx_hash.clone());
+		let order_id = order.id.clone();
 		if let Err(error) = self
 			.state_machine
-			.set_transaction_hash(&order.id, tx_hash, tx_type)
+			.update_order_with(&order_id, move |stored| {
+				set_order_stage_hash(stored, tx_type, tx_hash.clone());
+			})
 			.await
 		{
 			tracing::error!(
@@ -730,11 +869,21 @@ impl RecoveryService {
 			},
 		};
 
+		let Some(attempt_tx) = attempt.tx.as_evm() else {
+			tracing::warn!(
+				order_id = %order.id,
+				?tx_type,
+				tx_hash = ?tx_hash,
+				"Confirmed revert belongs to a non-EVM attempt; cannot replay EVM revert data, treating as Unknown"
+			);
+			return ReconcileResult::Unknown;
+		};
+
 		let revert_bytes = match self
 			.delivery
 			.get_revert_data(
 				chain_id,
-				attempt.tx.clone(),
+				attempt_tx.clone(),
 				attempt.signer.clone(),
 				receipt_block_number,
 			)
@@ -1059,45 +1208,105 @@ impl RecoveryService {
 			},
 			StageResolution::Unknown => return Ok((order, ReconcileResult::Unknown)),
 			StageResolution::Hash(claim_tx) => {
-				let chain_id = order
-					.input_chains
-					.first()
-					.map(|c| c.chain_id)
-					.ok_or_else(|| RecoveryError::Storage("No input chains in order".into()))?;
+				let fallback_chain_ids = claim_recovery_fallback_chain_ids(&order);
+				if fallback_chain_ids.is_empty() {
+					return Err(RecoveryError::Storage(
+						"No claim recovery fallback chains in order".into(),
+					));
+				}
 
-				match self.delivery.get_receipt(&claim_tx, chain_id).await {
-					Ok(receipt) if receipt.success => {
-						self.mark_recovered_attempt_confirmed(
-							&order.id,
-							TransactionType::Claim,
-							&claim_tx,
-							&receipt,
-						)
-						.await;
-						return Ok((order, ReconcileResult::Finalized));
-					},
-					Ok(receipt) => {
-						tracing::warn!("Claim transaction {:?} reverted", claim_tx);
-						let result = self
-							.handle_confirmed_revert(
-								&mut order,
+				let mut expected_hashes = order.claim_transaction_hashes();
+				if !expected_hashes.contains(&claim_tx) {
+					expected_hashes.push(claim_tx.clone());
+				}
+				let expected_count = order
+					.expected_claim_transaction_count()
+					.max(expected_hashes.len())
+					.max(1);
+				let candidates = claim_recovery_candidates(
+					&order,
+					&attempts,
+					&fallback_chain_ids,
+					claim_tx.clone(),
+				);
+				let mut confirmed_hashes = Vec::new();
+				let mut last_receipt_error = None;
+				for (candidate, candidate_chain_id) in candidates {
+					match self
+						.delivery
+						.get_receipt(&candidate, candidate_chain_id)
+						.await
+					{
+						Ok(receipt) if receipt.success => {
+							if !order.claim_transaction_hashes().contains(&candidate) {
+								self.write_repaired_hash(
+									&mut order,
+									TransactionType::Claim,
+									candidate.clone(),
+								)
+								.await;
+							}
+							self.mark_recovered_attempt_confirmed(
+								&order.id,
 								TransactionType::Claim,
-								&claim_tx,
-								chain_id,
-								receipt.block_number,
-								&attempts,
+								&candidate,
+								&receipt,
 							)
 							.await;
-						return Ok((order, result));
-					},
-					Err(e) => {
-						tracing::warn!(
-							"Could not get claim transaction receipt; treating as Unknown: {}",
-							e
+							if !confirmed_hashes.contains(&candidate) {
+								confirmed_hashes.push(candidate);
+							}
+						},
+						Ok(receipt) => {
+							tracing::warn!("Claim transaction {:?} reverted", candidate);
+							let result = self
+								.handle_confirmed_revert(
+									&mut order,
+									TransactionType::Claim,
+									&candidate,
+									candidate_chain_id,
+									receipt.block_number,
+									&attempts,
+								)
+								.await;
+							return Ok((order, result));
+						},
+						Err(e) => {
+							tracing::warn!(
+								"Could not get claim transaction receipt for recovery candidate: {}",
+								e
+							);
+							last_receipt_error = Some(e);
+						},
+					}
+				}
+
+				if !confirmed_hashes.is_empty() {
+					let enough_hashes_confirmed = confirmed_hashes.len() >= expected_count;
+					let all_known_expected_hashes_confirmed = expected_hashes
+						.iter()
+						.all(|expected_hash| confirmed_hashes.contains(expected_hash));
+					if !(enough_hashes_confirmed && all_known_expected_hashes_confirmed) {
+						tracing::info!(
+							order_id = %order.id,
+							confirmed_claim_hashes = confirmed_hashes.len(),
+							expected_claim_hashes = expected_count,
+							"Recovery found only a partial claim set; leaving order unchanged for later recovery"
 						);
 						return Ok((order, ReconcileResult::Unknown));
-					},
+					}
+
+					return Ok((order, ReconcileResult::Finalized));
 				}
+
+				if let Some(e) = last_receipt_error {
+					tracing::warn!(
+						"Could not get any claim transaction receipt from order hash or attempt lineage; treating as Unknown: {}",
+						e
+					);
+				}
+
+				return Ok((order, ReconcileResult::Unknown));
 			},
 			StageResolution::NotFound => { /* fall through to pre-claim */ },
 		}
@@ -1252,19 +1461,26 @@ impl RecoveryService {
 					.map(|c| c.chain_id)
 					.ok_or_else(|| RecoveryError::Storage("No output chains in order".into()))?;
 
-				let mut candidates = vec![fill_tx.clone()];
-				if let Some(lineage_hash) =
-					choose_recovery_attempt_hash(&attempts, TransactionType::Fill)
-				{
-					if lineage_hash != fill_tx {
-						candidates.push(lineage_hash);
-					}
+				let mut expected_hashes = order.fill_transaction_hashes();
+				if !expected_hashes.contains(&fill_tx) {
+					expected_hashes.push(fill_tx.clone());
 				}
+				let expected_count = order
+					.expected_fill_transaction_count()
+					.max(expected_hashes.len())
+					.max(1);
+				let candidates =
+					fill_recovery_candidates(&order, &attempts, chain_id, fill_tx.clone());
+				let mut confirmed_hashes = Vec::new();
 				let mut last_receipt_error = None;
-				for candidate in candidates {
-					match self.delivery.get_receipt(&candidate, chain_id).await {
+				for (candidate, candidate_chain_id) in candidates {
+					match self
+						.delivery
+						.get_receipt(&candidate, candidate_chain_id)
+						.await
+					{
 						Ok(receipt) if receipt.success => {
-							if candidate != fill_tx {
+							if !order.fill_transaction_hashes().contains(&candidate) {
 								self.write_repaired_hash(
 									&mut order,
 									TransactionType::Fill,
@@ -1279,30 +1495,8 @@ impl RecoveryService {
 								&receipt,
 							)
 							.await;
-							if order.fill_proof.is_some() {
-								return Ok((
-									order.clone(),
-									ReconcileResult::NeedsPreClaim {
-										fill_proof: order.fill_proof.clone(),
-									},
-								));
-							} else {
-								match self.settlement.recover_post_fill_state(&order).await {
-									Ok(true) => {
-										return Ok((order, ReconcileResult::NeedsMonitoring))
-									},
-									Ok(false) => {
-										return Ok((order, ReconcileResult::NeedsPostFill));
-									},
-									Err(e) => {
-										tracing::error!(
-											order_id = %order.id,
-											error = %e,
-											"Failed to recover existing post-fill state during recovery"
-										);
-										return Err(RecoveryError::Settlement(e.to_string()));
-									},
-								}
+							if !confirmed_hashes.contains(&candidate) {
+								confirmed_hashes.push(candidate);
 							}
 						},
 						Ok(receipt) => {
@@ -1315,7 +1509,7 @@ impl RecoveryService {
 									&mut order,
 									TransactionType::Fill,
 									&candidate,
-									chain_id,
+									candidate_chain_id,
 									receipt.block_number,
 									&attempts,
 								)
@@ -1329,6 +1523,48 @@ impl RecoveryService {
 							);
 							last_receipt_error = Some(e);
 						},
+					}
+				}
+				if !confirmed_hashes.is_empty() {
+					let enough_hashes_confirmed = confirmed_hashes.len() >= expected_count;
+					let all_known_expected_hashes_confirmed = expected_hashes
+						.iter()
+						.all(|expected_hash| confirmed_hashes.contains(expected_hash));
+					if !(enough_hashes_confirmed && all_known_expected_hashes_confirmed) {
+						tracing::info!(
+							order_id = %order.id,
+							confirmed_fill_hashes = confirmed_hashes.len(),
+							expected_fill_hashes = expected_count,
+							"Recovery found only a partial fill set; leaving order unchanged for later recovery"
+						);
+						return Ok((order, ReconcileResult::Unknown));
+					}
+
+					if order.fill_proof.is_some() {
+						return Ok((
+							order.clone(),
+							ReconcileResult::NeedsPreClaim {
+								fill_proof: order.fill_proof.clone(),
+							},
+						));
+					} else {
+						if expected_count > 1 || order.fill_transaction_hashes().len() > 1 {
+							return Ok((order, ReconcileResult::NeedsPostFill));
+						}
+						match self.settlement.recover_post_fill_state(&order).await {
+							Ok(true) => return Ok((order, ReconcileResult::NeedsMonitoring)),
+							Ok(false) => {
+								return Ok((order, ReconcileResult::NeedsPostFill));
+							},
+							Err(e) => {
+								tracing::error!(
+									order_id = %order.id,
+									error = %e,
+									"Failed to recover existing post-fill state during recovery"
+								);
+								return Err(RecoveryError::Settlement(e.to_string()));
+							},
+						}
 					}
 				}
 				if let Some(e) = last_receipt_error {
@@ -1874,6 +2110,7 @@ impl RecoveryService {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use alloy_primitives::U256;
 	use mockall::predicate::*;
 	use solver_delivery::MockDeliveryInterface;
 	use solver_settlement::MockSettlementInterface;
@@ -1884,8 +2121,9 @@ mod tests {
 	use solver_types::{
 		standards::eip7683::LockType,
 		utils::tests::builders::{Eip7683OrderDataBuilder, IntentBuilder, OrderBuilder},
-		Address, ExecutionParams, FillProof, Transaction, TransactionAttempt,
-		TransactionAttemptStatus, TransactionHash,
+		Address, ExecutionParams, FillProof, Hyperlane7683FillInstruction, Hyperlane7683Output,
+		Hyperlane7683ResolvedOrder, Transaction, TransactionAttempt, TransactionAttemptStatus,
+		TransactionHash, TransactionReceipt, HYPERLANE7683_STANDARD,
 	};
 	use tempfile::TempDir;
 
@@ -2078,6 +2316,97 @@ mod tests {
 		attempt.tx_hash = hash_byte.map(|byte| TransactionHash(vec![byte; 32]));
 		attempt.updated_at = updated_at;
 		attempt
+	}
+
+	fn test_hyperlane_resolved_order(destination_domains: &[u64]) -> Hyperlane7683ResolvedOrder {
+		Hyperlane7683ResolvedOrder {
+			user: [0x11; 32],
+			origin_chain_id: U256::from(700001u64),
+			open_deadline: u32::MAX,
+			fill_deadline: u32::MAX,
+			order_id: [0x22; 32],
+			max_spent: destination_domains
+				.iter()
+				.map(|domain| Hyperlane7683Output {
+					token: [0x33; 32],
+					amount: U256::from(100u64),
+					recipient: [0x44; 32],
+					chain_id: U256::from(*domain),
+				})
+				.collect(),
+			min_received: vec![Hyperlane7683Output {
+				token: [0x55; 32],
+				amount: U256::from(90u64),
+				recipient: [0x66; 32],
+				chain_id: U256::from(700001u64),
+			}],
+			fill_instructions: destination_domains
+				.iter()
+				.map(|domain| Hyperlane7683FillInstruction {
+					destination_chain_id: U256::from(*domain),
+					destination_settler: [0x77; 32],
+					origin_data: vec![0xaa],
+				})
+				.collect(),
+		}
+	}
+
+	#[test]
+	fn hyperlane_claim_recovery_uses_destination_fallback_chains() {
+		let order = OrderBuilder::new()
+			.with_standard(HYPERLANE7683_STANDARD)
+			.with_input_chain_ids(vec![700001])
+			.with_output_chain_ids(vec![700099])
+			.with_data(
+				serde_json::to_value(test_hyperlane_resolved_order(&[700002, 700003])).unwrap(),
+			)
+			.build();
+
+		assert_eq!(
+			claim_recovery_fallback_chain_ids(&order),
+			vec![700002, 700003, 700099]
+		);
+	}
+
+	#[test]
+	fn claim_recovery_candidates_expand_legacy_hash_across_fallback_chains() {
+		let legacy_hash = TransactionHash(vec![0xc1; 32]);
+		let order = OrderBuilder::new()
+			.with_claim_tx_hash(Some(legacy_hash.clone()))
+			.build();
+
+		let candidates =
+			claim_recovery_candidates(&order, &[], &[700002, 700003], legacy_hash.clone());
+
+		assert_eq!(
+			candidates,
+			vec![(legacy_hash.clone(), 700002), (legacy_hash, 700003)]
+		);
+	}
+
+	#[test]
+	fn claim_recovery_candidates_preserve_attempt_chain_ids() {
+		let legacy_hash = TransactionHash(vec![0xc1; 32]);
+		let attempt_hash = TransactionHash(vec![0xd2; 32]);
+		let order = OrderBuilder::new()
+			.with_claim_tx_hash(Some(legacy_hash.clone()))
+			.build();
+		let mut attempt = sample_attempt(
+			"claim-attempt",
+			TransactionType::Claim,
+			TransactionAttemptStatus::Broadcast,
+			Some(0xd2),
+			10,
+		);
+		attempt.chain_id = 700004;
+
+		let candidates =
+			claim_recovery_candidates(&order, &[attempt], &[700002], legacy_hash.clone());
+
+		assert_eq!(
+			candidates,
+			vec![(attempt_hash, 700004), (legacy_hash, 700002)]
+		);
 	}
 
 	#[test]
@@ -2289,6 +2618,16 @@ mod tests {
 		}
 	}
 
+	fn successful_receipt(hash: TransactionHash, block_number: u64) -> TransactionReceipt {
+		TransactionReceipt {
+			hash,
+			block_number,
+			success: true,
+			block_timestamp: None,
+			logs: vec![],
+		}
+	}
+
 	#[tokio::test]
 	async fn recovery_marks_matching_broadcast_attempt_confirmed_when_fill_receipt_is_proven() {
 		let temp_dir = tempfile::tempdir().unwrap();
@@ -2391,6 +2730,241 @@ mod tests {
 		let attempt = attempt_store.get_attempt(&attempt.id).await.unwrap();
 		assert_eq!(attempt.status, TransactionAttemptStatus::Confirmed);
 		assert!(attempt.receipt.is_some());
+	}
+
+	#[tokio::test]
+	async fn recovery_does_not_advance_partial_multi_fill() {
+		let temp_dir = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let attempt_store = Arc::new(TransactionAttemptStore::new(storage.clone()));
+
+		let first_hash = TransactionHash(vec![0xa1; 32]);
+		let mut order = create_test_order_with_status(OrderStatus::Executing);
+		order.fill_tx_hash = None;
+		order.fill_tx_hashes.clear();
+		order.expected_fill_tx_count = Some(2);
+		order.post_fill_tx_hash = None;
+		order.settlement_name = Some("eip7683".to_string());
+		state_machine.store_order(&order).await.unwrap();
+
+		let attempt = attempt_store
+			.create_planned_attempt(
+				&order.id,
+				Some(Address(vec![9; 20])),
+				TransactionType::Fill,
+				sample_tx(137),
+			)
+			.await
+			.unwrap();
+		attempt_store
+			.update_attempt_status(
+				&attempt.id,
+				TransactionAttemptStatus::Broadcast,
+				None,
+				|attempt| {
+					attempt.tx_hash = Some(first_hash.clone());
+				},
+			)
+			.await
+			.unwrap();
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_get_receipt()
+			.with(eq(first_hash.clone()), eq(137u64))
+			.times(1)
+			.returning(move |hash, _| {
+				let hash = hash.clone();
+				Box::pin(async move { Ok(successful_receipt(hash, 12345)) })
+			});
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([(
+				137u64,
+				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]),
+			1,
+			20,
+			60,
+		));
+
+		let mut mock_settlement = MockSettlementInterface::new();
+		mock_settlement.expect_recover_post_fill_state().times(0);
+		let settlement = Arc::new(SettlementService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_settlement) as Box<dyn solver_settlement::SettlementInterface>,
+			)]),
+			String::new(),
+			20,
+		));
+
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine.clone(),
+			delivery,
+			settlement,
+			EventBus::new(100),
+			attempt_store.clone(),
+			empty_networks_config(),
+		);
+
+		let (repaired_order, result) = recovery_service
+			.reconcile_with_blockchain(&order)
+			.await
+			.unwrap();
+
+		assert!(matches!(result, ReconcileResult::Unknown));
+		assert_eq!(repaired_order.status, OrderStatus::Executing);
+		assert_eq!(
+			repaired_order.fill_transaction_hashes(),
+			vec![first_hash.clone()]
+		);
+		let stored = state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(stored.status, OrderStatus::Executing);
+		assert_eq!(stored.fill_transaction_hashes(), vec![first_hash.clone()]);
+		let attempt = attempt_store.get_attempt(&attempt.id).await.unwrap();
+		assert_eq!(attempt.status, TransactionAttemptStatus::Confirmed);
+		assert!(attempt.receipt.is_some());
+	}
+
+	#[tokio::test]
+	async fn recovery_advances_when_all_multi_fill_attempts_are_confirmed() {
+		let temp_dir = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let attempt_store = Arc::new(TransactionAttemptStore::new(storage.clone()));
+
+		let first_hash = TransactionHash(vec![0xa1; 32]);
+		let second_hash = TransactionHash(vec![0xb2; 32]);
+		let mut order = create_test_order_with_status(OrderStatus::Executing);
+		order.fill_tx_hash = None;
+		order.fill_tx_hashes.clear();
+		order.expected_fill_tx_count = Some(2);
+		order.post_fill_tx_hash = None;
+		order.settlement_name = Some("eip7683".to_string());
+		state_machine.store_order(&order).await.unwrap();
+
+		let first_attempt = attempt_store
+			.create_planned_attempt(
+				&order.id,
+				Some(Address(vec![9; 20])),
+				TransactionType::Fill,
+				sample_tx(137),
+			)
+			.await
+			.unwrap();
+		attempt_store
+			.update_attempt_status(
+				&first_attempt.id,
+				TransactionAttemptStatus::Broadcast,
+				None,
+				|attempt| {
+					attempt.tx_hash = Some(first_hash.clone());
+				},
+			)
+			.await
+			.unwrap();
+		let second_attempt = attempt_store
+			.create_planned_attempt(
+				&order.id,
+				Some(Address(vec![9; 20])),
+				TransactionType::Fill,
+				sample_tx(42161),
+			)
+			.await
+			.unwrap();
+		attempt_store
+			.update_attempt_status(
+				&second_attempt.id,
+				TransactionAttemptStatus::Broadcast,
+				None,
+				|attempt| {
+					attempt.tx_hash = Some(second_hash.clone());
+				},
+			)
+			.await
+			.unwrap();
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_get_receipt()
+			.withf({
+				let first_hash = first_hash.clone();
+				let second_hash = second_hash.clone();
+				move |hash, chain_id| {
+					(hash == &first_hash && *chain_id == 137)
+						|| (hash == &second_hash && *chain_id == 42161)
+				}
+			})
+			.times(2)
+			.returning(move |hash, _| {
+				let hash = hash.clone();
+				Box::pin(async move { Ok(successful_receipt(hash, 12345)) })
+			});
+		let delivery_impl = Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>;
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([(137u64, delivery_impl.clone()), (42161u64, delivery_impl)]),
+			1,
+			20,
+			60,
+		));
+
+		let mut mock_settlement = MockSettlementInterface::new();
+		mock_settlement
+			.expect_recover_post_fill_state()
+			.times(0)
+			.returning(|_| Box::pin(async move { Ok(false) }));
+		let settlement = Arc::new(SettlementService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_settlement) as Box<dyn solver_settlement::SettlementInterface>,
+			)]),
+			String::new(),
+			20,
+		));
+
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine.clone(),
+			delivery,
+			settlement,
+			EventBus::new(100),
+			attempt_store.clone(),
+			empty_networks_config(),
+		);
+
+		let (repaired_order, result) = recovery_service
+			.reconcile_with_blockchain(&order)
+			.await
+			.unwrap();
+
+		assert!(matches!(result, ReconcileResult::NeedsPostFill));
+		let mut repaired_hashes = repaired_order.fill_transaction_hashes();
+		repaired_hashes.sort_by(|a, b| a.0.cmp(&b.0));
+		assert_eq!(
+			repaired_hashes,
+			vec![first_hash.clone(), second_hash.clone()]
+		);
+		let mut stored_hashes = state_machine
+			.get_order(&order.id)
+			.await
+			.unwrap()
+			.fill_transaction_hashes();
+		stored_hashes.sort_by(|a, b| a.0.cmp(&b.0));
+		assert_eq!(stored_hashes, vec![first_hash.clone(), second_hash.clone()]);
+		let first_attempt = attempt_store.get_attempt(&first_attempt.id).await.unwrap();
+		let second_attempt = attempt_store.get_attempt(&second_attempt.id).await.unwrap();
+		assert_eq!(first_attempt.status, TransactionAttemptStatus::Confirmed);
+		assert_eq!(second_attempt.status, TransactionAttemptStatus::Confirmed);
+		assert!(first_attempt.receipt.is_some());
+		assert!(second_attempt.receipt.is_some());
 	}
 
 	#[tokio::test]
@@ -4327,6 +4901,7 @@ mod tests {
 		solver_types::NetworkConfig {
 			name: None,
 			network_type: solver_types::NetworkType::New,
+			kind: Default::default(),
 			rpc_urls: vec![],
 			input_settler_address: input_settler,
 			output_settler_address: output_settler,
@@ -5253,6 +5828,7 @@ mod tests {
 			solver_types::NetworkConfig {
 				name: None,
 				network_type: solver_types::NetworkType::New,
+				kind: Default::default(),
 				rpc_urls: vec![],
 				input_settler_address: Address(vec![0xcc; 20]),
 				output_settler_address: Address(vec![0xaa; 20]),
@@ -5335,6 +5911,7 @@ mod tests {
 			solver_types::NetworkConfig {
 				name: None,
 				network_type: solver_types::NetworkType::New,
+				kind: Default::default(),
 				rpc_urls: vec![],
 				input_settler_address: Address(vec![0xcc; 20]),
 				output_settler_address: Address(vec![0xaa; 20]),
