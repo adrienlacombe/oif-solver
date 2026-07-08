@@ -1,7 +1,7 @@
 //! Order state machine implementation.
 //!
 //! Manages order state transitions with validation, ensuring orders move through
-//! valid lifecycle states: Created -> Pending -> Executed -> Settled -> Finalized.
+//! valid lifecycle states: Created -> Pending/Executing -> Executed -> Settled -> Finalized.
 //! Also handles failure states and provides utilities for updating order fields.
 
 use once_cell::sync::Lazy;
@@ -64,7 +64,11 @@ static TRANSITIONS: Lazy<HashMap<OrderStatusKind, HashSet<OrderStatusKind>>> = L
 	);
 	m.insert(
 		OrderStatusKind::Pending,
-		HashSet::from([OrderStatusKind::Executing, OrderStatusKind::Failed]),
+		HashSet::from([
+			OrderStatusKind::Executing,
+			OrderStatusKind::Executed,
+			OrderStatusKind::Failed,
+		]),
 	);
 	m.insert(
 		OrderStatusKind::Executing,
@@ -1136,6 +1140,10 @@ mod tests {
 		assert!(OrderStateMachine::is_valid_transition(
 			&OrderStatus::Created,
 			&OrderStatus::Pending
+		));
+		assert!(OrderStateMachine::is_valid_transition(
+			&OrderStatus::Pending,
+			&OrderStatus::Executed
 		));
 		assert!(!OrderStateMachine::is_valid_transition(
 			&OrderStatus::Created,

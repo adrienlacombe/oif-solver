@@ -23,7 +23,7 @@ use solver_storage::{
 use solver_types::{
 	current_timestamp, standards::eip7683::LockType, truncate_id, with_0x_prefix, Address,
 	DiscoveryEvent, Eip7683OrderData, ExecutionDecision, ExecutionParams, Intent, Order,
-	OrderEvent, SolverEvent, StorageKey,
+	OrderEvent, OrderStatus, SolverEvent, StorageKey,
 };
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
@@ -644,6 +644,10 @@ impl IntentHandler {
 
 				match self.order_service.should_execute(&order, &context).await {
 					ExecutionDecision::Execute(params) => {
+						let requires_preparation = order_requires_preparation(&order);
+						if !requires_preparation {
+							order.status = OrderStatus::Executing;
+						}
 						order.execution_params = Some(params.clone());
 						if let Err(e) = self.state_machine.store_order(&order).await {
 							// Release the reservation we just took so the deposit
@@ -651,7 +655,7 @@ impl IntentHandler {
 							self.release_compact_deposits(&order).await;
 							return Err(IntentError::Storage(e.to_string()));
 						}
-						if order_requires_preparation(&order) {
+						if requires_preparation {
 							self.event_bus
 								.publish(SolverEvent::Order(OrderEvent::Preparing {
 									intent: intent.clone(),
@@ -2911,7 +2915,14 @@ mod tests {
 			.returning(|_| Box::pin(async move { Ok(false) }));
 		mock_storage
 			.expect_set_bytes()
-			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+			.returning(|key, bytes, _, _| {
+				if key == "orders:test_intent_123" {
+					let stored: Order =
+						serde_json::from_slice(&bytes).expect("stored order decodes");
+					assert_eq!(stored.status, OrderStatus::Executing);
+				}
+				Box::pin(async move { Ok(()) })
+			});
 		mock_order_interface
 			.expect_validate_and_create_order()
 			.times(1)
