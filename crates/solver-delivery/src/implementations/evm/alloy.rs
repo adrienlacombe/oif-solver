@@ -66,6 +66,11 @@ const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// returns to the deadline check and the confirmation timeout is enforced even
 /// when an RPC call never answers (M-12).
 const RPC_PROBE_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Provider gas estimates can be exact-bound for stateful contract paths on
+/// mainnet. Pad estimates before quoting and broadcasting unless the caller
+/// supplied an explicit gas limit.
+const ESTIMATED_GAS_LIMIT_BUFFER_BPS: u64 = 2_000;
+const BPS_DENOMINATOR: u64 = 10_000;
 
 /// Drift-monitor parameters. The monitor periodically compares local nonce
 /// cache against chain pending. Some lead is normal during in-flight
@@ -150,6 +155,14 @@ fn buffered_extra_native_fee_estimate(raw_fee: U256, buffer_bps: u32) -> ExtraNa
 		buffer_wei: buffer.to_string(),
 		total_fee_wei: total.to_string(),
 	}
+}
+
+fn buffer_estimated_gas_limit(gas: u64) -> u64 {
+	let multiplier = u128::from(BPS_DENOMINATOR + ESTIMATED_GAS_LIMIT_BUFFER_BPS);
+	let denominator = u128::from(BPS_DENOMINATOR);
+	let numerator = u128::from(gas).saturating_mul(multiplier);
+	let buffered = numerator.saturating_add(denominator.saturating_sub(1)) / denominator;
+	u64::try_from(buffered).unwrap_or(u64::MAX)
 }
 
 fn signed_preflight_shortfall_message(balance: U256, required: U256, shortfall: U256) -> String {
@@ -1455,7 +1468,15 @@ impl DeliveryInterface for AlloyDelivery {
 			let estimate_request = build_estimate_request(&tx_attempt);
 			match provider.estimate_gas(estimate_request).await {
 				Ok(gas) => {
-					tx_attempt.gas_limit = Some(gas);
+					let buffered_gas = buffer_estimated_gas_limit(gas);
+					tracing::debug!(
+						chain_id,
+						raw_gas_limit = gas,
+						buffered_gas_limit = buffered_gas,
+						buffer_bps = ESTIMATED_GAS_LIMIT_BUFFER_BPS,
+						"Applied estimated gas limit buffer"
+					);
+					tx_attempt.gas_limit = Some(buffered_gas);
 				},
 				Err(e) => {
 					let msg = e.to_string();
@@ -3477,7 +3498,7 @@ impl DeliveryInterface for AlloyDelivery {
 			.estimate_gas(request)
 			.await
 			.map_err(|e| DeliveryError::Network(format!("Failed to estimate gas: {e}")))?;
-		Ok(gas)
+		Ok(buffer_estimated_gas_limit(gas))
 	}
 
 	async fn estimate_gas_with_overrides(
@@ -3507,7 +3528,7 @@ impl DeliveryInterface for AlloyDelivery {
 			.map_err(|e| {
 				DeliveryError::Network(format!("Failed to estimate gas with overrides: {e}"))
 			})?;
-		Ok(gas)
+		Ok(buffer_estimated_gas_limit(gas))
 	}
 
 	async fn eth_call(&self, tx: SolverTransaction) -> Result<Bytes, DeliveryError> {
@@ -5604,6 +5625,17 @@ mod tests {
 			assert_eq!(estimate.raw_fee_wei, "1000");
 			assert_eq!(estimate.buffer_wei, "125");
 			assert_eq!(estimate.total_fee_wei, "1125");
+		}
+
+		#[test]
+		fn buffer_estimated_gas_limit_adds_twenty_percent_and_rounds_up() {
+			assert_eq!(buffer_estimated_gas_limit(457_679), 549_215);
+			assert_eq!(buffer_estimated_gas_limit(1), 2);
+		}
+
+		#[test]
+		fn buffer_estimated_gas_limit_saturates_at_u64_max() {
+			assert_eq!(buffer_estimated_gas_limit(u64::MAX), u64::MAX);
 		}
 
 		#[test]
