@@ -955,10 +955,10 @@ impl HyperlaneSettlement {
 		// Build the quoteGasPayment call
 		let call_data = IHyperlaneOracle::quoteGasPayment_0Call {
 			destinationDomain: destination_chain,
-			recipientOracle: alloy_primitives::Address::from_slice(&recipient_oracle.0),
+			recipientOracle: Self::evm_abi_address("recipient oracle", &recipient_oracle)?,
 			gasLimit: gas_limit,
 			customMetadata: custom_metadata.into(),
-			source: alloy_primitives::Address::from_slice(&source.0),
+			source: Self::evm_abi_address("source", &source)?,
 			payloads: payloads.into_iter().map(Into::into).collect(),
 		};
 
@@ -1077,6 +1077,24 @@ impl HyperlaneSettlement {
 			)));
 		}
 		Ok(solver_types::Address(bytes[12..].to_vec()))
+	}
+
+	fn evm_abi_address(
+		field: &str,
+		address: &solver_types::Address,
+	) -> Result<alloy_primitives::Address, SettlementError> {
+		match address.0.len() {
+			20 => Ok(alloy_primitives::Address::from_slice(&address.0)),
+			32 => {
+				let mut bytes = [0u8; 32];
+				bytes.copy_from_slice(&address.0);
+				let normalized = Self::evm_address_from_bytes32(field, &bytes)?;
+				Ok(alloy_primitives::Address::from_slice(&normalized.0))
+			},
+			len => Err(SettlementError::ValidationFailed(format!(
+				"Hyperlane {field} is not an EVM ABI address: expected 20 bytes or left-padded 32 bytes, got {len} bytes"
+			))),
+		}
 	}
 
 	fn starknet_address_from_bytes32(
@@ -1333,7 +1351,7 @@ impl HyperlaneSettlement {
 			))
 		})?;
 
-		let settler = alloy_primitives::Address::from_slice(&destination_settler.0);
+		let settler = Self::evm_abi_address("destination settler", destination_settler)?;
 		let call_data = IHyperlane7683::quoteGasPaymentCall {
 			_destinationDomain: origin_domain,
 		};
@@ -1380,7 +1398,7 @@ impl HyperlaneSettlement {
 			))
 		})?;
 
-		let settler = alloy_primitives::Address::from_slice(&destination_settler.0);
+		let settler = Self::evm_abi_address("destination settler", destination_settler)?;
 		let call_data = IHyperlane7683::orderStatusCall {
 			orderId: FixedBytes::<32>::from(order_id),
 		};
@@ -1954,6 +1972,36 @@ impl SettlementInterface for HyperlaneSettlement {
 		&self,
 		params: &PostFillFeeParams,
 	) -> Result<Option<SettlementFeeQuote>, SettlementError> {
+		if params.order_standard.as_deref() == Some(HYPERLANE7683_STANDARD) {
+			let origin_domain = self.resolve_domain(params.origin_chain_id)?;
+			if self.network_kind(params.dest_chain_id) == NetworkKind::Starknet {
+				let fee_wei = self
+					.estimate_hyperlane7683_starknet_settle_gas_payment(
+						params.dest_chain_id,
+						&params.source_settler,
+						origin_domain,
+					)
+					.await?;
+				return Ok(Some(SettlementFeeQuote {
+					fee_wei,
+					chain_id: params.dest_chain_id,
+				}));
+			}
+
+			self.require_starknet_origin_evm_settlement_enabled(origin_domain)?;
+			let fee_wei = self
+				.estimate_hyperlane7683_settle_gas_payment(
+					params.dest_chain_id,
+					&params.source_settler,
+					origin_domain,
+				)
+				.await?;
+			return Ok(Some(SettlementFeeQuote {
+				fee_wei,
+				chain_id: params.dest_chain_id,
+			}));
+		}
+
 		if self.network_kind(params.dest_chain_id) == NetworkKind::Starknet {
 			let origin_domain = self.resolve_domain(params.origin_chain_id)?;
 			let fee_wei = self
@@ -2281,10 +2329,10 @@ impl SettlementInterface for HyperlaneSettlement {
 		// Build submit call with correct payloads
 		let call_data = IHyperlaneOracle::submit_0Call {
 			destinationDomain: origin_domain,
-			recipientOracle: alloy_primitives::Address::from_slice(&recipient_oracle.0),
+			recipientOracle: Self::evm_abi_address("recipient oracle", &recipient_oracle)?,
 			gasLimit: gas_limit,
 			customMetadata: vec![].into(),
-			source: alloy_primitives::Address::from_slice(&output_settler.settler_address.0),
+			source: Self::evm_abi_address("source", &output_settler.settler_address)?,
 			payloads: payloads.into_iter().map(Into::into).collect(),
 		};
 
@@ -4380,6 +4428,7 @@ mod tests {
 			output_recipient: [0x22; 32],
 			output_call: vec![0xab, 0xcd],
 			source_settler: solver_types::Address(starknet_bytes32(0x77).to_vec()),
+			order_standard: Some(HYPERLANE7683_STANDARD.to_string()),
 		};
 
 		let quote = settlement
@@ -4438,6 +4487,7 @@ mod tests {
 			output_recipient: [0x22; 32],
 			output_call: vec![0xab, 0xcd],
 			source_settler: solver_types::Address(vec![0x55; 20]),
+			order_standard: None,
 		};
 		let expected_payload = encode_quote_fill_description(
 			[0u8; 32],
@@ -4478,6 +4528,71 @@ mod tests {
 		);
 		assert_eq!(decoded.payloads.len(), 1);
 		assert_eq!(decoded.payloads[0].as_ref(), expected_payload.as_slice());
+	}
+
+	#[tokio::test]
+	async fn hyperlane7683_quotes_evm_destination_fee_without_evm_input_oracle_address() {
+		let server = MockServer::start().await;
+		let quoted_fee = U256::from(1_234_567u64);
+		Mock::given(method("POST"))
+			.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+				"jsonrpc": "2.0",
+				"id": 1,
+				"result": format!("0x{}", hex::encode(quoted_fee.to_be_bytes::<32>()))
+			})))
+			.mount(&server)
+			.await;
+
+		let origin_chain = 700001u64;
+		let origin_domain = 700001u32;
+		let dest_chain = 1u64;
+		let destination_settler = solver_types::Address(evm_bytes32(0x55).to_vec());
+		let provider = ProviderBuilder::new()
+			.connect_http(server.uri().parse().expect("valid RPC URL"))
+			.erased();
+		let settlement = test_hyperlane_settlement_with_providers(
+			OracleConfig {
+				input_oracles: HashMap::from([(
+					origin_chain,
+					vec![solver_types::Address(starknet_bytes32(0x33).to_vec())],
+				)]),
+				output_oracles: HashMap::new(),
+				routes: HashMap::from([(origin_chain, vec![dest_chain])]),
+				selection_strategy: OracleSelectionStrategy::First,
+			},
+			HashMap::from([(dest_chain, provider)]),
+			HashMap::from([(origin_chain, origin_domain), (dest_chain, 1u32)]),
+		);
+		let params = PostFillFeeParams {
+			origin_chain_id: origin_chain,
+			dest_chain_id: dest_chain,
+			output_token: [0x11; 32],
+			output_amount: U256::from(1000u64),
+			output_recipient: [0x22; 32],
+			output_call: vec![0xab, 0xcd],
+			source_settler: destination_settler.clone(),
+			order_standard: Some(HYPERLANE7683_STANDARD.to_string()),
+		};
+
+		let quote = settlement
+			.quote_post_fill_fee(&params)
+			.await
+			.unwrap()
+			.expect("Hyperlane7683 EVM destination route has a fee");
+
+		assert_eq!(quote.fee_wei, quoted_fee);
+		assert_eq!(quote.chain_id, dest_chain);
+		let requests = server.received_requests().await.unwrap();
+		assert_eq!(requests.len(), 1);
+		let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+		let input_hex = body["params"][0]["input"].as_str().unwrap();
+		let input = hex::decode(input_hex.trim_start_matches("0x")).unwrap();
+		let decoded = IHyperlane7683::quoteGasPaymentCall::abi_decode(&input).unwrap();
+		assert_eq!(decoded._destinationDomain, origin_domain);
+		assert_eq!(
+			body["params"][0]["to"].as_str().unwrap().to_lowercase(),
+			format!("0x{}", hex::encode([0x55u8; 20]))
+		);
 	}
 
 	#[tokio::test]

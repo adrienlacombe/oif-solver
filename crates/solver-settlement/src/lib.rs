@@ -200,6 +200,8 @@ pub struct PostFillFeeParams {
 	pub output_call: Vec<u8>,
 	/// Output settler that attests on the destination chain.
 	pub source_settler: Address,
+	/// Order standard when quoting for an already-opened order.
+	pub order_standard: Option<String>,
 }
 
 /// Native-token settlement-message fee quote returned by a backend.
@@ -1459,6 +1461,7 @@ mod tests {
 			output_recipient: [0u8; 32],
 			output_call: vec![],
 			source_settler: addr(0x11),
+			order_standard: None,
 		};
 
 		assert!(settlement
@@ -1477,6 +1480,7 @@ mod tests {
 			output_recipient: [0u8; 32],
 			output_call: vec![],
 			source_settler: addr(0x11),
+			order_standard: None,
 		}
 	}
 

@@ -2600,6 +2600,7 @@ impl CostProfitService {
 			output_recipient,
 			output_call,
 			source_settler,
+			order_standard: None,
 		}))
 	}
 
@@ -2645,6 +2646,7 @@ impl CostProfitService {
 			output_recipient,
 			output_call,
 			source_settler,
+			order_standard: Some(order.standard.clone()),
 		}))
 	}
 
