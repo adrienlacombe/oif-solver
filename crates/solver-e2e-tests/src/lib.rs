@@ -1851,11 +1851,15 @@ fn build_seed_overrides(
 		SettlementTypeOverride, Token,
 	};
 
+	fn solver_address(address: Address) -> solver_types::Address {
+		address.into()
+	}
+
 	fn token(symbol: &str, address: Address) -> Token {
 		Token {
 			symbol: symbol.to_string(),
 			name: Some(symbol.to_string()),
-			address,
+			address: solver_address(address),
 			decimals: 18,
 		}
 	}
@@ -1871,8 +1875,8 @@ fn build_seed_overrides(
 			kind: Some(NetworkKind::Evm),
 			tokens: vec![token("TOKA", d.token_a), token("TOKB", d.token_b)],
 			rpc_urls: Some(vec![d.rpc_http.clone()]),
-			input_settler_address: Some(d.input_settler),
-			output_settler_address: Some(d.output_settler),
+			input_settler_address: Some(solver_address(d.input_settler)),
+			output_settler_address: Some(solver_address(d.output_settler)),
 			input_settler_compact_address: d.input_settler_compact,
 			the_compact_address: d.the_compact,
 			allocator_address: d.allocator,
@@ -1880,11 +1884,17 @@ fn build_seed_overrides(
 	}
 
 	let mut input_oracles = HashMap::new();
-	input_oracles.insert(origin.chain_id, vec![origin.input_oracle]);
-	input_oracles.insert(destination.chain_id, vec![destination.input_oracle]);
+	input_oracles.insert(origin.chain_id, vec![solver_address(origin.input_oracle)]);
+	input_oracles.insert(
+		destination.chain_id,
+		vec![solver_address(destination.input_oracle)],
+	);
 	let mut output_oracles = HashMap::new();
-	output_oracles.insert(origin.chain_id, vec![origin.output_oracle]);
-	output_oracles.insert(destination.chain_id, vec![destination.output_oracle]);
+	output_oracles.insert(origin.chain_id, vec![solver_address(origin.output_oracle)]);
+	output_oracles.insert(
+		destination.chain_id,
+		vec![solver_address(destination.output_oracle)],
+	);
 
 	let mut routes = HashMap::new();
 	routes.insert(origin.chain_id, vec![destination.chain_id]);
@@ -1903,14 +1913,14 @@ fn build_seed_overrides(
 			anyhow!("destination mock_mailbox missing — set use_hyperlane_settlement")
 		})?;
 		let mut mailboxes = HashMap::new();
-		mailboxes.insert(origin.chain_id, origin_mailbox);
-		mailboxes.insert(destination.chain_id, dest_mailbox);
+		mailboxes.insert(origin.chain_id, solver_address(origin_mailbox));
+		mailboxes.insert(destination.chain_id, solver_address(dest_mailbox));
 		// IGP addresses are only validated for presence; the on-chain gas
 		// quote goes through `mailbox.quoteDispatch` (which our mock returns
 		// 0 for). Reuse the mailbox address as the IGP placeholder.
 		let mut igp_addresses = HashMap::new();
-		igp_addresses.insert(origin.chain_id, origin_mailbox);
-		igp_addresses.insert(destination.chain_id, dest_mailbox);
+		igp_addresses.insert(origin.chain_id, solver_address(origin_mailbox));
+		igp_addresses.insert(destination.chain_id, solver_address(dest_mailbox));
 
 		let hyperlane = HyperlaneSettlementOverride {
 			mailboxes,
