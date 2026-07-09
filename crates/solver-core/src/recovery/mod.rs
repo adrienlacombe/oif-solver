@@ -17,10 +17,10 @@ use solver_delivery::DeliveryService;
 use solver_settlement::{SettlementReadiness, SettlementService};
 use solver_storage::{QueryFilter, StorageService};
 use solver_types::{
-	with_0x_prefix, DeliveryEvent, Hyperlane7683ResolvedOrder, Intent, Order, OrderEvent,
-	OrderStatus, SettlementEvent, SolverEvent, StorageKey, TransactionAttempt,
-	TransactionAttemptStatus, TransactionHash, TransactionReceipt, TransactionType,
-	HYPERLANE7683_STANDARD,
+	current_timestamp, with_0x_prefix, DeliveryEvent, FillProof, Hyperlane7683OrderStatus,
+	Hyperlane7683ResolvedOrder, Intent, Order, OrderEvent, OrderStatus, SettlementEvent,
+	SolverEvent, StorageKey, TransactionAttempt, TransactionAttemptStatus, TransactionHash,
+	TransactionReceipt, TransactionType, HYPERLANE7683_STANDARD,
 };
 use std::sync::Arc;
 use thiserror::Error;
@@ -294,6 +294,13 @@ enum StageResolution {
 	NotFound,
 	Unknown,
 	Terminated,
+}
+
+enum Hyperlane7683ClaimRecoverySignal {
+	Finalized,
+	NeedsClaim(FillProof),
+	Unknown,
+	NoSignal,
 }
 
 fn set_order_stage_hash(order: &mut Order, tx_type: TransactionType, tx_hash: TransactionHash) {
@@ -815,6 +822,210 @@ impl RecoveryService {
 		StageResolution::NotFound
 	}
 
+	async fn hyperlane7683_claim_recovery_signal(
+		&self,
+		order: &mut Order,
+	) -> Hyperlane7683ClaimRecoverySignal {
+		if order.standard != HYPERLANE7683_STANDARD {
+			return Hyperlane7683ClaimRecoverySignal::NoSignal;
+		}
+		if !matches!(order.status, OrderStatus::Settled | OrderStatus::PreClaimed) {
+			return Hyperlane7683ClaimRecoverySignal::NoSignal;
+		}
+		if !order.claim_transaction_hashes().is_empty() {
+			return Hyperlane7683ClaimRecoverySignal::NoSignal;
+		}
+
+		let resolved_order =
+			match serde_json::from_value::<Hyperlane7683ResolvedOrder>(order.data.clone()) {
+				Ok(resolved_order) => resolved_order,
+				Err(error) => {
+					tracing::warn!(
+						order_id = %order.id,
+						%error,
+						"Hyperlane7683 claim recovery could not decode resolved order"
+					);
+					return Hyperlane7683ClaimRecoverySignal::Unknown;
+				},
+			};
+
+		let origin_chain_id = match order.input_chains.first().map(|chain| chain.chain_id) {
+			Some(chain_id) => chain_id,
+			None => {
+				tracing::warn!(
+					order_id = %order.id,
+					"Hyperlane7683 claim recovery skipped: order has no input chain"
+				);
+				return Hyperlane7683ClaimRecoverySignal::Unknown;
+			},
+		};
+		let origin_network = match self.networks_config.get(&origin_chain_id) {
+			Some(network) => network,
+			None => {
+				tracing::warn!(
+					order_id = %order.id,
+					origin_chain_id,
+					"Hyperlane7683 claim recovery skipped: no origin NetworkConfig"
+				);
+				return Hyperlane7683ClaimRecoverySignal::Unknown;
+			},
+		};
+
+		match self
+			.delivery
+			.get_hyperlane7683_order_status(
+				origin_chain_id,
+				&origin_network.input_settler_address,
+				resolved_order.order_id,
+			)
+			.await
+		{
+			Ok(Hyperlane7683OrderStatus::Settled) => {
+				tracing::info!(
+					order_id = %order.id,
+					origin_chain_id,
+					"Hyperlane7683 claim recovery found origin order_status SETTLED"
+				);
+				return Hyperlane7683ClaimRecoverySignal::Finalized;
+			},
+			Ok(status) => {
+				tracing::debug!(
+					order_id = %order.id,
+					origin_chain_id,
+					?status,
+					"Hyperlane7683 claim recovery origin status is not settled"
+				);
+			},
+			Err(error) => {
+				tracing::warn!(
+					order_id = %order.id,
+					origin_chain_id,
+					%error,
+					"Hyperlane7683 claim recovery could not query origin order_status"
+				);
+				return Hyperlane7683ClaimRecoverySignal::Unknown;
+			},
+		}
+
+		for instruction in &resolved_order.fill_instructions {
+			let destination_chain_id = match instruction.destination_domain() {
+				Ok(domain) => u64::from(domain),
+				Err(error) => {
+					tracing::warn!(
+						order_id = %order.id,
+						%error,
+						"Hyperlane7683 claim recovery found invalid destination domain"
+					);
+					return Hyperlane7683ClaimRecoverySignal::Unknown;
+				},
+			};
+			let destination_settler =
+				solver_types::Address(instruction.destination_settler.to_vec());
+
+			match self
+				.delivery
+				.get_hyperlane7683_order_status(
+					destination_chain_id,
+					&destination_settler,
+					resolved_order.order_id,
+				)
+				.await
+			{
+				Ok(Hyperlane7683OrderStatus::Filled) => {
+					let fill_proof = match self
+						.ensure_hyperlane7683_recovery_fill_proof(order, resolved_order.order_id)
+						.await
+					{
+						Some(fill_proof) => fill_proof,
+						None => return Hyperlane7683ClaimRecoverySignal::Unknown,
+					};
+					tracing::info!(
+						order_id = %order.id,
+						destination_chain_id,
+						"Hyperlane7683 claim recovery found destination order_status FILLED; retrying claim"
+					);
+					return Hyperlane7683ClaimRecoverySignal::NeedsClaim(fill_proof);
+				},
+				Ok(status) => {
+					tracing::debug!(
+						order_id = %order.id,
+						destination_chain_id,
+						?status,
+						"Hyperlane7683 claim recovery destination status is not fill-ready"
+					);
+				},
+				Err(error) => {
+					tracing::warn!(
+						order_id = %order.id,
+						destination_chain_id,
+						%error,
+						"Hyperlane7683 claim recovery could not query destination order_status"
+					);
+					return Hyperlane7683ClaimRecoverySignal::Unknown;
+				},
+			}
+		}
+
+		Hyperlane7683ClaimRecoverySignal::NoSignal
+	}
+
+	async fn ensure_hyperlane7683_recovery_fill_proof(
+		&self,
+		order: &mut Order,
+		hyperlane_order_id: [u8; 32],
+	) -> Option<FillProof> {
+		if let Some(fill_proof) = order.fill_proof.clone() {
+			return Some(fill_proof);
+		}
+
+		let tx_hash = order
+			.fill_transaction_hashes()
+			.into_iter()
+			.next()
+			.unwrap_or_else(|| TransactionHash(hyperlane_order_id.to_vec()));
+		let fill_proof = FillProof {
+			tx_hash,
+			block_number: 0,
+			attestation_data: None,
+			filled_timestamp: current_timestamp(),
+			oracle_address: "0x0000000000000000000000000000000000000000".to_string(),
+		};
+
+		match self
+			.state_machine
+			.set_fill_proof(&order.id, fill_proof.clone())
+			.await
+		{
+			Ok(updated) => {
+				order.fill_proof = updated.fill_proof;
+				Some(fill_proof)
+			},
+			Err(error) => {
+				tracing::warn!(
+					order_id = %order.id,
+					%error,
+					"Hyperlane7683 claim recovery could not persist synthetic fill proof"
+				);
+				None
+			},
+		}
+	}
+
+	fn hyperlane7683_signal_to_result(
+		signal: Hyperlane7683ClaimRecoverySignal,
+	) -> Option<ReconcileResult> {
+		match signal {
+			Hyperlane7683ClaimRecoverySignal::Finalized => Some(ReconcileResult::Finalized),
+			Hyperlane7683ClaimRecoverySignal::NeedsClaim(fill_proof) => {
+				Some(ReconcileResult::NeedsClaim {
+					fill_proof: Some(fill_proof),
+				})
+			},
+			Hyperlane7683ClaimRecoverySignal::Unknown => Some(ReconcileResult::Unknown),
+			Hyperlane7683ClaimRecoverySignal::NoSignal => None,
+		}
+	}
+
 	/// Handles a confirmed revert: looks up the attempt-ledger row to retrieve
 	/// the original `tx` + `signer`, replays via `get_revert_data` against the
 	/// failed-tx block, classifies the revert bytes, and dispatches stage
@@ -1196,7 +1407,13 @@ impl RecoveryService {
 				// Reason already logged by evidence_to_resolution.
 				return Ok((order, ReconcileResult::Failed(TransactionType::Claim)));
 			},
-			StageResolution::Unknown => return Ok((order, ReconcileResult::Unknown)),
+			StageResolution::Unknown => {
+				let signal = self.hyperlane7683_claim_recovery_signal(&mut order).await;
+				if let Some(result) = Self::hyperlane7683_signal_to_result(signal) {
+					return Ok((order, result));
+				}
+				return Ok((order, ReconcileResult::Unknown));
+			},
 			StageResolution::Hash(claim_tx) => {
 				let fallback_chain_ids = claim_recovery_fallback_chain_ids(&order);
 				if fallback_chain_ids.is_empty() {
@@ -1298,7 +1515,13 @@ impl RecoveryService {
 
 				return Ok((order, ReconcileResult::Unknown));
 			},
-			StageResolution::NotFound => { /* fall through to pre-claim */ },
+			StageResolution::NotFound => {
+				let signal = self.hyperlane7683_claim_recovery_signal(&mut order).await;
+				if let Some(result) = Self::hyperlane7683_signal_to_result(signal) {
+					return Ok((order, result));
+				}
+				/* fall through to pre-claim */
+			},
 		}
 
 		// Check pre-claim transaction
@@ -2111,9 +2334,10 @@ mod tests {
 	use solver_types::{
 		standards::eip7683::LockType,
 		utils::tests::builders::{Eip7683OrderDataBuilder, IntentBuilder, OrderBuilder},
-		Address, ExecutionParams, FillProof, Hyperlane7683FillInstruction, Hyperlane7683Output,
-		Hyperlane7683ResolvedOrder, Transaction, TransactionAttempt, TransactionAttemptStatus,
-		TransactionHash, TransactionReceipt, HYPERLANE7683_STANDARD,
+		Address, ExecutionParams, FillProof, Hyperlane7683FillInstruction,
+		Hyperlane7683OrderStatus, Hyperlane7683Output, Hyperlane7683ResolvedOrder, Transaction,
+		TransactionAttempt, TransactionAttemptStatus, TransactionHash, TransactionReceipt,
+		HYPERLANE7683_STANDARD,
 	};
 	use tempfile::TempDir;
 
@@ -6107,6 +6331,249 @@ mod tests {
 			.await
 			.unwrap();
 		assert!(matches!(result, ReconcileResult::Unknown));
+		assert_eq!(repaired.claim_tx_hash, None);
+	}
+
+	#[tokio::test]
+	async fn hyperlane_claim_recovery_retries_when_origin_logs_unsupported_and_destination_filled()
+	{
+		let temp_dir = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let attempt_store = Arc::new(TransactionAttemptStore::new(storage.clone()));
+
+		let order_id = [0xd8; 32];
+		let origin_chain_id = 700_001u64;
+		let destination_chain_id = 11_155_111u64;
+		let origin_settler = Address(vec![0x0f; 32]);
+		let destination_settler_bytes = {
+			let mut bytes = [0u8; 32];
+			bytes[12..].copy_from_slice(&[0xaa; 20]);
+			bytes
+		};
+		let destination_settler = Address(destination_settler_bytes.to_vec());
+		let mut resolved_order = test_hyperlane_resolved_order(&[destination_chain_id]);
+		resolved_order.order_id = order_id;
+		resolved_order.fill_instructions[0].destination_settler = destination_settler_bytes;
+
+		let order = OrderBuilder::new()
+			.with_id(format!("0x{}", hex::encode(order_id)))
+			.with_standard(HYPERLANE7683_STANDARD)
+			.with_status(OrderStatus::Settled)
+			.with_input_chain_ids(vec![origin_chain_id])
+			.with_output_chain_ids(vec![destination_chain_id])
+			.with_data(serde_json::to_value(resolved_order).unwrap())
+			.with_fill_tx_hash(Some(TransactionHash(vec![0xbb; 32])))
+			.with_claim_tx_hash(None)
+			.build();
+		state_machine.store_order(&order).await.unwrap();
+
+		let mut networks = solver_types::NetworksConfig::new();
+		networks.insert(
+			origin_chain_id,
+			test_network_config(origin_settler.clone(), Address(vec![0; 20])),
+		);
+		networks.insert(
+			destination_chain_id,
+			test_network_config(Address(vec![0; 32]), destination_settler.clone()),
+		);
+		let networks = Arc::new(networks);
+
+		let mut mock_origin = MockDeliveryInterface::new();
+		mock_origin
+			.expect_get_block_number()
+			.with(eq(origin_chain_id))
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(20_000_000u64) }));
+		mock_origin
+			.expect_get_logs()
+			.withf(move |chain_id, filter| {
+				*chain_id == origin_chain_id && matches_event::<Finalised>(filter)
+			})
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async move {
+					Err(solver_delivery::DeliveryError::Network(
+						"Starknet delivery does not support this operation: get_logs".into(),
+					))
+				})
+			});
+		mock_origin
+			.expect_get_hyperlane7683_order_status()
+			.with(eq(origin_chain_id), eq(origin_settler), eq(order_id))
+			.times(1)
+			.returning(|_, _, _| {
+				Box::pin(async move { Ok(Hyperlane7683OrderStatus::Other(b"OPENED".to_vec())) })
+			});
+
+		let mut mock_destination = MockDeliveryInterface::new();
+		mock_destination
+			.expect_get_hyperlane7683_order_status()
+			.with(
+				eq(destination_chain_id),
+				eq(destination_settler),
+				eq(order_id),
+			)
+			.times(1)
+			.returning(|_, _, _| Box::pin(async move { Ok(Hyperlane7683OrderStatus::Filled) }));
+
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([
+				(
+					origin_chain_id,
+					Arc::new(mock_origin) as Arc<dyn solver_delivery::DeliveryInterface>,
+				),
+				(
+					destination_chain_id,
+					Arc::new(mock_destination) as Arc<dyn solver_delivery::DeliveryInterface>,
+				),
+			]),
+			1,
+			20,
+			60,
+		));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
+
+		let recovery_service = RecoveryService::new(
+			storage,
+			state_machine,
+			delivery,
+			settlement,
+			EventBus::new(100),
+			attempt_store,
+			networks,
+		);
+
+		let (repaired, result) = recovery_service
+			.reconcile_with_blockchain(&order)
+			.await
+			.unwrap();
+
+		let ReconcileResult::NeedsClaim {
+			fill_proof: Some(fill_proof),
+		} = result
+		else {
+			panic!("Expected NeedsClaim with synthetic Hyperlane fill proof");
+		};
+		assert_eq!(fill_proof.block_number, 0);
+		assert_eq!(fill_proof.attestation_data, None);
+		assert!(repaired.fill_proof.is_some());
+		assert_eq!(repaired.claim_tx_hash, None);
+	}
+
+	#[tokio::test]
+	async fn hyperlane_claim_recovery_finalizes_when_origin_status_already_settled() {
+		let temp_dir = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let attempt_store = Arc::new(TransactionAttemptStore::new(storage.clone()));
+
+		let order_id = [0xe9; 32];
+		let origin_chain_id = 700_001u64;
+		let destination_chain_id = 11_155_111u64;
+		let origin_settler = Address(vec![0x0f; 32]);
+		let destination_settler_bytes = {
+			let mut bytes = [0u8; 32];
+			bytes[12..].copy_from_slice(&[0xaa; 20]);
+			bytes
+		};
+		let destination_settler = Address(destination_settler_bytes.to_vec());
+		let mut resolved_order = test_hyperlane_resolved_order(&[destination_chain_id]);
+		resolved_order.order_id = order_id;
+		resolved_order.fill_instructions[0].destination_settler = destination_settler_bytes;
+
+		let order = OrderBuilder::new()
+			.with_id(format!("0x{}", hex::encode(order_id)))
+			.with_standard(HYPERLANE7683_STANDARD)
+			.with_status(OrderStatus::Settled)
+			.with_input_chain_ids(vec![origin_chain_id])
+			.with_output_chain_ids(vec![destination_chain_id])
+			.with_data(serde_json::to_value(resolved_order).unwrap())
+			.with_fill_tx_hash(Some(TransactionHash(vec![0xbb; 32])))
+			.with_claim_tx_hash(None)
+			.build();
+		state_machine.store_order(&order).await.unwrap();
+
+		let mut networks = solver_types::NetworksConfig::new();
+		networks.insert(
+			origin_chain_id,
+			test_network_config(origin_settler.clone(), Address(vec![0; 20])),
+		);
+		networks.insert(
+			destination_chain_id,
+			test_network_config(Address(vec![0; 32]), destination_settler.clone()),
+		);
+		let networks = Arc::new(networks);
+
+		let mut mock_origin = MockDeliveryInterface::new();
+		mock_origin
+			.expect_get_block_number()
+			.with(eq(origin_chain_id))
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(20_000_000u64) }));
+		mock_origin
+			.expect_get_logs()
+			.withf(move |chain_id, filter| {
+				*chain_id == origin_chain_id && matches_event::<Finalised>(filter)
+			})
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async move {
+					Err(solver_delivery::DeliveryError::Network(
+						"Starknet delivery does not support this operation: get_logs".into(),
+					))
+				})
+			});
+		mock_origin
+			.expect_get_hyperlane7683_order_status()
+			.with(eq(origin_chain_id), eq(origin_settler), eq(order_id))
+			.times(1)
+			.returning(|_, _, _| Box::pin(async move { Ok(Hyperlane7683OrderStatus::Settled) }));
+
+		let mut mock_destination = MockDeliveryInterface::new();
+		mock_destination
+			.expect_get_hyperlane7683_order_status()
+			.times(0);
+
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([
+				(
+					origin_chain_id,
+					Arc::new(mock_origin) as Arc<dyn solver_delivery::DeliveryInterface>,
+				),
+				(
+					destination_chain_id,
+					Arc::new(mock_destination) as Arc<dyn solver_delivery::DeliveryInterface>,
+				),
+			]),
+			1,
+			20,
+			60,
+		));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
+
+		let recovery_service = RecoveryService::new(
+			storage,
+			state_machine,
+			delivery,
+			settlement,
+			EventBus::new(100),
+			attempt_store,
+			networks,
+		);
+
+		let (repaired, result) = recovery_service
+			.reconcile_with_blockchain(&order)
+			.await
+			.unwrap();
+
+		assert!(matches!(result, ReconcileResult::Finalized));
 		assert_eq!(repaired.claim_tx_hash, None);
 	}
 
