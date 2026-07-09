@@ -55,8 +55,14 @@ pad64() {
 }
 
 to_dec() {
-  local value="$1"
-  cast to-dec "$value" 2>/dev/null || echo "$value"
+	local value="$1"
+	local converted
+
+	if converted="$(cast to-dec "$value" 2>/dev/null)"; then
+		awk '{print $1}' <<<"$converted"
+	else
+		awk '{print $1}' <<<"$value"
+	fi
 }
 
 call_first_line() {
