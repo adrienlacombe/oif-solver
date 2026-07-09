@@ -1,0 +1,105 @@
+{
+  "solver_id": "oif-hyperlane7683-sepolia",
+  "solver_name": "OIF Hyperlane7683 Sepolia",
+  "min_profitability_pct": "0.0",
+  "gas_buffer_bps": 1500,
+  "networks": [
+    {
+      "chain_id": 11155111,
+      "name": "ethereum-sepolia",
+      "type": "parent",
+      "kind": "evm",
+      "rpc_urls": ["https://ethereum-sepolia.example/rpc"],
+      "input_settler_address": "0xDC110Ae9A0aE636DC28468167b36960EFC754995",
+      "output_settler_address": "0xDC110Ae9A0aE636DC28468167b36960EFC754995",
+      "tokens": [
+        {
+          "symbol": "WETH",
+          "name": "Wrapped Ether",
+          "address": "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14",
+          "decimals": 18
+        }
+      ]
+    },
+    {
+      "chain_id": 23448591,
+      "name": "starknet-sepolia",
+      "type": "new",
+      "kind": "starknet",
+      "rpc_urls": ["https://starknet-sepolia.example/rpc"],
+      "input_settler_address": "0x3a67e806aadbb58127528a18ea7363a46df360c96e3867ae7e886d9594bd87",
+      "output_settler_address": "0x3a67e806aadbb58127528a18ea7363a46df360c96e3867ae7e886d9594bd87",
+      "tokens": [
+        {
+          "symbol": "ETH",
+          "name": "Ether",
+          "address": "0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7",
+          "decimals": 18
+        }
+      ]
+    }
+  ],
+  "settlement": {
+    "type": "hyperlane",
+    "priority": ["hyperlane"],
+    "hyperlane": {
+      "mailboxes": {
+        "11155111": "0xfFAEF09B3cd11D9b20d1a19bECca54EEC2884766",
+        "23448591": "0x03c725cd6a4463e4a9258d29304bcca5e4f1bbccab078ffd69784f5193a6d792"
+      },
+      "igp_addresses": {
+        "11155111": "0x17Dc724B7a2F09141C13b8AC33B396073785c2BC",
+        "23448591": "0x1eff3a364cb5ec3ebef9267d0cc3ebcb22cb983af981d7c128fc8bad30b6bc2"
+      },
+      "domains": {
+        "11155111": 11155111,
+        "23448591": 23448591
+      },
+      "starknet_fee_token_addresses": {
+        "23448591": "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d"
+      },
+      "oracles": {
+        "input": {
+          "11155111": ["0xDC110Ae9A0aE636DC28468167b36960EFC754995"],
+          "23448591": ["0x3a67e806aadbb58127528a18ea7363a46df360c96e3867ae7e886d9594bd87"]
+        },
+        "output": {
+          "11155111": ["0xDC110Ae9A0aE636DC28468167b36960EFC754995"],
+          "23448591": ["0x3a67e806aadbb58127528a18ea7363a46df360c96e3867ae7e886d9594bd87"]
+        }
+      },
+      "routes": {
+        "11155111": [23448591],
+        "23448591": [11155111]
+      },
+      "default_gas_limit": 500000,
+      "message_timeout_seconds": 600,
+      "finalization_required": false,
+      "allow_zero_hyperlane7683_settle_quote": true,
+      "intent_min_expiry_seconds": 300
+    }
+  },
+  "source_finality": {
+    "default_mode": "numeric",
+    "default_blocks": 2,
+    "default_block_time_seconds": 12,
+    "retry_grace_seconds": 10,
+    "chains": {
+      "11155111": {
+        "mode": "numeric",
+        "blocks": 2,
+        "block_time_seconds": 12
+      },
+      "23448591": {
+        "mode": "numeric",
+        "blocks": 2,
+        "block_time_seconds": 6
+      }
+    }
+  },
+  "admin": {
+    "enabled": true,
+    "domain": "localhost",
+    "admin_addresses": ["0x1111111111111111111111111111111111111111"]
+  }
+}

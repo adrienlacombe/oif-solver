@@ -7311,6 +7311,63 @@ mod tests {
 	}
 
 	#[test]
+	fn example_hyperlane7683_sepolia_bootstrap_builds_runtime_config() {
+		let _jwt_secret = EnvVarGuard::capture("JWT_SECRET");
+		std::env::set_var("JWT_SECRET", "x".repeat(32));
+
+		let bootstrap: SeedOverrides = serde_json::from_str(include_str!(
+			"../../../config/example-hyperlane7683-sepolia.json"
+		))
+		.unwrap();
+
+		let op_config = merge_to_operator_config_seedless(bootstrap).unwrap();
+		let runtime = build_runtime_config(&op_config).unwrap();
+
+		let evm = runtime.networks.get(&11155111).unwrap();
+		assert_eq!(evm.kind, solver_types::NetworkKind::Evm);
+		assert!(evm.input_settler_address.is_evm_address());
+
+		let starknet = runtime.networks.get(&23448591).unwrap();
+		assert_eq!(starknet.kind, solver_types::NetworkKind::Starknet);
+		assert!(starknet.input_settler_address.is_bytes32_address());
+		assert!(starknet.tokens[0].address.is_bytes32_address());
+
+		let hyperlane = runtime.settlement.implementations.get("hyperlane").unwrap();
+		assert_eq!(
+			hyperlane
+				.get("allow_zero_hyperlane7683_settle_quote")
+				.and_then(|value| value.as_bool()),
+			Some(true)
+		);
+		assert_eq!(
+			hyperlane
+				.get("domains")
+				.and_then(|domains| domains.get("23448591"))
+				.and_then(|domain| domain.as_u64()),
+			Some(23448591)
+		);
+
+		assert!(runtime
+			.discovery
+			.implementations
+			.contains_key("onchain_hyperlane7683"));
+		assert!(runtime
+			.discovery
+			.implementations
+			.contains_key("onchain_starknet_hyperlane7683"));
+		assert_eq!(
+			runtime
+				.delivery
+				.implementations
+				.get("starknet")
+				.and_then(|delivery| delivery.get("chain_ids"))
+				.and_then(|chain_ids| chain_ids.get("23448591"))
+				.and_then(|chain_id| chain_id.as_str()),
+			Some(STARKNET_SEPOLIA_CHAIN_ID)
+		);
+	}
+
+	#[test]
 	fn test_build_runtime_config_backfills_legacy_empty_hyperlane_domains() {
 		let overrides = test_seed_overrides();
 		let mut op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
