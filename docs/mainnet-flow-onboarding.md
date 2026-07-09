@@ -74,9 +74,14 @@ DRY_RUN=0 \
 scripts/flow/lifi-submit-quotes.sh
 ```
 
-The `oif-solver-mainnet/lifi-solver-api-key` secret exists in AWS Secrets Manager. LI.FI address
-registration is still pending for `0xd4a1A11fb69c906D82EC7D99e91a28fc62447415`; use that address
-as `EXCLUSIVE_FOR` once LI.FI reports it under `GET /solver-api/solver/identities`.
+The `oif-solver-mainnet/lifi-solver-api-key` secret exists in AWS Secrets Manager. LI.FI reports
+`0xd4a1A11fb69c906D82EC7D99e91a28fc62447415` under `GET /solver-api/solver/identities`; use that
+address as `EXCLUSIVE_FOR`.
+
+Current Step 3 status: LI.FI accepts the registered identity but does not yet accept Ethereum <->
+Starknet quote routes. `GET /chains/supported` does not list Starknet, V1 quote requests reject
+`starknet:*` CAIP-2 namespaces, and quote submission rejects 32-byte Starknet asset addresses.
+Ask LI.FI to enable Starknet in the LI.FI Intent protocol before publishing standing quotes.
 
 The account currently has no issued ACM certificate or Route53 hosted zone visible through the
 `alc` AWS profile. Those are external onboarding items, not code changes.
@@ -86,10 +91,9 @@ The account currently has no issued ACM certificate or Route53 hosted zone visib
 The quote publisher defaults to conservative route ranges. Tune these from live inventory and
 realized PnL:
 
-- `MIN_AMOUNT`
-- `MAX_AMOUNT`
+- `MIN_AMOUNT` (raw source-asset base units)
+- `MAX_AMOUNT` (raw source-asset base units)
 - `QUOTE_RATE`
-- `MAX_TO_AMOUNT`
 - `EXPIRY_SECONDS`
 
 Operationally, keep these dashboards/alarms green before scaling flow:
