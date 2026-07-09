@@ -68,5 +68,5 @@ fi
 
 curl -fsS -X POST "$LIFI_ORDER_URL/quotes/submit" \
   -H 'Content-Type: application/json' \
-  -H "api-key: $LIFI_SOLVER_API_KEY" \
+  -H "x-api-key: $LIFI_SOLVER_API_KEY" \
   -d "$payload" | jq .

@@ -74,9 +74,12 @@ DRY_RUN=0 \
 scripts/flow/lifi-submit-quotes.sh
 ```
 
-The account currently has no `LIFI_SOLVER_API_KEY` secret, no issued ACM certificate, and no
-Route53 hosted zone visible through the `alc` AWS profile. Those are external onboarding items,
-not code changes.
+The `oif-solver-mainnet/lifi-solver-api-key` secret exists in AWS Secrets Manager. LI.FI address
+registration is still pending for `0xd4a1A11fb69c906D82EC7D99e91a28fc62447415`; use that address
+as `EXCLUSIVE_FOR` once LI.FI reports it under `GET /solver-api/solver/identities`.
+
+The account currently has no issued ACM certificate or Route53 hosted zone visible through the
+`alc` AWS profile. Those are external onboarding items, not code changes.
 
 ## Quote Competitiveness
 
