@@ -321,6 +321,14 @@ pub struct HyperlaneSettlementOverride {
 	#[serde(default)]
 	pub finalization_required: Option<bool>,
 
+	/// Allows Hyperlane7683 settlement against mocks that quote zero gas.
+	///
+	/// Production deployments should leave this unset/false; a zero quote from
+	/// a real Hyperlane route usually means the destination gas payment is not
+	/// configured.
+	#[serde(default)]
+	pub allow_zero_hyperlane7683_settle_quote: Option<bool>,
+
 	/// Optional minimum required `expires` window (seconds) for accepting intents.
 	#[serde(default)]
 	pub intent_min_expiry_seconds: Option<u64>,

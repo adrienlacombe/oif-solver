@@ -278,6 +278,10 @@ pub mod interfaces {
 			function fill(bytes32 _orderId, bytes calldata _originData, bytes calldata _fillerData) external payable;
 			function settle(bytes32[] calldata _orderIds) external payable;
 			function orderStatus(bytes32 orderId) external view returns (bytes32 status);
+			function filledOrders(bytes32 orderId) external view returns (bytes memory originData, bytes memory fillerData);
+			function mailbox() external view returns (address);
+			function hook() external view returns (address);
+			function destinationGas(uint32 domain) external view returns (uint256);
 			function quoteGasPayment(uint32 _destinationDomain) external view returns (uint256);
 			function routers(uint32 _domain) external view returns (bytes32);
 		}

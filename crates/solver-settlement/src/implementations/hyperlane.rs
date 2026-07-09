@@ -14,9 +14,9 @@ use crate::{
 	},
 	OracleConfig, PostFillFeeParams, SettlementError, SettlementFeeQuote, SettlementInterface,
 };
-use alloy_primitives::{hex, FixedBytes, U256};
+use alloy_primitives::{hex, Address as AlloyAddress, Bytes, FixedBytes, U256};
 use alloy_provider::{DynProvider, Provider};
-use alloy_sol_types::{sol, SolCall};
+use alloy_sol_types::{sol, SolCall, SolValue};
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
@@ -300,6 +300,16 @@ sol! {
 
 	// Alternative dispatch event format
 	event DispatchId(bytes32 indexed messageId);
+
+	interface IHyperlaneMailbox {
+		function quoteDispatch(
+			uint32 destinationDomain,
+			bytes32 recipientAddress,
+			bytes calldata messageBody,
+			bytes calldata customHookMetadata,
+			address customHook
+		) external view returns (uint256 fee);
+	}
 }
 
 /// Message state for a single order
@@ -892,6 +902,12 @@ impl HyperlaneSettlement {
 		// Create message tracker with storage
 		let message_tracker = MessageTracker::new(storage);
 
+		if allow_zero_hyperlane7683_settle_quote {
+			tracing::warn!(
+				"Hyperlane7683 zero settle gas quotes are allowed; this is intended only for local/mock deployments"
+			);
+		}
+
 		Ok(Self {
 			providers,
 			network_kinds,
@@ -1339,6 +1355,296 @@ impl HyperlaneSettlement {
 		}))
 	}
 
+	async fn call_evm_view(
+		provider: &DynProvider,
+		to: AlloyAddress,
+		input: Vec<u8>,
+		context: &str,
+	) -> Result<Bytes, SettlementError> {
+		let call_request = alloy_rpc_types::eth::transaction::TransactionRequest {
+			to: Some(alloy_primitives::TxKind::Call(to)),
+			input: input.into(),
+			..Default::default()
+		};
+		provider
+			.call(call_request)
+			.block(alloy_rpc_types::eth::BlockId::latest())
+			.await
+			.map_err(|e| SettlementError::BackendUnavailable(format!("{context}: {e}")))
+	}
+
+	fn standard_hook_metadata_override_gas_limit(
+		gas_limit: U256,
+		refund_address: AlloyAddress,
+	) -> Vec<u8> {
+		let mut metadata = Vec::with_capacity(86);
+		metadata.extend_from_slice(&1u16.to_be_bytes());
+		metadata.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+		metadata.extend_from_slice(&gas_limit.to_be_bytes::<32>());
+		metadata.extend_from_slice(refund_address.as_slice());
+		metadata
+	}
+
+	fn hyperlane7683_settle_message_body(order_id: [u8; 32], filler_data: Bytes) -> Vec<u8> {
+		(
+			true,
+			vec![FixedBytes::<32>::from(order_id)],
+			vec![filler_data],
+		)
+			.abi_encode()
+	}
+
+	fn evm_solver_refund_address(&self, order: &Order) -> Result<AlloyAddress, SettlementError> {
+		let address = self
+			.solver_identities
+			.evm
+			.as_ref()
+			.unwrap_or(&order.solver_address);
+		Self::evm_abi_address("solver refund address", address)
+	}
+
+	fn validate_hyperlane7683_settle_quote(
+		&self,
+		quote: U256,
+		destination_chain_id: u64,
+		quote_source: &str,
+	) -> Result<U256, SettlementError> {
+		if quote == U256::ZERO && !self.allow_zero_hyperlane7683_settle_quote {
+			return Err(SettlementError::ValidationFailed(format!(
+				"Hyperlane7683 settle gas payment quote is zero on destination chain {destination_chain_id} from {quote_source}; set allow_zero_hyperlane7683_settle_quote only for environments where this is expected"
+			)));
+		}
+
+		Ok(quote)
+	}
+
+	async fn try_estimate_hyperlane7683_settle_dispatch_payment(
+		&self,
+		destination_chain_id: u64,
+		destination_settler: &solver_types::Address,
+		origin_domain: u32,
+		order_id: [u8; 32],
+		refund_address: AlloyAddress,
+	) -> Result<Option<U256>, SettlementError> {
+		let provider = self.providers.get(&destination_chain_id).ok_or_else(|| {
+			SettlementError::ValidationFailed(format!(
+				"No provider for Hyperlane7683 destination chain {destination_chain_id}"
+			))
+		})?;
+		let settler = Self::evm_abi_address("destination settler", destination_settler)?;
+
+		let mailbox = match Self::call_evm_view(
+			provider,
+			settler,
+			IHyperlane7683::mailboxCall {}.abi_encode(),
+			"Hyperlane7683 mailbox lookup failed",
+		)
+		.await
+		.and_then(|result| {
+			IHyperlane7683::mailboxCall::abi_decode_returns(&result).map_err(|e| {
+				SettlementError::BackendUnavailable(format!(
+					"Failed to decode Hyperlane7683 mailbox result: {e}"
+				))
+			})
+		}) {
+			Ok(mailbox) => mailbox,
+			Err(error) => {
+				tracing::warn!(
+					destination_chain_id,
+					error = %error,
+					"Hyperlane7683 full settle dispatch quote unavailable; falling back to quoteGasPayment"
+				);
+				return Ok(None);
+			},
+		};
+
+		let hook = match Self::call_evm_view(
+			provider,
+			settler,
+			IHyperlane7683::hookCall {}.abi_encode(),
+			"Hyperlane7683 hook lookup failed",
+		)
+		.await
+		.and_then(|result| {
+			IHyperlane7683::hookCall::abi_decode_returns(&result).map_err(|e| {
+				SettlementError::BackendUnavailable(format!(
+					"Failed to decode Hyperlane7683 hook result: {e}"
+				))
+			})
+		}) {
+			Ok(hook) => hook,
+			Err(error) => {
+				tracing::warn!(
+					destination_chain_id,
+					error = %error,
+					"Hyperlane7683 full settle dispatch quote unavailable; falling back to quoteGasPayment"
+				);
+				return Ok(None);
+			},
+		};
+
+		let destination_gas = match Self::call_evm_view(
+			provider,
+			settler,
+			IHyperlane7683::destinationGasCall {
+				domain: origin_domain,
+			}
+			.abi_encode(),
+			"Hyperlane7683 destinationGas lookup failed",
+		)
+		.await
+		.and_then(|result| {
+			IHyperlane7683::destinationGasCall::abi_decode_returns(&result).map_err(|e| {
+				SettlementError::BackendUnavailable(format!(
+					"Failed to decode Hyperlane7683 destinationGas result: {e}"
+				))
+			})
+		}) {
+			Ok(destination_gas) => destination_gas,
+			Err(error) => {
+				tracing::warn!(
+					destination_chain_id,
+					error = %error,
+					"Hyperlane7683 full settle dispatch quote unavailable; falling back to quoteGasPayment"
+				);
+				return Ok(None);
+			},
+		};
+
+		let router = match Self::call_evm_view(
+			provider,
+			settler,
+			IHyperlane7683::routersCall {
+				_domain: origin_domain,
+			}
+			.abi_encode(),
+			"Hyperlane7683 router lookup failed",
+		)
+		.await
+		.and_then(|result| {
+			IHyperlane7683::routersCall::abi_decode_returns(&result).map_err(|e| {
+				SettlementError::BackendUnavailable(format!(
+					"Failed to decode Hyperlane7683 routers result: {e}"
+				))
+			})
+		}) {
+			Ok(router) => router,
+			Err(error) => {
+				tracing::warn!(
+					destination_chain_id,
+					error = %error,
+					"Hyperlane7683 full settle dispatch quote unavailable; falling back to quoteGasPayment"
+				);
+				return Ok(None);
+			},
+		};
+		if router.as_slice().iter().all(|byte| *byte == 0) {
+			return Err(SettlementError::ValidationFailed(format!(
+				"Hyperlane7683 destination settler {destination_settler} has no router enrolled for origin domain {origin_domain}"
+			)));
+		}
+
+		let filled_order = match Self::call_evm_view(
+			provider,
+			settler,
+			IHyperlane7683::filledOrdersCall {
+				orderId: FixedBytes::<32>::from(order_id),
+			}
+			.abi_encode(),
+			"Hyperlane7683 filledOrders lookup failed",
+		)
+		.await
+		.and_then(|result| {
+			IHyperlane7683::filledOrdersCall::abi_decode_returns(&result).map_err(|e| {
+				SettlementError::BackendUnavailable(format!(
+					"Failed to decode Hyperlane7683 filledOrders result: {e}"
+				))
+			})
+		}) {
+			Ok(filled_order) => filled_order,
+			Err(error) => {
+				tracing::warn!(
+					destination_chain_id,
+					error = %error,
+					"Hyperlane7683 full settle dispatch quote unavailable; falling back to quoteGasPayment"
+				);
+				return Ok(None);
+			},
+		};
+
+		let message_body =
+			Self::hyperlane7683_settle_message_body(order_id, filled_order.fillerData);
+		let hook_metadata =
+			Self::standard_hook_metadata_override_gas_limit(destination_gas, refund_address);
+		let quote_call = IHyperlaneMailbox::quoteDispatchCall {
+			destinationDomain: origin_domain,
+			recipientAddress: router,
+			messageBody: Bytes::from(message_body),
+			customHookMetadata: Bytes::from(hook_metadata),
+			customHook: hook,
+		};
+		let quote = match Self::call_evm_view(
+			provider,
+			mailbox,
+			quote_call.abi_encode(),
+			"Hyperlane mailbox quoteDispatch failed",
+		)
+		.await
+		.and_then(|result| {
+			IHyperlaneMailbox::quoteDispatchCall::abi_decode_returns(&result).map_err(|e| {
+				SettlementError::BackendUnavailable(format!(
+					"Failed to decode Hyperlane mailbox quoteDispatch result: {e}"
+				))
+			})
+		}) {
+			Ok(quote) => quote,
+			Err(error) => {
+				tracing::warn!(
+					destination_chain_id,
+					error = %error,
+					"Hyperlane7683 full settle dispatch quote unavailable; falling back to quoteGasPayment"
+				);
+				return Ok(None);
+			},
+		};
+
+		Ok(Some(quote))
+	}
+
+	async fn estimate_hyperlane7683_settle_dispatch_payment(
+		&self,
+		order: &Order,
+		destination_chain_id: u64,
+		destination_settler: &solver_types::Address,
+		origin_domain: u32,
+		order_id: [u8; 32],
+	) -> Result<U256, SettlementError> {
+		let refund_address = self.evm_solver_refund_address(order)?;
+		if let Some(quote) = self
+			.try_estimate_hyperlane7683_settle_dispatch_payment(
+				destination_chain_id,
+				destination_settler,
+				origin_domain,
+				order_id,
+				refund_address,
+			)
+			.await?
+		{
+			return self.validate_hyperlane7683_settle_quote(
+				quote,
+				destination_chain_id,
+				"Mailbox.quoteDispatch",
+			);
+		}
+
+		self.estimate_hyperlane7683_settle_gas_payment(
+			destination_chain_id,
+			destination_settler,
+			origin_domain,
+		)
+		.await
+	}
+
 	async fn estimate_hyperlane7683_settle_gas_payment(
 		&self,
 		destination_chain_id: u64,
@@ -1377,13 +1683,7 @@ impl HyperlaneSettlement {
 					"Failed to decode Hyperlane7683 quoteGasPayment result: {e}"
 				))
 			})?;
-		if quote == U256::ZERO && !self.allow_zero_hyperlane7683_settle_quote {
-			return Err(SettlementError::ValidationFailed(format!(
-				"Hyperlane7683 settle gas payment quote is zero on destination chain {destination_chain_id}; set allow_zero_hyperlane7683_settle_quote only for environments where this is expected"
-			)));
-		}
-
-		Ok(quote)
+		self.validate_hyperlane7683_settle_quote(quote, destination_chain_id, "quoteGasPayment")
 	}
 
 	async fn get_hyperlane7683_order_status(
@@ -1466,10 +1766,12 @@ impl HyperlaneSettlement {
 		self.require_starknet_origin_evm_settlement_enabled(origin_domain)?;
 
 		let gas_payment = self
-			.estimate_hyperlane7683_settle_gas_payment(
+			.estimate_hyperlane7683_settle_dispatch_payment(
+				order,
 				leg.destination_chain_id,
 				&destination_settler,
 				origin_domain,
+				resolved_order.order_id,
 			)
 			.await?;
 
@@ -1891,6 +2193,13 @@ fn parse_starknet_address_table(
 	}
 
 	Ok(result)
+}
+
+fn allow_zero_hyperlane7683_settle_quote_from_config(config: &serde_json::Value) -> bool {
+	config
+		.get("allow_zero_hyperlane7683_settle_quote")
+		.and_then(|v| v.as_bool())
+		.unwrap_or(false)
 }
 
 /// Configuration schema for HyperlaneSettlement
@@ -2465,10 +2774,8 @@ pub fn create_settlement(
 		.get("default_gas_limit")
 		.and_then(|v| v.as_i64())
 		.unwrap_or(500000) as u64;
-	let allow_zero_hyperlane7683_settle_quote = config
-		.get("allow_zero_hyperlane7683_settle_quote")
-		.and_then(|v| v.as_bool())
-		.unwrap_or(false);
+	let allow_zero_hyperlane7683_settle_quote =
+		allow_zero_hyperlane7683_settle_quote_from_config(config);
 
 	// Create settlement service synchronously
 	let settlement = tokio::task::block_in_place(|| {
@@ -2587,6 +2894,48 @@ mod tests {
 
 	fn quote_gas_payment_selector_hex() -> String {
 		hex::encode(IHyperlane7683::quoteGasPaymentCall::SELECTOR)
+	}
+
+	fn quote_dispatch_selector_hex() -> String {
+		hex::encode(IHyperlaneMailbox::quoteDispatchCall::SELECTOR)
+	}
+
+	fn mailbox_selector_hex() -> String {
+		hex::encode(IHyperlane7683::mailboxCall::SELECTOR)
+	}
+
+	fn hook_selector_hex() -> String {
+		hex::encode(IHyperlane7683::hookCall::SELECTOR)
+	}
+
+	fn destination_gas_selector_hex() -> String {
+		hex::encode(IHyperlane7683::destinationGasCall::SELECTOR)
+	}
+
+	fn routers_selector_hex() -> String {
+		hex::encode(IHyperlane7683::routersCall::SELECTOR)
+	}
+
+	fn filled_orders_selector_hex() -> String {
+		hex::encode(IHyperlane7683::filledOrdersCall::SELECTOR)
+	}
+
+	fn rpc_result_hex(data: Vec<u8>) -> serde_json::Value {
+		serde_json::json!({
+			"jsonrpc": "2.0",
+			"id": 1,
+			"result": format!("0x{}", hex::encode(data)),
+		})
+	}
+
+	fn rpc_result_u256(value: U256) -> serde_json::Value {
+		rpc_result_hex(value.to_be_bytes::<32>().to_vec())
+	}
+
+	fn rpc_result_address(byte: u8) -> serde_json::Value {
+		let mut bytes = [0u8; 32];
+		bytes[12..].fill(byte);
+		rpc_result_hex(bytes.to_vec())
 	}
 
 	fn starknet_selector_hex(entrypoint: &str) -> String {
@@ -2811,6 +3160,22 @@ mod tests {
 			err.to_string().contains("Missing required field: domains"),
 			"unexpected error: {err}"
 		);
+	}
+
+	#[test]
+	fn hyperlane_zero_hyperlane7683_settle_quote_flag_defaults_false() {
+		assert!(!allow_zero_hyperlane7683_settle_quote_from_config(
+			&serde_json::json!({})
+		));
+	}
+
+	#[test]
+	fn hyperlane_zero_hyperlane7683_settle_quote_flag_parses_true() {
+		assert!(allow_zero_hyperlane7683_settle_quote_from_config(
+			&serde_json::json!({
+				"allow_zero_hyperlane7683_settle_quote": true
+			})
+		));
 	}
 
 	// Shared helpers for OutputFilled emitter-filter tests.
@@ -3566,6 +3931,9 @@ mod tests {
 	async fn hyperlane7683_claim_quotes_settle_fee_and_encodes_settle_call() {
 		let server = MockServer::start().await;
 		let quoted_fee = U256::from(123_456_789u64);
+		let destination_gas = U256::from(555_000u64);
+		let router = [0x99; 32];
+		let filler_data = vec![0xfe; 32];
 		Mock::given(method("POST"))
 			.and(body_string_contains(order_status_selector_hex()))
 			.respond_with(
@@ -3575,12 +3943,43 @@ mod tests {
 			.mount(&server)
 			.await;
 		Mock::given(method("POST"))
-			.and(body_string_contains(quote_gas_payment_selector_hex()))
-			.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-				"jsonrpc": "2.0",
-				"id": 1,
-				"result": format!("0x{}", hex::encode(quoted_fee.to_be_bytes::<32>()))
-			})))
+			.and(body_string_contains(mailbox_selector_hex()))
+			.respond_with(ResponseTemplate::new(200).set_body_json(rpc_result_address(0x66)))
+			.mount(&server)
+			.await;
+		Mock::given(method("POST"))
+			.and(body_string_contains(hook_selector_hex()))
+			.respond_with(ResponseTemplate::new(200).set_body_json(rpc_result_address(0x88)))
+			.mount(&server)
+			.await;
+		Mock::given(method("POST"))
+			.and(body_string_contains(destination_gas_selector_hex()))
+			.respond_with(
+				ResponseTemplate::new(200).set_body_json(rpc_result_u256(destination_gas)),
+			)
+			.mount(&server)
+			.await;
+		Mock::given(method("POST"))
+			.and(body_string_contains(routers_selector_hex()))
+			.respond_with(ResponseTemplate::new(200).set_body_json(rpc_result_hex(router.to_vec())))
+			.mount(&server)
+			.await;
+		Mock::given(method("POST"))
+			.and(body_string_contains(filled_orders_selector_hex()))
+			.respond_with(
+				ResponseTemplate::new(200).set_body_json(rpc_result_hex(
+					(
+						Bytes::from(vec![0xaa, 0xbb]),
+						Bytes::from(filler_data.clone()),
+					)
+						.abi_encode_params(),
+				)),
+			)
+			.mount(&server)
+			.await;
+		Mock::given(method("POST"))
+			.and(body_string_contains(quote_dispatch_selector_hex()))
+			.respond_with(ResponseTemplate::new(200).set_body_json(rpc_result_u256(quoted_fee)))
 			.mount(&server)
 			.await;
 
@@ -3612,20 +4011,41 @@ mod tests {
 		assert_eq!(settle._orderIds, vec![FixedBytes::<32>::from(order_id)]);
 
 		let requests = server.received_requests().await.unwrap();
-		assert_eq!(requests.len(), 2);
+		assert_eq!(requests.len(), 7);
 		let body: serde_json::Value = requests
 			.iter()
 			.map(|request| serde_json::from_slice(&request.body).unwrap())
 			.find(|body: &serde_json::Value| {
 				body["params"][0]["input"]
 					.as_str()
-					.is_some_and(|input| input.contains(&quote_gas_payment_selector_hex()))
+					.is_some_and(|input| input.contains(&quote_dispatch_selector_hex()))
 			})
-			.expect("quoteGasPayment request should be present");
+			.expect("Mailbox.quoteDispatch request should be present");
 		let input_hex = body["params"][0]["input"].as_str().unwrap();
 		let input = hex::decode(input_hex.trim_start_matches("0x")).unwrap();
-		let quote_call = IHyperlane7683::quoteGasPaymentCall::abi_decode(&input).unwrap();
-		assert_eq!(quote_call._destinationDomain, origin_domain as u32);
+		let quote_call = IHyperlaneMailbox::quoteDispatchCall::abi_decode(&input).unwrap();
+		assert_eq!(quote_call.destinationDomain, origin_domain as u32);
+		assert_eq!(quote_call.recipientAddress, FixedBytes::<32>::from(router));
+		assert_eq!(quote_call.customHook, AlloyAddress::from([0x88; 20]));
+		assert_eq!(
+			quote_call.messageBody.as_ref(),
+			HyperlaneSettlement::hyperlane7683_settle_message_body(
+				order_id,
+				Bytes::from(filler_data)
+			)
+			.as_slice()
+		);
+		assert_eq!(
+			quote_call.customHookMetadata.as_ref(),
+			HyperlaneSettlement::standard_hook_metadata_override_gas_limit(
+				destination_gas,
+				settlement.evm_solver_refund_address(&order).unwrap()
+			)
+			.as_slice()
+		);
+		assert!(!requests.iter().any(|request| {
+			String::from_utf8_lossy(&request.body).contains(&quote_gas_payment_selector_hex())
+		}));
 	}
 
 	#[tokio::test]
@@ -3786,7 +4206,7 @@ mod tests {
 		);
 
 		let requests = server.received_requests().await.unwrap();
-		assert_eq!(requests.len(), 4);
+		assert_eq!(requests.len(), 6);
 	}
 
 	#[tokio::test]
@@ -3850,7 +4270,7 @@ mod tests {
 		assert_eq!(settle._orderIds, vec![FixedBytes::<32>::from(order_id)]);
 
 		let requests = server.received_requests().await.unwrap();
-		assert_eq!(requests.len(), 2);
+		assert_eq!(requests.len(), 3);
 	}
 
 	#[tokio::test]
@@ -3992,7 +4412,7 @@ mod tests {
 		);
 
 		let requests = server.received_requests().await.unwrap();
-		assert_eq!(requests.len(), 5);
+		assert_eq!(requests.len(), 6);
 	}
 
 	#[tokio::test]

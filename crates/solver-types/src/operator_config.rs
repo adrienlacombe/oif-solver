@@ -257,6 +257,10 @@ pub struct OperatorHyperlaneConfig {
 	/// Whether finalization is required before claiming.
 	pub finalization_required: bool,
 
+	/// Allows Hyperlane7683 settlement against mocks that quote zero gas.
+	#[serde(default)]
+	pub allow_zero_hyperlane7683_settle_quote: bool,
+
 	/// Mailbox contract address per chain.
 	pub mailboxes: HashMap<u64, SolverAddress>,
 
@@ -1169,6 +1173,7 @@ mod tests {
 					default_gas_limit: 300_000,
 					message_timeout_seconds: 600,
 					finalization_required: true,
+					allow_zero_hyperlane7683_settle_quote: false,
 					mailboxes: HashMap::new(),
 					igp_addresses: HashMap::new(),
 					domains: HashMap::new(),

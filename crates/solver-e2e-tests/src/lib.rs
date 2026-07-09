@@ -19,6 +19,7 @@ use solver_storage::{
 	implementations::file::{FileStorage, TtlConfig as FileTtlConfig},
 	StorageService,
 };
+use solver_types::HYPERLANE7683_OPEN_TOPIC0;
 use std::{
 	collections::HashMap,
 	path::PathBuf,
@@ -65,6 +66,47 @@ sol! {
 	#[sol(rpc)]
 	contract IMailboxMock {
 		function dispatchCounter() external view returns (uint256);
+	}
+
+	#[derive(Debug)]
+	struct Hyperlane7683OrderData {
+		bytes32 sender;
+		bytes32 recipient;
+		bytes32 inputToken;
+		bytes32 outputToken;
+		uint256 amountIn;
+		uint256 amountOut;
+		uint256 senderNonce;
+		uint32 originDomain;
+		uint32 destinationDomain;
+		bytes32 destinationSettler;
+		uint32 fillDeadline;
+		bytes data;
+	}
+
+	#[derive(Debug)]
+	struct Hyperlane7683OnchainCrossChainOrder {
+		uint32 fillDeadline;
+		bytes32 orderDataType;
+		bytes orderData;
+	}
+
+	#[sol(rpc)]
+	contract IHyperlane7683E2e {
+		function initialize(address _customHook, address _interchainSecurityModule, address _owner) external;
+		function enrollRemoteRouter(uint32 _domain, bytes32 _router) external;
+		function open(Hyperlane7683OnchainCrossChainOrder calldata _order) external payable;
+		function orderStatus(bytes32 orderId) external view returns (bytes32 status);
+		function quoteGasPayment(uint32 _destinationDomain) external view returns (uint256);
+	}
+
+	#[sol(rpc)]
+	contract IHyperlaneMockMailbox {
+		function addRemoteMailbox(uint32 _domain, address _mailbox) external;
+		function defaultHook() external view returns (address);
+		function defaultIsm() external view returns (address);
+		function localDomain() external view returns (uint32);
+		function latestDispatchedId() external view returns (bytes32);
 	}
 
 	#[sol(rpc)]
@@ -213,6 +255,13 @@ pub struct ChainDeployment {
 	/// Tests can read its `dispatchCounter` to assert the solver actually
 	/// called `HyperlaneOracle.submit()` during PostFill.
 	pub mock_mailbox: Option<Address>,
+	/// Domain-aware Hyperlane mock mailbox used by the Hyperlane7683 settler
+	/// e2e path. Kept separate from `mock_mailbox`, which is the legacy
+	/// counter-only mailbox used by the HyperlaneOracle test.
+	pub hyperlane7683_mailbox: Option<Address>,
+	/// Hyperlane7683 settler/router for this chain when
+	/// `HarnessOptions::use_hyperlane7683_settlers` is set.
+	pub hyperlane7683_settler: Option<Address>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,6 +334,14 @@ pub struct HarnessOptions {
 	/// `Harness::destination_mailbox_dispatch_count`) to assert the call
 	/// actually happened.
 	pub use_hyperlane_settlement: bool,
+	/// Deploy real Hyperlane7683 settler/router contracts on both Anvil
+	/// chains, backed by domain-aware Hyperlane mock mailboxes, and write
+	/// their addresses into the bootstrap network settler fields. This is the
+	/// e2e path for on-chain Hyperlane7683 discovery/fill/claim.
+	pub use_hyperlane7683_settlers: bool,
+	/// Allow Hyperlane7683 claim generation when the mock mailbox quotes zero
+	/// gas payment. Keep false outside local mocked e2e tests.
+	pub allow_zero_hyperlane7683_settle_quote: bool,
 	/// Plant the canonical Permit2 contract on the origin chain via
 	/// `anvil_setCode` and have the user pre-approve Permit2 for unlimited
 	/// TOKA spending. Required for any test that submits Permit2-signed
@@ -423,6 +480,8 @@ impl Default for HarnessOptions {
 			enable_admin_api: false,
 			admin_redis_url: None,
 			use_hyperlane_settlement: false,
+			use_hyperlane7683_settlers: false,
+			allow_zero_hyperlane7683_settle_quote: false,
 			enable_permit2: false,
 			enable_compact_simple_allocator: false,
 			deny_list_addresses: None,
@@ -440,6 +499,10 @@ impl Harness {
 
 	pub async fn boot_with(options: HarnessOptions) -> Result<Self> {
 		init_tracing();
+		let mut options = options;
+		if options.use_hyperlane7683_settlers {
+			options.use_hyperlane_settlement = true;
+		}
 
 		let lock_guard = harness_lock().lock().await;
 
@@ -513,6 +576,21 @@ impl Harness {
 				deploy_hyperlane_oracle(&destination_provider, dest_mailbox)
 					.await
 					.context("deploy HyperlaneOracle (destination)")?;
+		}
+
+		if options.use_hyperlane7683_settlers {
+			let stack = deploy_hyperlane7683_stack(&origin_provider, &destination_provider)
+				.await
+				.context("deploy Hyperlane7683 settler stack")?;
+			origin.hyperlane7683_mailbox = Some(stack.origin_mailbox);
+			origin.hyperlane7683_settler = Some(stack.origin_settler);
+			origin.input_settler = stack.origin_settler;
+			origin.output_settler = stack.origin_settler;
+
+			destination.hyperlane7683_mailbox = Some(stack.destination_mailbox);
+			destination.hyperlane7683_settler = Some(stack.destination_settler);
+			destination.input_settler = stack.destination_settler;
+			destination.output_settler = stack.destination_settler;
 		}
 
 		// Permit2 scenario: plant the canonical Permit2 runtime bytecode on
@@ -1104,6 +1182,93 @@ impl Harness {
 		pending.get_receipt().await.context("open receipt")
 	}
 
+	/// User submits `Hyperlane7683.open(order)` on the origin chain. Returns
+	/// the orderId emitted by the Hyperlane7683 `Open` event.
+	pub async fn user_open_hyperlane7683(
+		&self,
+		seed: &str,
+		amount_in: U256,
+		amount_out: U256,
+		fill_deadline: u32,
+	) -> Result<B256> {
+		let origin_settler = self
+			.origin
+			.hyperlane7683_settler
+			.ok_or_else(|| anyhow!("Hyperlane7683 origin settler not deployed"))?;
+		let destination_settler = self
+			.destination
+			.hyperlane7683_settler
+			.ok_or_else(|| anyhow!("Hyperlane7683 destination settler not deployed"))?;
+
+		let provider = build_provider(&self.origin.rpc_http, self.user_signer.clone()).await?;
+		let order_data = Hyperlane7683OrderData {
+			sender: B256::ZERO,
+			recipient: addr_to_bytes32(self.recipient_address()),
+			inputToken: addr_to_bytes32(self.origin.token_a),
+			outputToken: addr_to_bytes32(self.destination.token_b),
+			amountIn: amount_in,
+			amountOut: amount_out,
+			senderNonce: nonce_from_seed(seed),
+			originDomain: ORIGIN_CHAIN_ID as u32,
+			destinationDomain: DEST_CHAIN_ID as u32,
+			destinationSettler: addr_to_bytes32(destination_settler),
+			fillDeadline: 0,
+			data: Bytes::new(),
+		};
+		let order = Hyperlane7683OnchainCrossChainOrder {
+			fillDeadline: fill_deadline,
+			orderDataType: hyperlane7683_order_data_type(),
+			orderData: Bytes::from(order_data.abi_encode()),
+		};
+		let pending = IHyperlane7683E2e::new(origin_settler, provider)
+			.open(order)
+			.send()
+			.await
+			.context("send Hyperlane7683.open")?;
+		let receipt = pending
+			.get_receipt()
+			.await
+			.context("Hyperlane7683.open receipt")?;
+		if !receipt.status() {
+			return Err(anyhow!(
+				"Hyperlane7683.open reverted (tx {:?})",
+				receipt.transaction_hash
+			));
+		}
+		extract_hyperlane7683_order_id_from_receipt(&receipt).ok_or_else(|| {
+			anyhow!(
+				"Hyperlane7683 Open event not found in receipt {:?}",
+				receipt.transaction_hash
+			)
+		})
+	}
+
+	/// Read the destination Hyperlane7683 `orderStatus(orderId)` value.
+	pub async fn hyperlane7683_destination_order_status(&self, order_id: B256) -> Result<B256> {
+		let destination_settler = self
+			.destination
+			.hyperlane7683_settler
+			.ok_or_else(|| anyhow!("Hyperlane7683 destination settler not deployed"))?;
+		IHyperlane7683E2e::new(destination_settler, &self.destination_provider)
+			.orderStatus(order_id)
+			.call()
+			.await
+			.context("Hyperlane7683 destination orderStatus")
+	}
+
+	/// Read the destination Hyperlane7683 mailbox's last dispatched message ID.
+	pub async fn hyperlane7683_destination_latest_dispatch_id(&self) -> Result<B256> {
+		let mailbox = self
+			.destination
+			.hyperlane7683_mailbox
+			.ok_or_else(|| anyhow!("Hyperlane7683 destination mailbox not deployed"))?;
+		IHyperlaneMockMailbox::new(mailbox, &self.destination_provider)
+			.latestDispatchedId()
+			.call()
+			.await
+			.context("Hyperlane7683 destination latestDispatchedId")
+	}
+
 	/// Poll for the next log on `chain_id` matching the given event signature
 	/// and (optional) orderId topic. Polls every `POLL_INTERVAL` until either
 	/// match or `timeout`.
@@ -1476,6 +1641,18 @@ pub fn amount_with_decimals(whole: u64) -> U256 {
 	U256::from(whole) * U256::from(10u64).pow(U256::from(18u64))
 }
 
+pub fn hyperlane7683_order_status_filled() -> B256 {
+	let mut status = [0u8; 32];
+	status[..6].copy_from_slice(b"FILLED");
+	B256::from(status)
+}
+
+fn hyperlane7683_order_data_type() -> B256 {
+	keccak256(
+		b"OrderData(bytes32 sender,bytes32 recipient,bytes32 inputToken,bytes32 outputToken,uint256 amountIn,uint256 amountOut,uint256 senderNonce,uint32 originDomain,uint32 destinationDomain,bytes32 destinationSettler,uint32 fillDeadline,bytes data)"
+	)
+}
+
 pub fn assert_open_failed(result: Result<TransactionReceipt>, context: &str) {
 	match result {
 		Ok(receipt) => {
@@ -1578,6 +1755,41 @@ fn load_bytecode_from_artifact(path: &std::path::Path, contract_name: &str) -> R
 	let bytes =
 		hex::decode(trimmed).with_context(|| format!("decode hex bytecode for {contract_name}"))?;
 	Ok(Bytes::from(bytes))
+}
+
+/// Path to Hyperlane7683 contract artifacts. `HYPERLANE7683_CONTRACTS_PATH`
+/// may point either at the Solidity project root or directly at its `out/`.
+/// Defaults to the sibling checkout used while developing this integration.
+fn hyperlane7683_contracts_out() -> Result<PathBuf> {
+	let path = if let Ok(env_path) = std::env::var("HYPERLANE7683_CONTRACTS_PATH") {
+		PathBuf::from(env_path)
+	} else {
+		workspace_root()?
+			.parent()
+			.ok_or_else(|| anyhow!("workspace has no parent"))?
+			.join("adrien-oif-starknet")
+			.join("solidity")
+	};
+	let out = if path.file_name().and_then(|name| name.to_str()) == Some("out") {
+		path
+	} else {
+		path.join("out")
+	};
+	if !out.exists() {
+		return Err(anyhow!(
+			"Hyperlane7683 artifacts not found at {}.\n\nSet HYPERLANE7683_CONTRACTS_PATH \
+			 to a built Hyperlane7683 Solidity checkout, or place adrien-oif-starknet/solidity \
+			 as a sibling of oif-solver.",
+			out.display()
+		));
+	}
+	Ok(out)
+}
+
+fn load_hyperlane7683_bytecode(contract_name: &str, artifact_dir: &str) -> Result<Bytes> {
+	let out = hyperlane7683_contracts_out()?;
+	let path = out.join(format!("{artifact_dir}/{contract_name}.json"));
+	load_bytecode_from_artifact(&path, contract_name)
 }
 
 /// CREATE-deploys raw `bytecode || ctor_args`. Returns the deployed address.
@@ -1721,6 +1933,8 @@ async fn deploy_chain(
 		the_compact: None,
 		allocator: None,
 		mock_mailbox: None,
+		hyperlane7683_mailbox: None,
+		hyperlane7683_settler: None,
 	})
 }
 
@@ -1746,6 +1960,193 @@ async fn deploy_hyperlane_oracle(provider: &DynProvider, mailbox: Address) -> Re
 		.expect("static address");
 	let args = (mailbox, custom_hook, ism).abi_encode_params();
 	deploy_raw(provider, bytecode, Bytes::from(args)).await
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Hyperlane7683Stack {
+	origin_mailbox: Address,
+	origin_settler: Address,
+	destination_mailbox: Address,
+	destination_settler: Address,
+}
+
+async fn deploy_hyperlane7683_stack(
+	origin_provider: &DynProvider,
+	destination_provider: &DynProvider,
+) -> Result<Hyperlane7683Stack> {
+	let origin_mailbox =
+		deploy_hyperlane_mock_mailbox(origin_provider, ORIGIN_CHAIN_ID as u32).await?;
+	let destination_mailbox =
+		deploy_hyperlane_mock_mailbox(destination_provider, DEST_CHAIN_ID as u32).await?;
+
+	// The isolated Anvil chains cannot call contracts on each other, so route mock remote
+	// dispatches back into local mailbox code while preserving the domain ids under test.
+	enroll_hyperlane_mock_mailbox(
+		origin_provider,
+		origin_mailbox,
+		DEST_CHAIN_ID as u32,
+		origin_mailbox,
+	)
+	.await?;
+	enroll_hyperlane_mock_mailbox(
+		destination_provider,
+		destination_mailbox,
+		ORIGIN_CHAIN_ID as u32,
+		destination_mailbox,
+	)
+	.await?;
+
+	let origin_settler = deploy_hyperlane7683_settler(origin_provider, origin_mailbox).await?;
+	let destination_settler =
+		deploy_hyperlane7683_settler(destination_provider, destination_mailbox).await?;
+
+	initialize_hyperlane7683(origin_provider, origin_settler, origin_mailbox).await?;
+	initialize_hyperlane7683(
+		destination_provider,
+		destination_settler,
+		destination_mailbox,
+	)
+	.await?;
+
+	enroll_hyperlane7683_router(
+		origin_provider,
+		origin_settler,
+		DEST_CHAIN_ID as u32,
+		destination_settler,
+	)
+	.await?;
+	enroll_hyperlane7683_router(
+		destination_provider,
+		destination_settler,
+		ORIGIN_CHAIN_ID as u32,
+		origin_settler,
+	)
+	.await?;
+
+	tracing::info!(
+		origin_mailbox = %origin_mailbox,
+		origin_settler = %origin_settler,
+		destination_mailbox = %destination_mailbox,
+		destination_settler = %destination_settler,
+		"Deployed Hyperlane7683 stack"
+	);
+
+	Ok(Hyperlane7683Stack {
+		origin_mailbox,
+		origin_settler,
+		destination_mailbox,
+		destination_settler,
+	})
+}
+
+async fn deploy_hyperlane_mock_mailbox(provider: &DynProvider, domain: u32) -> Result<Address> {
+	let bytecode = load_hyperlane7683_bytecode("MockMailbox", "MockMailbox.sol")?;
+	let args = (U256::from(domain),).abi_encode_params();
+	let mailbox = deploy_raw(provider, bytecode, Bytes::from(args))
+		.await
+		.with_context(|| format!("deploy Hyperlane MockMailbox(domain={domain})"))?;
+	let local_domain = IHyperlaneMockMailbox::new(mailbox, provider)
+		.localDomain()
+		.call()
+		.await
+		.context("MockMailbox.localDomain")?;
+	if local_domain != domain {
+		return Err(anyhow!(
+			"MockMailbox localDomain mismatch: expected {domain}, got {local_domain}"
+		));
+	}
+	Ok(mailbox)
+}
+
+async fn enroll_hyperlane_mock_mailbox(
+	provider: &DynProvider,
+	mailbox: Address,
+	remote_domain: u32,
+	remote_mailbox: Address,
+) -> Result<()> {
+	let pending = IHyperlaneMockMailbox::new(mailbox, provider)
+		.addRemoteMailbox(remote_domain, remote_mailbox)
+		.send()
+		.await
+		.context("send MockMailbox.addRemoteMailbox")?;
+	let receipt = pending
+		.get_receipt()
+		.await
+		.context("MockMailbox.addRemoteMailbox receipt")?;
+	if !receipt.status() {
+		return Err(anyhow!(
+			"MockMailbox.addRemoteMailbox reverted (tx {:?})",
+			receipt.transaction_hash
+		));
+	}
+	Ok(())
+}
+
+async fn deploy_hyperlane7683_settler(provider: &DynProvider, mailbox: Address) -> Result<Address> {
+	let bytecode = load_hyperlane7683_bytecode("Hyperlane7683", "Hyperlane7683.sol")?;
+	let permit2 = parse_address(PERMIT2_ADDRESS)?;
+	let args = (mailbox, permit2).abi_encode_params();
+	deploy_raw(provider, bytecode, Bytes::from(args))
+		.await
+		.context("deploy Hyperlane7683")
+}
+
+async fn initialize_hyperlane7683(
+	provider: &DynProvider,
+	settler: Address,
+	mailbox: Address,
+) -> Result<()> {
+	let mailbox_contract = IHyperlaneMockMailbox::new(mailbox, provider);
+	let hook = mailbox_contract
+		.defaultHook()
+		.call()
+		.await
+		.context("MockMailbox.defaultHook")?;
+	let ism = mailbox_contract
+		.defaultIsm()
+		.call()
+		.await
+		.context("MockMailbox.defaultIsm")?;
+	let pending = IHyperlane7683E2e::new(settler, provider)
+		.initialize(hook, ism, parse_address(SOLVER_ADDRESS)?)
+		.send()
+		.await
+		.context("send Hyperlane7683.initialize")?;
+	let receipt = pending
+		.get_receipt()
+		.await
+		.context("Hyperlane7683.initialize receipt")?;
+	if !receipt.status() {
+		return Err(anyhow!(
+			"Hyperlane7683.initialize reverted (tx {:?})",
+			receipt.transaction_hash
+		));
+	}
+	Ok(())
+}
+
+async fn enroll_hyperlane7683_router(
+	provider: &DynProvider,
+	settler: Address,
+	remote_domain: u32,
+	remote_settler: Address,
+) -> Result<()> {
+	let pending = IHyperlane7683E2e::new(settler, provider)
+		.enrollRemoteRouter(remote_domain, addr_to_bytes32(remote_settler))
+		.send()
+		.await
+		.context("send Hyperlane7683.enrollRemoteRouter")?;
+	let receipt = pending
+		.get_receipt()
+		.await
+		.context("Hyperlane7683.enrollRemoteRouter receipt")?;
+	if !receipt.status() {
+		return Err(anyhow!(
+			"Hyperlane7683.enrollRemoteRouter reverted (tx {:?})",
+			receipt.transaction_hash
+		));
+	}
+	Ok(())
 }
 
 /// Plant Permit2's runtime bytecode at its canonical address via
@@ -1932,6 +2333,9 @@ fn build_seed_overrides(
 			default_gas_limit: None,
 			message_timeout_seconds: None,
 			finalization_required: None,
+			allow_zero_hyperlane7683_settle_quote: options
+				.allow_zero_hyperlane7683_settle_quote
+				.then_some(true),
 			intent_min_expiry_seconds: None,
 			starknet_fee_token_addresses: HashMap::new(),
 		};
@@ -2145,6 +2549,18 @@ fn spawn_solver(
 
 fn extract_order_id_from_receipt(receipt: &TransactionReceipt) -> Option<B256> {
 	let target_topic = Open::SIGNATURE_HASH;
+	for log in receipt.inner.logs() {
+		if log.topics().first() == Some(&target_topic) {
+			if let Some(order_id) = log.topics().get(1) {
+				return Some(*order_id);
+			}
+		}
+	}
+	None
+}
+
+fn extract_hyperlane7683_order_id_from_receipt(receipt: &TransactionReceipt) -> Option<B256> {
+	let target_topic = B256::from_str(HYPERLANE7683_OPEN_TOPIC0).expect("static Open topic");
 	for log in receipt.inner.logs() {
 		if log.topics().first() == Some(&target_topic) {
 			if let Some(order_id) = log.topics().get(1) {

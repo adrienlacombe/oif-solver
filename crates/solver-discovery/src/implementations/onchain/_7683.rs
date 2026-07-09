@@ -162,6 +162,23 @@ fn hyperlane7683_resolved_order_from_sol(
 	}
 }
 
+fn hyperlane7683_intent_data(
+	order: &Hyperlane7683ResolvedOrder,
+) -> Result<serde_json::Value, DiscoveryError> {
+	let mut data = serde_json::to_value(order).map_err(|e| {
+		DiscoveryError::ParseError(format!(
+			"Failed to serialize Hyperlane7683 resolved order: {e}"
+		))
+	})?;
+	if let Some(object) = data.as_object_mut() {
+		object.insert(
+			"settlement_name".to_string(),
+			serde_json::Value::String("hyperlane".to_string()),
+		);
+	}
+	Ok(data)
+}
+
 /// Decodes a Hyperlane7683 EVM Open log into the protocol-level resolved order.
 ///
 /// This is intentionally a pure parser shared by the Hyperlane7683 monitor and
@@ -208,11 +225,7 @@ pub fn parse_hyperlane7683_open_log(log: &Log) -> Result<Intent, DiscoveryError>
 			exclusive_until: None,
 			discovered_at: current_timestamp(),
 		},
-		data: serde_json::to_value(&order).map_err(|e| {
-			DiscoveryError::ParseError(format!(
-				"Failed to serialize Hyperlane7683 resolved order: {e}"
-			))
-		})?,
+		data: hyperlane7683_intent_data(&order)?,
 		order_bytes,
 		quote_id: None,
 		lock_type: HYPERLANE7683_STANDARD.to_string(),
@@ -764,11 +777,7 @@ fn starknet_hyperlane7683_order_to_intent(
 	order: Hyperlane7683ResolvedOrder,
 ) -> Result<Intent, DiscoveryError> {
 	let id = hex::encode(order.order_id);
-	let data = serde_json::to_value(&order).map_err(|e| {
-		DiscoveryError::ParseError(format!(
-			"Failed to serialize Starknet Hyperlane7683 resolved order: {e}"
-		))
-	})?;
+	let data = hyperlane7683_intent_data(&order)?;
 
 	Ok(Intent {
 		id,
@@ -2540,6 +2549,10 @@ mod tests {
 		assert!(!intent.metadata.requires_auction);
 		assert!(intent.metadata.exclusive_until.is_none());
 		assert!(intent.quote_id.is_none());
+		assert_eq!(
+			intent.data.get("settlement_name").and_then(|v| v.as_str()),
+			Some("hyperlane")
+		);
 
 		let order: Hyperlane7683ResolvedOrder = serde_json::from_value(intent.data).unwrap();
 		assert_eq!(order.order_id, [0x88u8; 32]);
@@ -2791,6 +2804,10 @@ mod tests {
 		assert!(!intent.metadata.requires_auction);
 		assert!(intent.metadata.exclusive_until.is_none());
 		assert!(intent.quote_id.is_none());
+		assert_eq!(
+			intent.data.get("settlement_name").and_then(|v| v.as_str()),
+			Some("hyperlane")
+		);
 
 		let order: Hyperlane7683ResolvedOrder = serde_json::from_value(intent.data).unwrap();
 		assert_eq!(order.order_id, expected_order_id);

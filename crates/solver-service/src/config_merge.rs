@@ -863,6 +863,7 @@ fn build_operator_hyperlane_config_from_seed(
 		default_gas_limit: seed.defaults.hyperlane_default_gas_limit,
 		message_timeout_seconds: seed.defaults.hyperlane_message_timeout_seconds,
 		finalization_required: seed.defaults.hyperlane_finalization_required,
+		allow_zero_hyperlane7683_settle_quote: false,
 		mailboxes,
 		igp_addresses,
 		domains,
@@ -1076,6 +1077,9 @@ fn build_operator_hyperlane_config_from_override(
 		finalization_required: override_cfg
 			.finalization_required
 			.unwrap_or(seed.defaults.hyperlane_finalization_required),
+		allow_zero_hyperlane7683_settle_quote: override_cfg
+			.allow_zero_hyperlane7683_settle_quote
+			.unwrap_or(false),
 		mailboxes: override_cfg.mailboxes.clone(),
 		igp_addresses: override_cfg.igp_addresses.clone(),
 		domains,
@@ -1870,6 +1874,20 @@ fn build_discovery_config_from_operator(
 	chain_ids: &[u64],
 ) -> Result<DiscoveryConfig, MergeError> {
 	let mut implementations = HashMap::new();
+	let hyperlane_discovery_enabled = operator_config
+		.settlement
+		.priority
+		.as_ref()
+		.filter(|priority| !priority.is_empty())
+		.map(|priority| {
+			priority
+				.iter()
+				.any(|settlement| matches!(settlement, OperatorSettlementType::Hyperlane))
+		})
+		.unwrap_or(matches!(
+			operator_config.settlement.settlement_type,
+			OperatorSettlementType::Hyperlane
+		)) && operator_config.settlement.hyperlane.is_some();
 
 	let mut evm_chain_ids = chain_ids
 		.iter()
@@ -1924,9 +1942,25 @@ fn build_discovery_config_from_operator(
 				int(default_finality_blocks as i64),
 			),
 			("finality_blocks", finality_blocks.clone()),
-			("source_finality_rules", source_finality_rules),
+			("source_finality_rules", source_finality_rules.clone()),
 		]);
 		implementations.insert("onchain_eip7683".to_string(), onchain_config);
+		if hyperlane_discovery_enabled {
+			let hyperlane_onchain_config = json_object(vec![
+				("network_ids", evm_network_ids_array.clone()),
+				("polling_interval_secs", int(5)),
+				(
+					"default_finality_blocks",
+					int(default_finality_blocks as i64),
+				),
+				("finality_blocks", finality_blocks.clone()),
+				("source_finality_rules", source_finality_rules),
+			]);
+			implementations.insert(
+				"onchain_hyperlane7683".to_string(),
+				hyperlane_onchain_config,
+			);
+		}
 
 		// EVM offchain discovery - ingests orders in-process via the public /orders API.
 		let offchain_config = json_object(vec![("network_ids", evm_network_ids_array)]);
@@ -1952,10 +1986,12 @@ fn build_discovery_config_from_operator(
 			("finality_blocks", finality_blocks),
 			("source_finality_rules", source_finality_rules),
 		]);
-		implementations.insert(
-			"onchain_starknet_hyperlane7683".to_string(),
-			starknet_onchain_config,
-		);
+		if hyperlane_discovery_enabled {
+			implementations.insert(
+				"onchain_starknet_hyperlane7683".to_string(),
+				starknet_onchain_config,
+			);
+		}
 	}
 
 	Ok(DiscoveryConfig { implementations })
@@ -2103,6 +2139,10 @@ fn build_hyperlane_json_from_operator(
 	table.insert(
 		"finalization_required".to_string(),
 		serde_json::Value::Bool(hyperlane.finalization_required),
+	);
+	table.insert(
+		"allow_zero_hyperlane7683_settle_quote".to_string(),
+		serde_json::Value::Bool(hyperlane.allow_zero_hyperlane7683_settle_quote),
 	);
 	if let Some(min_expiry) = hyperlane.intent_min_expiry_seconds {
 		table.insert(
@@ -3284,6 +3324,10 @@ fn extract_hyperlane_config(
 		.and_then(|h| h.get("finalization_required"))
 		.and_then(|v| v.as_bool())
 		.unwrap_or(true);
+	let allow_zero_hyperlane7683_settle_quote = hyperlane_json
+		.and_then(|h| h.get("allow_zero_hyperlane7683_settle_quote"))
+		.and_then(|v| v.as_bool())
+		.unwrap_or(false);
 	let intent_min_expiry_seconds = hyperlane_json
 		.and_then(|h| h.get("intent_min_expiry_seconds"))
 		.and_then(|v| v.as_i64())
@@ -3439,6 +3483,7 @@ fn extract_hyperlane_config(
 		default_gas_limit,
 		message_timeout_seconds,
 		finalization_required,
+		allow_zero_hyperlane7683_settle_quote,
 		mailboxes,
 		igp_addresses,
 		domains,
@@ -5372,6 +5417,7 @@ mod tests {
 					default_gas_limit: None,
 					message_timeout_seconds: None,
 					finalization_required: None,
+					allow_zero_hyperlane7683_settle_quote: None,
 					intent_min_expiry_seconds: None,
 				}),
 				direct: None,
@@ -5512,6 +5558,7 @@ mod tests {
 					default_gas_limit: None,
 					message_timeout_seconds: None,
 					finalization_required: None,
+					allow_zero_hyperlane7683_settle_quote: None,
 					intent_min_expiry_seconds: None,
 				}),
 				direct: None,
@@ -6020,6 +6067,7 @@ mod tests {
 					default_gas_limit: Some(300_000),
 					message_timeout_seconds: Some(600),
 					finalization_required: Some(true),
+					allow_zero_hyperlane7683_settle_quote: None,
 					intent_min_expiry_seconds: None,
 				}),
 				direct: None,
@@ -6201,6 +6249,7 @@ mod tests {
 					default_gas_limit: Some(300_000),
 					message_timeout_seconds: Some(600),
 					finalization_required: Some(true),
+					allow_zero_hyperlane7683_settle_quote: None,
 					intent_min_expiry_seconds: None,
 				}),
 				direct: None,
@@ -6443,6 +6492,7 @@ mod tests {
 					default_gas_limit: None,
 					message_timeout_seconds: None,
 					finalization_required: None,
+					allow_zero_hyperlane7683_settle_quote: None,
 					intent_min_expiry_seconds: None,
 				}),
 				direct: None,
@@ -7039,6 +7089,7 @@ mod tests {
 				default_gas_limit: None,
 				message_timeout_seconds: None,
 				finalization_required: None,
+				allow_zero_hyperlane7683_settle_quote: None,
 				intent_min_expiry_seconds: None,
 			}),
 			direct: None,
@@ -7297,6 +7348,7 @@ mod tests {
 					default_gas_limit: 300000,
 					message_timeout_seconds: 600,
 					finalization_required: true,
+					allow_zero_hyperlane7683_settle_quote: false,
 					mailboxes: HashMap::new(),
 					igp_addresses: HashMap::new(),
 					domains: HashMap::new(),
@@ -8040,6 +8092,9 @@ mod tests {
 		let discovery = build_discovery_config_from_operator(&op_config, &chain_ids).unwrap();
 
 		assert!(discovery.implementations.contains_key("onchain_eip7683"));
+		assert!(discovery
+			.implementations
+			.contains_key("onchain_hyperlane7683"));
 		assert!(discovery.implementations.contains_key("offchain_eip7683"));
 		assert!(!discovery
 			.implementations
@@ -8057,6 +8112,26 @@ mod tests {
 			.get("finality_blocks")
 			.and_then(|v| v.as_object())
 			.is_some());
+		let hyperlane_onchain = discovery
+			.implementations
+			.get("onchain_hyperlane7683")
+			.unwrap();
+		assert_eq!(
+			hyperlane_onchain.get("network_ids"),
+			onchain.get("network_ids")
+		);
+		assert_eq!(
+			hyperlane_onchain.get("default_finality_blocks"),
+			onchain.get("default_finality_blocks")
+		);
+		assert_eq!(
+			hyperlane_onchain.get("finality_blocks"),
+			onchain.get("finality_blocks")
+		);
+		assert_eq!(
+			hyperlane_onchain.get("source_finality_rules"),
+			onchain.get("source_finality_rules")
+		);
 
 		// Offchain ingests in-process via /orders; it carries only network_ids
 		// (no api_host/api_port — the HTTP listener was removed in C-04).
@@ -8093,6 +8168,10 @@ mod tests {
 		let discovery =
 			build_discovery_config_from_operator(&op_config, &[11155420, 84532]).unwrap();
 		let onchain = discovery.implementations.get("onchain_eip7683").unwrap();
+		let hyperlane_onchain = discovery
+			.implementations
+			.get("onchain_hyperlane7683")
+			.unwrap();
 
 		assert_eq!(
 			onchain
@@ -8111,6 +8190,14 @@ mod tests {
 		assert_eq!(
 			finality_blocks.get("84532").and_then(|v| v.as_i64()),
 			Some(12)
+		);
+		assert_eq!(
+			hyperlane_onchain.get("default_finality_blocks"),
+			onchain.get("default_finality_blocks")
+		);
+		assert_eq!(
+			hyperlane_onchain.get("finality_blocks"),
+			onchain.get("finality_blocks")
 		);
 	}
 
@@ -8189,6 +8276,12 @@ mod tests {
 				.and_then(|finality| finality.get(&chain_b.to_string()))
 				.and_then(|v| v.as_i64()),
 			Some(3)
+		);
+		assert!(
+			!discovery
+				.implementations
+				.contains_key("onchain_hyperlane7683"),
+			"direct-only settlement should not discover Hyperlane7683 orders it cannot claim"
 		);
 	}
 

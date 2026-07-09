@@ -77,6 +77,7 @@
       "default_gas_limit": 500000,
       "message_timeout_seconds": 600,
       "finalization_required": false,
+      "allow_zero_hyperlane7683_settle_quote": false,
       "intent_min_expiry_seconds": 300
     }
   },

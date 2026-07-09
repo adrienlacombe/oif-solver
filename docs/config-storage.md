@@ -236,6 +236,53 @@ The key `intent_min_expiry_seconds` uses the same field name across:
 
 See `config/non-seeded-networks-example.json` for a full non-seeded Hyperlane example (both chain IDs are non-seeded).
 
+### Hyperlane7683 On-Chain Orders
+
+When `settlement.type` is `hyperlane` and `settlement.hyperlane` is configured, the solver enables
+Hyperlane7683 on-chain discovery for supported EVM and Starknet networks. Use this mode when the
+orders are opened directly on Hyperlane7683 settler/router contracts instead of submitted through
+the solver Orders API.
+
+For every supported route:
+
+- Set each network's `input_settler_address` to the Hyperlane7683 contract that emits `Open`.
+- Set each network's `output_settler_address` to the Hyperlane7683 contract that fills/settles on
+  that chain.
+- Configure `settlement.hyperlane.domains` with the Hyperlane domain id for each chain. Domain ids
+  are `uint32` values and are not always the same as EVM chain ids.
+- Configure `settlement.hyperlane.mailboxes` and `settlement.hyperlane.igp_addresses` for each
+  chain that may dispatch settlement messages.
+- Ensure the Hyperlane7683 routers are enrolled for every remote domain and their mailboxes/hooks
+  are configured to quote and accept the settlement dispatch payment.
+
+For Hyperlane7683 EVM claims, the solver prefers a full mailbox fee quote. It reads the
+destination settler's enrolled router, mailbox, hook, destination gas, and
+`filledOrders(orderId)` data, builds the exact settle dispatch body and hook metadata, then calls
+`Mailbox.quoteDispatch(originDomain, router, messageBody, metadata, hook)`. The returned
+native-token value is attached to `settle([orderId])`.
+
+If the full dispatch quote is unavailable, the EVM claim path falls back to the destination
+settler's `quoteGasPayment(originDomain)`. Pre-order route fee estimates also use
+`quoteGasPayment(originDomain)` because the filled order's `fillerData` does not exist before the
+solver fills the order. A zero quote is rejected by default because production Hyperlane dispatches
+generally require payment and underpayment can revert or leave messages undelivered.
+
+Keep this unset or false in production:
+
+```json
+{
+  "settlement": {
+    "type": "hyperlane",
+    "hyperlane": {
+      "allow_zero_hyperlane7683_settle_quote": false
+    }
+  }
+}
+```
+
+Only set `allow_zero_hyperlane7683_settle_quote` to `true` for local mocked tests where the
+Hyperlane hook intentionally returns a zero quote.
+
 Example `direct` settlement:
 
 ```json

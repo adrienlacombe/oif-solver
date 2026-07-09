@@ -1795,6 +1795,7 @@ mod tests {
 					default_gas_limit: 0,
 					message_timeout_seconds: 0,
 					finalization_required: false,
+					allow_zero_hyperlane7683_settle_quote: false,
 					mailboxes: HashMap::new(),
 					igp_addresses: HashMap::new(),
 					domains: HashMap::new(),
