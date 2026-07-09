@@ -13,8 +13,8 @@ use alloy_rpc_types::BlockNumberOrTag;
 use alloy_sol_types::SolCall;
 use solver_config::{source_finality_rule_for_config, Config};
 use solver_delivery::{
-	DeliveryService, RevertClassification, TransactionAttemptRecorder, TransactionMonitoringEvent,
-	TransactionTracking,
+	DeliveryError, DeliveryService, RevertClassification, TransactionAttemptRecorder,
+	TransactionMonitoringEvent, TransactionTracking,
 };
 use solver_order::OrderService;
 use solver_storage::StorageService;
@@ -76,6 +76,8 @@ fn view_tx(to: &Address, chain_id: u64, data: Vec<u8>) -> Transaction {
 pub enum OrderError {
 	#[error("Service error: {0}")]
 	Service(String),
+	#[error("Delivery error: {0}")]
+	Delivery(#[from] DeliveryError),
 	#[error("Storage error: {0}")]
 	Storage(String),
 	#[error("State error: {0}")]
@@ -909,8 +911,7 @@ impl OrderHandler {
 			let tx_hash = self
 				.delivery
 				.deliver_execution(tx.clone(), Some(tracking))
-				.await
-				.map_err(|e| OrderError::Service(e.to_string()))?;
+				.await?;
 
 			self.event_bus
 				.publish(SolverEvent::Delivery(DeliveryEvent::TransactionPending {
@@ -3163,8 +3164,10 @@ mod tests {
 
 		assert!(result.is_err());
 		match result.unwrap_err() {
-			OrderError::Service(msg) => assert!(msg.contains("Execution delivery failed")),
-			_ => panic!("Expected Service error"),
+			OrderError::Delivery(DeliveryError::Network(msg)) => {
+				assert!(msg.contains("Execution delivery failed"))
+			},
+			_ => panic!("Expected Delivery::Network error"),
 		}
 	}
 

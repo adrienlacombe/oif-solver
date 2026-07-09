@@ -194,6 +194,68 @@ fn signed_preflight_insufficient_native_gas_info(
 	}
 }
 
+fn parse_rpc_insufficient_funds_amounts(message: &str) -> Option<(U256, U256)> {
+	let lower = message.to_lowercase();
+	if !lower.contains("insufficient funds") {
+		return None;
+	}
+
+	let mut have = None;
+	let mut want = None;
+	let tokens: Vec<_> = lower.split_whitespace().collect();
+	for pair in tokens.windows(2) {
+		match pair[0].trim_matches(|c: char| !c.is_ascii_alphanumeric()) {
+			"have" => {
+				have = pair[1]
+					.trim_matches(|c: char| !c.is_ascii_digit())
+					.parse::<U256>()
+					.ok();
+			},
+			"want" | "required" => {
+				want = pair[1]
+					.trim_matches(|c: char| !c.is_ascii_digit())
+					.parse::<U256>()
+					.ok();
+			},
+			_ => {},
+		}
+	}
+
+	match (have, want) {
+		(Some(balance), Some(required)) => Some((balance, required)),
+		_ => None,
+	}
+}
+
+fn estimate_insufficient_native_gas_info(
+	chain_id: u64,
+	from: Address,
+	tx: &SolverTransaction,
+	message: &str,
+) -> Option<InsufficientNativeGasInfo> {
+	let lower = message.to_lowercase();
+	if !lower.contains("insufficient funds") {
+		return None;
+	}
+
+	let (balance, required) =
+		parse_rpc_insufficient_funds_amounts(message).unwrap_or((U256::ZERO, U256::ZERO));
+	let shortfall = required.saturating_sub(balance);
+
+	Some(InsufficientNativeGasInfo {
+		chain_id,
+		signer: from.to_string(),
+		balance_wei: balance.to_string(),
+		required_wei: required.to_string(),
+		shortfall_wei: shortfall.to_string(),
+		gas_limit: tx.gas_limit,
+		max_fee_per_gas: tx.max_fee_per_gas,
+		gas_price: tx.gas_price,
+		extra_native_fee_wei: "0".to_string(),
+		value_wei: tx.value.to_string(),
+	})
+}
+
 /// One cached fee-params entry. `inserted_at` is captured at insertion time and
 /// compared against TTL on read; we use `std::time::Instant` so tests can pass an
 /// explicit `now` to exercise expiry without sleeping.
@@ -1480,6 +1542,20 @@ impl DeliveryInterface for AlloyDelivery {
 				},
 				Err(e) => {
 					let msg = e.to_string();
+					if let Some(info) =
+						estimate_insufficient_native_gas_info(chain_id, from, &tx_attempt, &msg)
+					{
+						tracing::warn!(
+							chain_id,
+							signer = %from,
+							balance_wei = %info.balance_wei,
+							required_wei = %info.required_wei,
+							shortfall_wei = %info.shortfall_wei,
+							error = %msg,
+							"Gas estimate failed due to insufficient native gas; no nonce allocated"
+						);
+						return Err(DeliveryError::InsufficientNativeGas(Box::new(info)));
+					}
 					let lower = msg.to_lowercase();
 					// Accept the plain "execution reverted" phrasing that
 					// estimate_gas typically emits, and also fall through to
@@ -5679,6 +5755,64 @@ mod tests {
 			assert_eq!(info.gas_limit, Some(21_000));
 			assert_eq!(info.max_fee_per_gas, Some(3));
 			assert_eq!(info.gas_price, None);
+		}
+
+		#[test]
+		fn estimate_insufficient_native_gas_info_parses_geth_have_want_error() {
+			let tx = SolverTransaction {
+				chain_id: 11155111,
+				to: None,
+				data: vec![],
+				value: U256::ZERO,
+				gas_limit: None,
+				gas_price: None,
+				max_fee_per_gas: Some(3_346_629_933),
+				max_priority_fee_per_gas: Some(1_124_643_201),
+				nonce: None,
+			};
+			let signer: Address = "0xca1c73a3c1263c39dd9e841d532071d80c389f7a"
+				.parse()
+				.expect("valid address");
+			let message = "server returned an error response: error code -32003: insufficient \
+				funds for gas * price + value: have 966093198463091 want 1353750000000001";
+
+			let info = estimate_insufficient_native_gas_info(11155111, signer, &tx, message)
+				.expect("insufficient funds estimate error should classify");
+
+			assert_eq!(info.chain_id, 11155111);
+			assert_eq!(info.signer, signer.to_string());
+			assert_eq!(info.balance_wei, "966093198463091");
+			assert_eq!(info.required_wei, "1353750000000001");
+			assert_eq!(info.shortfall_wei, "387656801536910");
+			assert_eq!(info.value_wei, "0");
+			assert_eq!(info.max_fee_per_gas, Some(3_346_629_933));
+			assert_eq!(info.gas_limit, None);
+		}
+
+		#[test]
+		fn estimate_insufficient_native_gas_info_ignores_contract_revert() {
+			let tx = SolverTransaction {
+				chain_id: 11155111,
+				to: None,
+				data: vec![],
+				value: U256::ZERO,
+				gas_limit: None,
+				gas_price: None,
+				max_fee_per_gas: None,
+				max_priority_fee_per_gas: None,
+				nonce: None,
+			};
+			let signer: Address = "0xca1c73a3c1263c39dd9e841d532071d80c389f7a"
+				.parse()
+				.expect("valid address");
+
+			assert!(estimate_insufficient_native_gas_info(
+				11155111,
+				signer,
+				&tx,
+				"execution reverted: AlreadyClaimed"
+			)
+			.is_none());
 		}
 
 		#[test]

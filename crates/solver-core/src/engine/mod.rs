@@ -197,6 +197,27 @@ fn settlement_failure_policy(
 	}
 }
 
+fn order_execution_failure_policy(
+	error: &crate::handlers::order::OrderError,
+) -> SettlementFailurePolicy {
+	use crate::handlers::order::OrderError;
+	use solver_delivery::DeliveryError;
+
+	match error {
+		OrderError::Delivery(delivery_error) => match delivery_error {
+			DeliveryError::Network(_) => SettlementFailurePolicy::RetryLater,
+			DeliveryError::TransactionFailed(_) => SettlementFailurePolicy::FailOrder,
+			DeliveryError::NonceTooLow(_) => SettlementFailurePolicy::RetryLater,
+			DeliveryError::InsufficientNativeGas(_) => SettlementFailurePolicy::RetryLater,
+			DeliveryError::NoImplementationAvailable => SettlementFailurePolicy::RetryLater,
+			DeliveryError::ReplacementUnderpriced { .. } => SettlementFailurePolicy::RetryLater,
+		},
+		OrderError::Service(_) | OrderError::Storage(_) | OrderError::State(_) => {
+			SettlementFailurePolicy::FailOrder
+		},
+	}
+}
+
 impl SolverEngine {
 	/// Creates a new solver engine with the given services.
 	///
@@ -648,15 +669,9 @@ impl SolverEngine {
 							self.spawn_handler(&dispatch_semaphore, &transaction_semaphore, move |engine| async move {
 								let order_id = order.id.clone();
 								if let Err(e) = engine.order_handler.handle_execution(order, params).await {
-									let error_msg = format!("Failed to handle order execution: {e}");
-									// Attempt to mark order as failed
-									if let Err(state_err) = engine.state_machine
-										.transition_order_status(&order_id, solver_types::OrderStatus::Failed(solver_types::TransactionType::Fill, error_msg.clone()))
-										.await
-									{
-										tracing::error!("Failed to mark order as failed: {}", state_err);
-									}
-									return Err(EngineError::Service(error_msg));
+									return engine
+										.handle_order_execution_error(&order_id, e)
+										.await;
 								}
 								Ok(())
 							}).await;
@@ -955,6 +970,39 @@ impl SolverEngine {
 	/// background approval retry loop.
 	pub fn startup_readiness_handle(&self) -> SharedStartupReadiness {
 		Arc::clone(&self.startup_readiness)
+	}
+
+	async fn handle_order_execution_error(
+		&self,
+		order_id: &str,
+		error: crate::handlers::order::OrderError,
+	) -> Result<(), EngineError> {
+		let error_msg = format!("Failed to handle order execution: {error}");
+		match order_execution_failure_policy(&error) {
+			SettlementFailurePolicy::RetryLater => {
+				tracing::warn!(
+					order_id = %order_id,
+					error = %error_msg,
+					"Order execution failed with a transient error; leaving order retryable"
+				);
+			},
+			SettlementFailurePolicy::FailOrder => {
+				if let Err(state_err) = self
+					.state_machine
+					.transition_order_status(
+						order_id,
+						solver_types::OrderStatus::Failed(
+							solver_types::TransactionType::Fill,
+							error_msg.clone(),
+						),
+					)
+					.await
+				{
+					tracing::error!("Failed to mark order as failed: {}", state_err);
+				}
+			},
+		}
+		Err(EngineError::Service(error_msg))
 	}
 
 	async fn handle_settlement_stage_error(
@@ -1809,6 +1857,21 @@ mod tests {
 		))
 	}
 
+	fn insufficient_native_gas_delivery_error() -> DeliveryError {
+		DeliveryError::InsufficientNativeGas(Box::new(InsufficientNativeGasInfo {
+			chain_id: 11155111,
+			signer: "0x0000000000000000000000000000000000000001".to_string(),
+			balance_wei: "1".to_string(),
+			required_wei: "2".to_string(),
+			shortfall_wei: "1".to_string(),
+			gas_limit: Some(21_000),
+			max_fee_per_gas: Some(1),
+			gas_price: None,
+			extra_native_fee_wei: "0".to_string(),
+			value_wei: "0".to_string(),
+		}))
+	}
+
 	async fn create_test_engine() -> SolverEngine {
 		let (
 			dynamic_config,
@@ -2619,6 +2682,55 @@ mod tests {
 		assert!(result.is_err());
 		let stored = engine.state_machine.get_order(&order.id).await.unwrap();
 		assert_eq!(stored.status, OrderStatus::PreClaimed);
+	}
+
+	#[tokio::test]
+	async fn fill_insufficient_native_gas_leaves_order_executing() {
+		let engine = create_test_engine().await;
+		let order = OrderBuilder::new()
+			.with_id("fill-insufficient-native-gas-order".to_string())
+			.with_status(OrderStatus::Executing)
+			.build();
+		engine.state_machine.store_order(&order).await.unwrap();
+
+		let result = engine
+			.handle_order_execution_error(
+				&order.id,
+				crate::handlers::order::OrderError::Delivery(
+					insufficient_native_gas_delivery_error(),
+				),
+			)
+			.await;
+
+		assert!(result.is_err());
+		let stored = engine.state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(stored.status, OrderStatus::Executing);
+	}
+
+	#[tokio::test]
+	async fn fill_transaction_failed_marks_order_failed() {
+		let engine = create_test_engine().await;
+		let order = OrderBuilder::new()
+			.with_id("fill-reverted-order".to_string())
+			.with_status(OrderStatus::Executing)
+			.build();
+		engine.state_machine.store_order(&order).await.unwrap();
+
+		let result = engine
+			.handle_order_execution_error(
+				&order.id,
+				crate::handlers::order::OrderError::Delivery(DeliveryError::TransactionFailed(
+					"execution reverted".to_string(),
+				)),
+			)
+			.await;
+
+		assert!(result.is_err());
+		let stored = engine.state_machine.get_order(&order.id).await.unwrap();
+		assert!(matches!(
+			stored.status,
+			OrderStatus::Failed(TransactionType::Fill, _)
+		));
 	}
 
 	#[tokio::test]
