@@ -283,6 +283,18 @@ Keep this unset or false in production:
 Only set `allow_zero_hyperlane7683_settle_quote` to `true` for local mocked tests where the
 Hyperlane hook intentionally returns a zero quote.
 
+Before a live route smoke test, run the destination-side preflight:
+
+```bash
+DESTINATION_RPC_URL=https://base-sepolia.example \
+DESTINATION_SETTLER=0x... \
+ORIGIN_DOMAIN=11155420 \
+scripts/flow/preflight-hyperlane7683-route.sh
+```
+
+After a fill, add `ORDER_ID`, `FILLER_DATA`, and `REFUND_ADDRESS` to quote the exact
+`Mailbox.quoteDispatch` call that the solver will attach to `settle([orderId])`.
+
 Example `direct` settlement:
 
 ```json
