@@ -1959,6 +1959,14 @@ impl RecoveryService {
 		}
 	}
 
+	fn publish_claim_ready(&self, order_id: String) {
+		self.event_bus
+			.publish(SolverEvent::Settlement(SettlementEvent::ClaimReady {
+				order_id,
+			}))
+			.ok();
+	}
+
 	/// Publishes appropriate event based on reconciliation result.
 	///
 	/// This method converts the reconciliation result into the appropriate
@@ -2070,6 +2078,15 @@ impl RecoveryService {
 				// Settled, check if ready for pre-claim or claim
 				tracing::info!("Order {} is settled", order.id);
 
+				if order.standard == HYPERLANE7683_STANDARD && fill_proof.is_some() {
+					tracing::info!(
+						order_id = %order.id,
+						"Hyperlane7683 recovery skipping scalar readiness and proceeding to claim"
+					);
+					self.publish_claim_ready(order.id);
+					return;
+				}
+
 				if let Some(proof) = fill_proof {
 					match self.settlement.readiness(&order, &proof).await {
 						SettlementReadiness::Ready => {
@@ -2133,15 +2150,20 @@ impl RecoveryService {
 
 			ReconcileResult::NeedsClaim { fill_proof } => {
 				// Fill confirmed, check if ready to claim
+				if order.standard == HYPERLANE7683_STANDARD && fill_proof.is_some() {
+					tracing::info!(
+						order_id = %order.id,
+						"Hyperlane7683 recovery skipping scalar readiness and proceeding to claim"
+					);
+					self.publish_claim_ready(order.id);
+					return;
+				}
+
 				if let Some(proof) = fill_proof {
 					match self.settlement.readiness(&order, &proof).await {
 						SettlementReadiness::Ready => {
 							tracing::info!("Order {} ready for claiming", order.id);
-							self.event_bus
-								.publish(SolverEvent::Settlement(SettlementEvent::ClaimReady {
-									order_id: order.id,
-								}))
-								.ok();
+							self.publish_claim_ready(order.id);
 						},
 						SettlementReadiness::Waiting(_) | SettlementReadiness::NeedsAction(_) => {
 							// Not ready to claim yet, emit event to spawn monitor
@@ -4605,6 +4627,58 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn publish_recovery_event_hyperlane_needs_claim_bypasses_scalar_readiness() {
+		let storage = Arc::new(StorageService::new(Box::new(
+			solver_storage::implementations::memory::MemoryStorage::new(),
+		)));
+		let first_fill = TransactionHash(vec![0xbb; 32]);
+		let second_fill = TransactionHash(vec![0xcc; 32]);
+		let order = OrderBuilder::new()
+			.with_standard(HYPERLANE7683_STANDARD)
+			.with_status(OrderStatus::Settled)
+			.with_fill_tx_hash(Some(first_fill.clone()))
+			.with_fill_tx_hashes(vec![first_fill, second_fill])
+			.with_expected_fill_tx_count(Some(2))
+			.build();
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		state_machine.store_order(&order).await.unwrap();
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
+		let event_bus = EventBus::new(100);
+		let mut receiver = event_bus.subscribe();
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
+
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine.clone(),
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+			empty_networks_config(),
+		);
+
+		recovery_service
+			.publish_recovery_event(
+				order.clone(),
+				ReconcileResult::NeedsClaim {
+					fill_proof: Some(create_test_fill_proof()),
+				},
+			)
+			.await;
+
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Settlement(SettlementEvent::ClaimReady { order_id }) => {
+				assert_eq!(order_id, order.id);
+			},
+			other => panic!("Expected ClaimReady event, got {other:?}"),
+		}
+		let stored = state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(stored.status, OrderStatus::Settled);
+	}
+
+	#[tokio::test]
 	async fn recovery_keeps_order_non_terminal_on_broadcaster_readiness_retry() {
 		// H-02 regression: a recoverable (non-terminal) Broadcaster readiness
 		// result during claim recovery must keep the order retryable, not
@@ -4974,6 +5048,58 @@ mod tests {
 			},
 			other => panic!("Expected StartMonitoring event, got {other:?}"),
 		}
+	}
+
+	#[tokio::test]
+	async fn publish_recovery_event_hyperlane_needs_preclaim_goes_to_claim_ready() {
+		let storage = Arc::new(StorageService::new(Box::new(
+			solver_storage::implementations::memory::MemoryStorage::new(),
+		)));
+		let first_fill = TransactionHash(vec![0xbb; 32]);
+		let second_fill = TransactionHash(vec![0xcc; 32]);
+		let order = OrderBuilder::new()
+			.with_standard(HYPERLANE7683_STANDARD)
+			.with_status(OrderStatus::Executed)
+			.with_fill_tx_hash(Some(first_fill.clone()))
+			.with_fill_tx_hashes(vec![first_fill, second_fill])
+			.with_expected_fill_tx_count(Some(2))
+			.build();
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		state_machine.store_order(&order).await.unwrap();
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
+		let event_bus = EventBus::new(100);
+		let mut receiver = event_bus.subscribe();
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
+
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine.clone(),
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+			empty_networks_config(),
+		);
+
+		recovery_service
+			.publish_recovery_event(
+				order.clone(),
+				ReconcileResult::NeedsPreClaim {
+					fill_proof: Some(create_test_fill_proof()),
+				},
+			)
+			.await;
+
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Settlement(SettlementEvent::ClaimReady { order_id }) => {
+				assert_eq!(order_id, order.id);
+			},
+			other => panic!("Expected ClaimReady event, got {other:?}"),
+		}
+		let stored = state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(stored.status, OrderStatus::Settled);
 	}
 
 	#[tokio::test]
