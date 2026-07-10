@@ -22,7 +22,7 @@ See root `AGENTS.md` for the full list. The ones this crate reads directly:
 
 Runtime configuration is assembled in `src/config_merge.rs`. That file is the seed-override + env-var entry point: `REDIS_URL` and `STORAGE_BACKEND` are read here directly, and seed templates are overridden by user-supplied `SeedOverrides`. **Read `config_merge.rs` before changing how config is loaded.**
 
-`src/server.rs` also reads `REDIS_URL` independently for the admin Redis client.
+`src/server.rs` builds the admin API's storage backend via `StoreConfig::from_env()` (honoring `STORAGE_BACKEND`), so the admin path no longer hardcodes Redis — a file-backed deployment needs no Redis.
 
 ## Run locally
 
