@@ -4303,7 +4303,7 @@ mod tests {
 			.await;
 		Mock::given(method("POST"))
 			.and(body_string_contains("\"method\":\"starknet_call\""))
-			.and(body_string_contains(&starknet_selector_hex(
+			.and(body_string_contains(starknet_selector_hex(
 				HYPERLANE7683_ORDER_STATUS_ENTRYPOINT,
 			)))
 			.respond_with(
@@ -4314,7 +4314,7 @@ mod tests {
 			.await;
 		Mock::given(method("POST"))
 			.and(body_string_contains("\"method\":\"starknet_call\""))
-			.and(body_string_contains(&starknet_selector_hex(
+			.and(body_string_contains(starknet_selector_hex(
 				HYPERLANE7683_QUOTE_GAS_PAYMENT_ENTRYPOINT,
 			)))
 			.respond_with(
@@ -4325,7 +4325,7 @@ mod tests {
 			.await;
 		Mock::given(method("POST"))
 			.and(body_string_contains("\"method\":\"starknet_call\""))
-			.and(body_string_contains(&starknet_selector_hex(
+			.and(body_string_contains(starknet_selector_hex(
 				HYPERLANE7683_ALLOWANCE_ENTRYPOINT,
 			)))
 			.respond_with(
@@ -4427,7 +4427,7 @@ mod tests {
 		let server = MockServer::start().await;
 		Mock::given(method("POST"))
 			.and(body_string_contains("\"method\":\"starknet_call\""))
-			.and(body_string_contains(&starknet_selector_hex(
+			.and(body_string_contains(starknet_selector_hex(
 				HYPERLANE7683_ORDER_STATUS_ENTRYPOINT,
 			)))
 			.respond_with(
@@ -4438,7 +4438,7 @@ mod tests {
 			.await;
 		Mock::given(method("POST"))
 			.and(body_string_contains("\"method\":\"starknet_call\""))
-			.and(body_string_contains(&starknet_selector_hex(
+			.and(body_string_contains(starknet_selector_hex(
 				HYPERLANE7683_QUOTE_GAS_PAYMENT_ENTRYPOINT,
 			)))
 			.respond_with(
@@ -4449,7 +4449,7 @@ mod tests {
 			.await;
 		Mock::given(method("POST"))
 			.and(body_string_contains("\"method\":\"starknet_call\""))
-			.and(body_string_contains(&starknet_selector_hex(
+			.and(body_string_contains(starknet_selector_hex(
 				HYPERLANE7683_ALLOWANCE_ENTRYPOINT,
 			)))
 			.respond_with(
@@ -4524,7 +4524,7 @@ mod tests {
 		let server = MockServer::start().await;
 		Mock::given(method("POST"))
 			.and(body_string_contains("\"method\":\"starknet_call\""))
-			.and(body_string_contains(&starknet_selector_hex(
+			.and(body_string_contains(starknet_selector_hex(
 				HYPERLANE7683_ORDER_STATUS_ENTRYPOINT,
 			)))
 			.respond_with(
@@ -4535,7 +4535,7 @@ mod tests {
 			.await;
 		Mock::given(method("POST"))
 			.and(body_string_contains("\"method\":\"starknet_call\""))
-			.and(body_string_contains(&starknet_selector_hex(
+			.and(body_string_contains(starknet_selector_hex(
 				HYPERLANE7683_QUOTE_GAS_PAYMENT_ENTRYPOINT,
 			)))
 			.respond_with(
@@ -4546,7 +4546,7 @@ mod tests {
 			.await;
 		Mock::given(method("POST"))
 			.and(body_string_contains("\"method\":\"starknet_call\""))
-			.and(body_string_contains(&starknet_selector_hex(
+			.and(body_string_contains(starknet_selector_hex(
 				HYPERLANE7683_ALLOWANCE_ENTRYPOINT,
 			)))
 			.respond_with(
@@ -4631,7 +4631,7 @@ mod tests {
 		let server = MockServer::start().await;
 		Mock::given(method("POST"))
 			.and(body_string_contains("\"method\":\"starknet_call\""))
-			.and(body_string_contains(&starknet_selector_hex(
+			.and(body_string_contains(starknet_selector_hex(
 				HYPERLANE7683_ORDER_STATUS_ENTRYPOINT,
 			)))
 			.respond_with(
@@ -4642,7 +4642,7 @@ mod tests {
 			.await;
 		Mock::given(method("POST"))
 			.and(body_string_contains("\"method\":\"starknet_call\""))
-			.and(body_string_contains(&starknet_selector_hex(
+			.and(body_string_contains(starknet_selector_hex(
 				HYPERLANE7683_QUOTE_GAS_PAYMENT_ENTRYPOINT,
 			)))
 			.respond_with(
@@ -4653,7 +4653,7 @@ mod tests {
 			.await;
 		Mock::given(method("POST"))
 			.and(body_string_contains("\"method\":\"starknet_call\""))
-			.and(body_string_contains(&starknet_selector_hex(
+			.and(body_string_contains(starknet_selector_hex(
 				HYPERLANE7683_ALLOWANCE_ENTRYPOINT,
 			)))
 			.respond_with(
@@ -4719,7 +4719,7 @@ mod tests {
 		let server = MockServer::start().await;
 		Mock::given(method("POST"))
 			.and(body_string_contains("\"method\":\"starknet_call\""))
-			.and(body_string_contains(&starknet_selector_hex(
+			.and(body_string_contains(starknet_selector_hex(
 				HYPERLANE7683_ORDER_STATUS_ENTRYPOINT,
 			)))
 			.respond_with(
@@ -4756,7 +4756,7 @@ mod tests {
 		let server = MockServer::start().await;
 		Mock::given(method("POST"))
 			.and(body_string_contains("\"method\":\"starknet_call\""))
-			.and(body_string_contains(&starknet_selector_hex(
+			.and(body_string_contains(starknet_selector_hex(
 				HYPERLANE7683_ORDER_STATUS_ENTRYPOINT,
 			)))
 			.respond_with(
@@ -4788,7 +4788,7 @@ mod tests {
 		let server = MockServer::start().await;
 		Mock::given(method("POST"))
 			.and(body_string_contains("\"method\":\"starknet_call\""))
-			.and(body_string_contains(&starknet_selector_hex(
+			.and(body_string_contains(starknet_selector_hex(
 				HYPERLANE7683_ORDER_STATUS_ENTRYPOINT,
 			)))
 			.respond_with(
@@ -4799,7 +4799,7 @@ mod tests {
 			.await;
 		Mock::given(method("POST"))
 			.and(body_string_contains("\"method\":\"starknet_call\""))
-			.and(body_string_contains(&starknet_selector_hex(
+			.and(body_string_contains(starknet_selector_hex(
 				HYPERLANE7683_QUOTE_GAS_PAYMENT_ENTRYPOINT,
 			)))
 			.respond_with(
@@ -4832,7 +4832,7 @@ mod tests {
 		let server = MockServer::start().await;
 		Mock::given(method("POST"))
 			.and(body_string_contains("\"method\":\"starknet_call\""))
-			.and(body_string_contains(&starknet_selector_hex(
+			.and(body_string_contains(starknet_selector_hex(
 				HYPERLANE7683_QUOTE_GAS_PAYMENT_ENTRYPOINT,
 			)))
 			.respond_with(
