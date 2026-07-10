@@ -1,7 +1,11 @@
 name: Build Mainnet Image
 
-# Builds the production solver image (linux/amd64, the Fargate platform) and
-# pushes it to the mainnet ECR repo tagged with the git short SHA. Manual only:
+# Builds the production solver image (linux/arm64 — the mainnet Fargate task
+# runtimePlatform is ARM64/Graviton) and pushes it to the mainnet ECR repo
+# tagged with the git short SHA. Built natively on a free public-repo arm64
+# runner (no QEMU). An amd64 image will fail to pull with "manifest does not
+# contain descriptor matching platform linux/arm64" and the deployment circuit
+# breaker will roll back. Manual only:
 # building/pushing a production artifact should be an explicit action. Rolling
 # it out is a separate step (bump the Terraform image tag var + `terraform
 # apply`); this workflow does NOT deploy to the running service.
@@ -23,7 +27,7 @@ env:
 
 jobs:
   build-and-push:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm # native arm64 (free for public repos); matches the Fargate ARM64 platform
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -53,7 +57,7 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64
+          platforms: linux/arm64
           push: true
           tags: ${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
           cache-from: type=gha
