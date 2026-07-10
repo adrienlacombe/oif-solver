@@ -69,15 +69,21 @@ pub struct AppState {
 	pub signature_validation: Arc<SignatureValidationService>,
 }
 
+/// Builds the storage backend used by the admin API.
+///
+/// The backend is selected from `STORAGE_BACKEND` via [`StoreConfig::from_env`],
+/// so it mirrors the solver engine's storage selection. A file-backed
+/// deployment (`STORAGE_BACKEND=file`) therefore does not require Redis for the
+/// admin API to start; Redis remains the default when `STORAGE_BACKEND` is
+/// unset.
 fn create_admin_storage_backend(
-	redis_url: String,
-	cluster_mode: bool,
 ) -> Result<std::sync::Arc<dyn solver_storage::StorageInterface>, Box<dyn std::error::Error>> {
-	create_storage_backend(StoreConfig::Redis {
-		url: redis_url,
-		cluster_mode,
-	})
-	.map_err(|e| {
+	let store_config = StoreConfig::from_env().map_err(|e| {
+		tracing::error!("Failed to resolve admin storage backend config: {}", e);
+		Box::new(std::io::Error::other(format!("Admin storage error: {e}")))
+			as Box<dyn std::error::Error>
+	})?;
+	create_storage_backend(store_config).map_err(|e| {
 		tracing::error!("Failed to create admin storage backend: {}", e);
 		Box::new(std::io::Error::other(format!("Admin storage error: {e}")))
 			as Box<dyn std::error::Error>
@@ -189,20 +195,21 @@ pub async fn start_server(
 	let admin_state = if let Some(auth_config) = &api_config.auth {
 		if let Some(admin_config) = &auth_config.admin {
 			if admin_config.enabled {
-				let redis_url = std::env::var("REDIS_URL")
-					.unwrap_or_else(|_| "redis://localhost:6379".to_string());
-				let cluster_mode = solver_storage::parse_redis_cluster_mode_env();
 				let solver_id = config.solver.id.clone();
 				// Use explicit chain_id from admin config, or fall back to first network
 				let chain_id = admin_config
 					.chain_id
 					.unwrap_or_else(|| config.networks.keys().next().copied().unwrap_or(1));
 
+				// Build one storage backend for all admin operations, selected from
+				// STORAGE_BACKEND (mirroring the solver engine) so a file-backed
+				// deployment does not require Redis. Shared across the SIWE nonce
+				// store, operator config store, and admin nonce store. Redis remains
+				// the default when STORAGE_BACKEND is unset.
+				let admin_storage = create_admin_storage_backend()?;
+
 				match create_nonce_store_with_namespace(
-					StoreConfig::Redis {
-						url: redis_url.clone(),
-						cluster_mode,
-					},
+					StoreConfig::Storage(admin_storage.clone()),
 					&solver_id,
 					"siwe",
 					admin_config.nonce_ttl_seconds,
@@ -230,9 +237,6 @@ pub async fn start_server(
 						)));
 					},
 				};
-
-				// Share one storage backend for all admin Redis operations.
-				let admin_storage = create_admin_storage_backend(redis_url.clone(), cluster_mode)?;
 
 				// Create ConfigStore for OperatorConfig
 				let config_store = create_admin_config_store(admin_storage.clone(), &solver_id)?;
@@ -2382,9 +2386,45 @@ mod tests {
 	}
 
 	#[test]
-	fn create_admin_storage_backend_returns_error_for_invalid_redis_url() {
-		let err = match super::create_admin_storage_backend(String::new(), false) {
-			Ok(_) => panic!("expected invalid redis URL to fail"),
+	#[serial_test::serial(env_redis)]
+	fn create_admin_storage_backend_uses_file_without_redis() {
+		// The admin backend must honor STORAGE_BACKEND. A file-backed deployment
+		// must initialize without any Redis dependency, and an unsupported
+		// backend must surface an "Admin storage error".
+		let prev_backend = std::env::var("STORAGE_BACKEND").ok();
+		let prev_path = std::env::var("STORAGE_PATH").ok();
+
+		let restore = |backend: &Option<String>, path: &Option<String>| {
+			match backend {
+				Some(v) => std::env::set_var("STORAGE_BACKEND", v),
+				None => std::env::remove_var("STORAGE_BACKEND"),
+			}
+			match path {
+				Some(v) => std::env::set_var("STORAGE_PATH", v),
+				None => std::env::remove_var("STORAGE_PATH"),
+			}
+		};
+
+		// File backend: no Redis required.
+		std::env::set_var("STORAGE_BACKEND", "file");
+		std::env::set_var(
+			"STORAGE_PATH",
+			std::env::temp_dir().join("oif-admin-backend-test"),
+		);
+		let file_result = super::create_admin_storage_backend();
+
+		// Unsupported backend: mapped to an admin storage error.
+		std::env::set_var("STORAGE_BACKEND", "definitely-not-a-backend");
+		let bad_result = super::create_admin_storage_backend();
+
+		restore(&prev_backend, &prev_path);
+
+		assert!(
+			file_result.is_ok(),
+			"file backend should initialize without Redis"
+		);
+		let err = match bad_result {
+			Ok(_) => panic!("unsupported backend should fail"),
 			Err(err) => err,
 		};
 		assert!(err.to_string().contains("Admin storage error"));
