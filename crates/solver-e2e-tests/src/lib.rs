@@ -2269,7 +2269,11 @@ fn build_seed_overrides(
 			// settlement flow we exercise here.
 			network_type: Some(NetworkType::Parent),
 			kind: Some(NetworkKind::Evm),
-			tokens: vec![token("TOKA", d.token_a), token("TOKB", d.token_b)],
+			tokens: vec![
+				token("ETH", Address::ZERO),
+				token("TOKA", d.token_a),
+				token("TOKB", d.token_b),
+			],
 			rpc_urls: Some(vec![d.rpc_http.clone()]),
 			input_settler_address: Some(solver_address(d.input_settler)),
 			output_settler_address: Some(solver_address(d.output_settler)),
