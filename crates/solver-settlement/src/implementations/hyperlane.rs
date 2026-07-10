@@ -1296,7 +1296,14 @@ impl HyperlaneSettlement {
 		let quote = Self::starknet_u256_from_low_high_felts(&result, "Starknet quote_gas_payment")?;
 		if quote == U256::ZERO && !self.allow_zero_hyperlane7683_settle_quote {
 			return Err(SettlementError::ValidationFailed(format!(
-				"Hyperlane7683 settle gas payment quote is zero on Starknet destination chain {destination_chain_id}; set allow_zero_hyperlane7683_settle_quote only for environments where this is expected"
+				"Hyperlane7683 settle gas payment quote is zero on Starknet destination chain \
+				 {destination_chain_id} for message origin domain {origin_domain}. The destination \
+				 router's GasRouter has no per-domain gas configured for domain {origin_domain}, so \
+				 quote_gas_payment returns zero and a settle dispatched now would pay the relayer \
+				 nothing and strand the message. Fix on-chain by calling set_destination_gas for \
+				 domain {origin_domain} on the destination router (the EVM side is configured the \
+				 same way via setDestinationGas). allow_zero_hyperlane7683_settle_quote is only for \
+				 local/mock environments where no relayer delivers the message."
 			)));
 		}
 		Ok(quote)
@@ -1411,7 +1418,13 @@ impl HyperlaneSettlement {
 	) -> Result<U256, SettlementError> {
 		if quote == U256::ZERO && !self.allow_zero_hyperlane7683_settle_quote {
 			return Err(SettlementError::ValidationFailed(format!(
-				"Hyperlane7683 settle gas payment quote is zero on destination chain {destination_chain_id} from {quote_source}; set allow_zero_hyperlane7683_settle_quote only for environments where this is expected"
+				"Hyperlane7683 settle gas payment quote is zero on destination chain \
+				 {destination_chain_id} from {quote_source}. The destination router most likely has \
+				 no per-domain gas configured (Hyperlane setDestinationGas), so a settle dispatched \
+				 now would underpay the relayer and strand the message. Fix on-chain by configuring \
+				 the destination gas for this route on the destination router. \
+				 allow_zero_hyperlane7683_settle_quote is only for local/mock environments where no \
+				 relayer delivers the message."
 			)));
 		}
 

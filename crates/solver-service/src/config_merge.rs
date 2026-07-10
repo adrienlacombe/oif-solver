@@ -7333,11 +7333,15 @@ mod tests {
 		assert!(starknet.tokens[0].address.is_bytes32_address());
 
 		let hyperlane = runtime.settlement.implementations.get("hyperlane").unwrap();
+		// Guard against re-leaking the test-only zero-quote allowance into the
+		// tracked live config. The Sepolia example must enforce real (non-zero)
+		// Hyperlane settle quotes; the allowance stays confined to the e2e
+		// harness (which uses a placeholder IGP that quotes zero).
 		assert_eq!(
 			hyperlane
 				.get("allow_zero_hyperlane7683_settle_quote")
 				.and_then(|value| value.as_bool()),
-			Some(true)
+			Some(false)
 		);
 		assert_eq!(
 			hyperlane
