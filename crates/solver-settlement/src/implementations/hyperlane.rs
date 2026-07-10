@@ -5324,6 +5324,11 @@ mod tests {
 				Box::new(backend),
 			)))),
 			default_gas_limit: 500_000,
+			network_kinds: HashMap::new(),
+			starknet_clients: HashMap::new(),
+			starknet_fee_token_addresses: HashMap::new(),
+			allow_zero_hyperlane7683_settle_quote: false,
+			solver_identities: SolverIdentityAddresses::default(),
 		};
 		let order = test_order_with_chains(1, 137);
 
