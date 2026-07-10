@@ -1,0 +1,65 @@
+name: Build Mainnet Image
+
+# Builds the production solver image (linux/amd64, the Fargate platform) and
+# pushes it to the mainnet ECR repo tagged with the git short SHA. Manual only:
+# building/pushing a production artifact should be an explicit action. Rolling
+# it out is a separate step (bump the Terraform image tag var + `terraform
+# apply`); this workflow does NOT deploy to the running service.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (branch, tag, or SHA). Defaults to the triggering ref."
+        required: false
+        default: ""
+
+permissions:
+  id-token: write # required for AWS OIDC
+  contents: read
+
+env:
+  AWS_REGION: eu-west-3
+  ECR_REPOSITORY: 618867225791.dkr.ecr.eu-west-3.amazonaws.com/oif-solver-mainnet
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.sha }}
+
+      - name: Compute image tag (git short SHA)
+        id: meta
+        run: echo "tag=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Requires an AWS IAM role trusting this repo via GitHub OIDC, exposed as
+      # the AWS_DEPLOY_ROLE_ARN repo secret. See infra/aws/terraform.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          echo "Pushed ${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Roll out by setting the Terraform image tag to ${{ steps.meta.outputs.tag }} and running terraform apply." >> "$GITHUB_STEP_SUMMARY"
