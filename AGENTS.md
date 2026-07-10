@@ -25,6 +25,14 @@ This file is the source of truth for AI coding assistants working in this repo. 
 | solver-storage | `crates/solver-storage` | Persistence abstractions (Redis + file backends) | **Yes** |
 | solver-types | `crates/solver-types` | Shared types: orders, events, auth, admin | **Yes** |
 
+## Cairo contracts (`cairo/`)
+
+`cairo/` is the OIF Starknet (Hyperlane7683) contract project, imported from `adrien-oif-starknet` for maintenance alongside the solver. It is a **Scarb project, not part of the Cargo workspace** — `cargo build` ignores it.
+
+- Toolchain is pinned in `cairo/.tool-versions`: **scarb 2.10.1**, starknet-foundry 0.38.3, starkli 0.4.1. Newer scarb fails on dependency trait/snapshot changes — build with the pinned version (via `asdf`/`mise`).
+- Build: `cd cairo && scarb build`. Test: `snforge test` (or `scarb test`).
+- The `hyperlane-starknet` crates are git dependencies pinned by rev. See `cairo/VENDORING.md` for the required STRK fee-token patch and how the fork is wired.
+
 ## Walk the tree before editing
 
 Before editing a file in `crates/<X>/`, read root `AGENTS.md` (this file) and, if present, `crates/<X>/AGENTS.md`. Crate-specific files override or refine the defaults stated here.

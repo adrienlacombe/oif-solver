@@ -1,0 +1,36 @@
+[package]
+name = "oif_starknet"
+version = "0.1.0"
+edition = "2024_07"
+
+[dependencies]
+alexandria_bytes = "0.4.0"
+alexandria_encoding = "0.4.0"
+# hyperlane-starknet crates from the OIF fork, which carries one patch on top of
+# upstream eb57b8d: interfaces.cairo ETH_ADDRESS -> STRK (the Starknet mailbox
+# charges STRK for dispatch fees). See VENDORING.md.
+contracts = { git = "https://github.com/adrienlacombe/hyperlane-starknet.git", rev = "88cd98fcf25f9a9c1e97fa0dc99416d0c55242cb" }
+mocks = { git = "https://github.com/adrienlacombe/hyperlane-starknet.git", rev = "88cd98fcf25f9a9c1e97fa0dc99416d0c55242cb" }
+openzeppelin_token = "0.20.0"
+openzeppelin_access = "0.20.0"
+openzeppelin_account = "0.20.0"
+openzeppelin_introspection = "0.20.0"
+openzeppelin_upgrades = "0.20.0"
+openzeppelin_utils = "0.20.0"
+permit2 = { git = "https://github.com/NethermindEth/permit2-starknet.git" }
+starknet = ">=2.10.1"
+token = { git = "https://github.com/adrienlacombe/hyperlane-starknet.git", rev = "88cd98fcf25f9a9c1e97fa0dc99416d0c55242cb" }
+
+[dev-dependencies]
+snforge_std = "0.38.3"
+assert_macros = ">=2.10.1"
+
+[[target.starknet-contract]]
+sierra = true
+casm = true
+
+[scripts]
+test = "snforge test"
+
+[tool.scarb]
+allow-prebuilt-plugins = ["snforge_std"]
