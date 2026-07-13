@@ -371,6 +371,11 @@ fn native_symbol_fallback(chain_id: u64) -> Option<&'static str> {
 		137 => Some("POL"),    // Polygon PoS
 		56 => Some("BNB"),     // BNB Smart Chain
 		43114 => Some("AVAX"), // Avalanche C-Chain
+		// Starknet mainnet: the mainnet mailbox charges dispatch/settlement fees in
+		// STRK (18 decimals). Without this, native gas pricing for a Starknet
+		// destination fails with "Token not supported: 0x0 on chain 358974494",
+		// blocking cost estimation for every Starknet-destination order.
+		358974494 => Some("STRK"),
 		_ => None,
 	}
 }
@@ -4069,6 +4074,161 @@ mod tests {
 		});
 
 		Arc::new(AccountService::new(Box::new(mock_account)))
+	}
+
+	/// Regression (bug fix): destination-side settlement / L1-data fees are priced
+	/// via `native_base_units_to_usd`, which resolves the native symbol via a
+	/// 20-byte zero-address token lookup and then `native_symbol_fallback`. Before
+	/// the fix, Starknet (domain 358974494) had no fallback entry, so
+	/// `calculate_total_cost` hard-failed with "Token not supported: 0x0 on chain
+	/// 358974494" for EVERY Starknet-destination order. Adding the STRK fallback
+	/// entry fixes it. This drives a Starknet destination with a non-zero
+	/// settlement fee and asserts the estimate now succeeds.
+	#[tokio::test]
+	async fn calculate_total_cost_prices_starknet_destination_settlement_fee() {
+		let one_native = U256::from(1_000_000_000_000_000_000u128);
+		let dest_chain: u64 = 358_974_494;
+
+		// The fix: Starknet resolves to STRK in the native-gas fallback map. Without
+		// this entry `native_base_units_to_usd` returns TokenNotSupported for the
+		// dest and cost estimation fails (the RED this guards against).
+		assert_eq!(native_symbol_fallback(dest_chain), Some("STRK"));
+
+		let mut mock_pricing = MockPricingInterface::new();
+		// Echo each native amount as its USD value for any asset (ETH origin legs,
+		// STRK destination legs) so every priced leg is a positive number.
+		mock_pricing
+			.expect_convert_asset()
+			.returning(|_, _, amount| {
+				let amount = amount.to_string();
+				Box::pin(async move { Ok(amount) })
+			});
+
+		let mut origin_delivery = MockDeliveryInterface::new();
+		origin_delivery
+			.expect_get_fee_params()
+			.returning(|chain_id| {
+				Box::pin(
+					async move { Ok(FeeParams::legacy(chain_id, 10_000_000_000_000_000_000u128)) },
+				)
+			});
+		origin_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let mut destination_delivery = MockDeliveryInterface::new();
+		destination_delivery
+			.expect_get_fee_params()
+			.returning(|chain_id| {
+				Box::pin(async move {
+					Ok(FeeParams::starknet_fixed(
+						chain_id,
+						U256::from(230_000_000_000_000_000_000u128),
+					))
+				})
+			});
+		destination_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([
+				(
+					1u64,
+					Arc::new(origin_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+				),
+				(
+					dest_chain,
+					Arc::new(destination_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+				),
+			]),
+			1,
+			3600,
+			60,
+		));
+
+		// The destination network deliberately has NO zero-address native
+		// TokenConfig, so the old upstream path (get_token_info(dest, 0x0) +
+		// fallback) would fail.
+		let mut networks = NetworksConfig::new();
+		networks.insert(
+			1,
+			solver_types::NetworkConfig {
+				name: Some("ethereum".to_string()),
+				network_type: solver_types::networks::NetworkType::New,
+				kind: Default::default(),
+				rpc_urls: vec![],
+				input_settler_address: solver_types::Address([0x11; 20].to_vec()),
+				output_settler_address: solver_types::Address([0x22; 20].to_vec()),
+				tokens: vec![solver_types::TokenConfig {
+					address: solver_types::Address(vec![0u8; 20]),
+					symbol: "ETH".to_string(),
+					name: Some("Ether".to_string()),
+					decimals: 18,
+				}],
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+		networks.insert(
+			dest_chain,
+			solver_types::NetworkConfig {
+				name: Some("starknet".to_string()),
+				network_type: solver_types::networks::NetworkType::New,
+				kind: Default::default(),
+				rpc_urls: vec![],
+				input_settler_address: solver_types::Address([0x33; 20].to_vec()),
+				output_settler_address: solver_types::Address([0x44; 20].to_vec()),
+				tokens: vec![solver_types::TokenConfig {
+					address: solver_types::Address([0x55; 20].to_vec()),
+					symbol: "STRK".to_string(),
+					name: Some("Starknet Token".to_string()),
+					decimals: 18,
+				}],
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+
+		let token_manager = Arc::new(TokenManager::new(
+			networks,
+			delivery.clone(),
+			create_mock_account_service(),
+		));
+		let service = CostProfitService::new(
+			Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new())),
+			delivery,
+			token_manager,
+			Arc::new(StorageService::new(Box::new(MockStorageInterface::new()))),
+			no_fee_settlement_service(),
+		);
+
+		let config = create_test_config();
+		let breakdown = service
+			.calculate_total_cost(
+				&[],
+				&[],
+				&config,
+				1,
+				dest_chain,
+				&GasUnits {
+					open_units: 1,
+					fill_units: 2,
+					post_fill_units: 3,
+					pre_claim_units: 4,
+					claim_units: 5,
+				},
+				one_native * U256::from(10u64), // settlement_fee_wei: non-zero → hits the fixed leg
+				U256::ZERO,                      // l1_data_fee_wei
+				U256::ZERO,                      // l1_data_fee_buffer_wei
+			)
+			.await
+			.expect("Starknet-destination cost estimate must succeed after routing dest fees through fee-params");
+
+		// Origin gas leg priced (ETH); the call succeeding is the core assertion.
+		assert!(breakdown.gas_open > Decimal::ZERO);
 	}
 
 	#[tokio::test]
