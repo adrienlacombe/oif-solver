@@ -16,6 +16,6 @@ pub use account::{AccountCommand, AccountSubcommand};
 pub use config::ConfigCommand;
 pub use env::{EnvCommand, EnvSubcommand};
 pub use init::{InitCommand, InitSubcommand};
-pub use intent::{IntentCommand, IntentSubcommand};
+pub use intent::{IntentCommand, IntentSubcommand, OpenArgs};
 pub use quote::{QuoteCommand, QuoteSubcommand};
 pub use token::{TokenCommand, TokenSubcommand};

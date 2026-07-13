@@ -4,6 +4,8 @@
 //! Handles intent request construction, settlement type validation, authentication
 //! schemes, and order submission workflows with comprehensive parameter validation.
 
+pub mod hyperlane_open;
+
 use crate::{
 	core::logging,
 	types::{chain::ChainId, error::Result},

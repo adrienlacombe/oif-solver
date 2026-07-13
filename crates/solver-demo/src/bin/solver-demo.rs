@@ -650,6 +650,12 @@ async fn handle_intent(cmd: solver_demo::cli::commands::IntentCommand) -> Result
 	use solver_demo::operations::intent::IntentOps;
 	use solver_demo::types::chain::ChainId;
 
+	// The Hyperlane7683 on-chain opener is self-contained (its own RPC + env key),
+	// so handle it before loading a demo session/context.
+	if let IntentSubcommand::Open(args) = cmd.command {
+		return handle_intent_open(args).await;
+	}
+
 	// Load context
 	let ctx = std::sync::Arc::new(Context::load_existing().await?);
 	let intent_ops = IntentOps::new(ctx.clone());
@@ -930,9 +936,39 @@ async fn handle_intent(cmd: solver_demo::cli::commands::IntentCommand) -> Result
 				);
 			}
 		},
+		IntentSubcommand::Open(_) => unreachable!("Open is handled before context load"),
 	}
 
 	Ok(())
+}
+
+/// Handle the self-contained Hyperlane7683 on-chain opener (EVM → Starknet).
+async fn handle_intent_open(args: solver_demo::cli::commands::OpenArgs) -> Result<()> {
+	use alloy_primitives::U256;
+	use solver_demo::operations::intent::hyperlane_open::{run, OpenParams};
+
+	let input_amount = args
+		.input_amount
+		.parse::<U256>()
+		.map_err(|e| anyhow::anyhow!("invalid --input-amount '{}': {e}", args.input_amount))?;
+	let output_amount = args
+		.output_amount
+		.parse::<U256>()
+		.map_err(|e| anyhow::anyhow!("invalid --output-amount '{}': {e}", args.output_amount))?;
+
+	run(OpenParams {
+		origin_chain: args.origin_chain,
+		dest_chain: args.dest_chain,
+		rpc: args.rpc,
+		hyperlane: args.hyperlane,
+		input_token: args.input_token,
+		output_token: args.output_token,
+		dest_settler: args.dest_settler,
+		recipient: args.recipient,
+		input_amount,
+		output_amount,
+	})
+	.await
 }
 
 /// Handle quote command
