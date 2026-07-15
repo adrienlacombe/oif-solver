@@ -922,6 +922,7 @@ impl SolverBuilder {
 			storage,
 			account,
 			solver_address,
+			solver_identities.clone(),
 			delivery,
 			discovery,
 			order,

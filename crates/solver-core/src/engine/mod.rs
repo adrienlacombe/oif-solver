@@ -134,6 +134,10 @@ pub struct SolverEngine {
 		Arc<tokio::sync::RwLock<solver_bridge::monitor::RebalanceMonitorStatus>>,
 	/// The solver's Ethereum address.
 	pub(crate) solver_address: solver_types::Address,
+	/// Per-network-kind solver identities (EVM + Starknet). Used to query solver
+	/// balances with the correct account for each chain kind — e.g. the Starknet
+	/// felt identity on Starknet chains rather than the EVM address.
+	pub(crate) solver_identities: solver_types::SolverIdentityAddresses,
 	/// Public-facing startup readiness state. Defaults to `ready()`. The
 	/// builder writes a non-ready value here when startup approvals are
 	/// blocked on native gas; the retry loop flips it back when the next
@@ -247,6 +251,7 @@ impl SolverEngine {
 		storage: Arc<StorageService>,
 		account: Arc<AccountService>,
 		solver_address: Address,
+		solver_identities: solver_types::SolverIdentityAddresses,
 		delivery: Arc<DeliveryService>,
 		discovery: Arc<DiscoveryService>,
 		order: Arc<OrderService>,
@@ -329,6 +334,7 @@ impl SolverEngine {
 			settlement_handler,
 			bridge_service,
 			solver_address: solver_address_stored,
+			solver_identities,
 			rebalance_monitor_status: Arc::new(tokio::sync::RwLock::new(
 				solver_bridge::monitor::RebalanceMonitorStatus::default(),
 			)),
@@ -1247,6 +1253,7 @@ impl SolverEngine {
 			self.token_manager.clone(),
 			self.dynamic_config.read().await.clone(),
 		)
+		.with_solver_identities(self.solver_identities.clone())
 		.build_execution_context(&intent)
 		.await
 		.map_err(|e| EngineError::Service(format!("Failed to build execution context: {e}")))?;
@@ -1423,6 +1430,7 @@ mod tests {
 		Arc<StorageService>,
 		Arc<AccountService>,
 		Address,
+		solver_types::SolverIdentityAddresses,
 		Arc<DeliveryService>,
 		Arc<DiscoveryService>,
 		Arc<OrderService>,
@@ -1500,6 +1508,7 @@ mod tests {
 		));
 
 		let dynamic_config = Arc::new(RwLock::new(config.clone()));
+		let solver_identities = solver_types::SolverIdentityAddresses::default();
 
 		(
 			dynamic_config,
@@ -1507,6 +1516,7 @@ mod tests {
 			storage,
 			account,
 			solver_address,
+			solver_identities,
 			delivery,
 			discovery,
 			order,
@@ -1525,6 +1535,7 @@ mod tests {
 			storage,
 			account,
 			solver_address,
+			solver_identities,
 			delivery,
 			discovery,
 			order,
@@ -1540,6 +1551,7 @@ mod tests {
 			storage.clone(),
 			account.clone(),
 			solver_address,
+			solver_identities,
 			delivery.clone(),
 			discovery.clone(),
 			order.clone(),
@@ -1572,6 +1584,7 @@ mod tests {
 			storage,
 			account,
 			solver_address,
+			solver_identities,
 			delivery,
 			discovery,
 			order,
@@ -1587,6 +1600,7 @@ mod tests {
 			storage,
 			account,
 			solver_address,
+			solver_identities,
 			delivery,
 			discovery,
 			order,
@@ -1612,6 +1626,7 @@ mod tests {
 			storage,
 			account,
 			solver_address,
+			solver_identities,
 			delivery,
 			discovery,
 			order,
@@ -1627,6 +1642,7 @@ mod tests {
 			storage,
 			account,
 			solver_address,
+			solver_identities,
 			delivery,
 			discovery,
 			order,
@@ -1651,6 +1667,7 @@ mod tests {
 			storage,
 			account,
 			solver_address,
+			solver_identities,
 			delivery,
 			discovery,
 			order,
@@ -1666,6 +1683,7 @@ mod tests {
 			storage,
 			account,
 			solver_address,
+			solver_identities,
 			delivery,
 			discovery,
 			order,
@@ -1879,6 +1897,7 @@ mod tests {
 			storage,
 			account,
 			solver_address,
+			solver_identities,
 			delivery,
 			discovery,
 			order,
@@ -1894,6 +1913,7 @@ mod tests {
 			storage,
 			account,
 			solver_address,
+			solver_identities,
 			delivery,
 			discovery,
 			order,
@@ -1914,6 +1934,7 @@ mod tests {
 			storage,
 			account,
 			solver_address,
+			solver_identities,
 			delivery,
 			discovery,
 			_order,
@@ -1933,6 +1954,7 @@ mod tests {
 			storage,
 			account,
 			solver_address,
+			solver_identities,
 			delivery,
 			discovery,
 			order,
@@ -1955,6 +1977,7 @@ mod tests {
 			storage,
 			account,
 			solver_address,
+			solver_identities,
 			_delivery,
 			discovery,
 			_order,
@@ -1980,6 +2003,7 @@ mod tests {
 			storage,
 			account,
 			solver_address,
+			solver_identities,
 			delivery,
 			discovery,
 			order,
@@ -2780,6 +2804,7 @@ mod tests {
 			storage,
 			account,
 			solver_address,
+			solver_identities,
 			delivery,
 			discovery,
 			order,
@@ -2795,6 +2820,7 @@ mod tests {
 			storage,
 			account,
 			solver_address,
+			solver_identities,
 			delivery,
 			discovery,
 			order,
@@ -2822,6 +2848,7 @@ mod tests {
 			storage,
 			account,
 			solver_address,
+			solver_identities,
 			delivery,
 			discovery,
 			order,
@@ -2837,6 +2864,7 @@ mod tests {
 			storage,
 			account,
 			solver_address,
+			solver_identities,
 			delivery,
 			discovery,
 			order,

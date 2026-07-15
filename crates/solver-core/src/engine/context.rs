@@ -10,8 +10,8 @@ use alloy_primitives::hex;
 use solver_config::Config;
 use solver_delivery::DeliveryService;
 use solver_types::{
-	is_native_address, Address, ExecutionContext, Hyperlane7683ResolvedOrder, Intent,
-	HYPERLANE7683_STANDARD,
+	is_native_address, Address, ExecutionContext, Hyperlane7683ResolvedOrder, Intent, NetworkKind,
+	NetworksConfig, SolverIdentityAddresses, HYPERLANE7683_STANDARD,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,6 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub struct ContextBuilder {
 	delivery: Arc<DeliveryService>,
 	solver_address: Address,
+	solver_identities: SolverIdentityAddresses,
 	token_manager: Arc<TokenManager>,
 	_config: Config,
 }
@@ -39,9 +40,36 @@ impl ContextBuilder {
 		Self {
 			delivery,
 			solver_address,
+			solver_identities: SolverIdentityAddresses::default(),
 			token_manager,
 			_config: config,
 		}
+	}
+
+	/// Sets the per-network-kind solver identities so balance lookups use the
+	/// correct account for each chain — e.g. the Starknet identity (a 32-byte
+	/// felt) for Starknet chains rather than the EVM primary address. Without
+	/// this, `fetch_solver_balances` queries the EVM address on Starknet, which
+	/// resolves to a different account and reads a zero balance. Defaults to empty
+	/// (every chain falls back to `solver_address`).
+	pub fn with_solver_identities(mut self, identities: SolverIdentityAddresses) -> Self {
+		self.solver_identities = identities;
+		self
+	}
+
+	/// Resolves the solver account address to use for balance lookups on a chain,
+	/// honoring the network kind (Starknet chains use the Starknet identity).
+	fn solver_address_for_chain(&self, chain_id: u64, networks: &NetworksConfig) -> String {
+		let is_starknet = networks
+			.get(&chain_id)
+			.map(|n| matches!(n.kind, NetworkKind::Starknet))
+			.unwrap_or(false);
+		if is_starknet {
+			if let Some(sn) = &self.solver_identities.starknet {
+				return sn.to_string();
+			}
+		}
+		self.solver_address.to_string()
 	}
 
 	/// Builds the execution context for strategy decisions.
@@ -253,10 +281,15 @@ impl ContextBuilder {
 	) -> Result<HashMap<(u64, Option<String>), String>, SolverError> {
 		let mut balances = HashMap::new();
 
-		// Use the solver address that was provided at initialization
-		let solver_address = self.solver_address.to_string();
+		// Network configs select the correct solver identity per chain kind:
+		// Starknet chains query the Starknet felt identity, EVM chains the EVM
+		// address. Using a single address across kinds queries the wrong account
+		// on Starknet and reads a zero balance.
+		let networks = self.token_manager.get_networks().await;
 
 		for &chain_id in chains {
+			let solver_address = self.solver_address_for_chain(chain_id, &networks);
+
 			// Get native token balance
 			match self
 				.delivery
