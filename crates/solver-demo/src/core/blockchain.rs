@@ -283,15 +283,20 @@ impl TxBuilder {
 			tx.gas = Some(gas);
 		}
 
-		// Fill gas price if not set
+		// Fill gas price if not set. Use EIP-1559 with base-fee headroom rather than
+		// a fixed legacy `gas_price`: a legacy tx priced at the current gas price
+		// gets dropped from the mempool when the base fee ticks up, which strands
+		// mainnet sends. `estimate_eip1559_fees()` sets a max fee with headroom plus
+		// a priority tip, so the tx stays valid until it mines.
 		if tx.gas_price.is_none() && tx.max_fee_per_gas.is_none() {
-			let gas_price = self
+			let est = self
 				.provider
 				.inner
-				.get_gas_price()
+				.estimate_eip1559_fees()
 				.await
-				.map_err(|e| Error::RpcError(format!("Failed to get gas price: {e}")))?;
-			tx.gas_price = Some(gas_price);
+				.map_err(|e| Error::RpcError(format!("Failed to estimate EIP-1559 fees: {e}")))?;
+			tx.max_fee_per_gas = Some(est.max_fee_per_gas);
+			tx.max_priority_fee_per_gas = Some(est.max_priority_fee_per_gas);
 		}
 
 		let pending = self
@@ -317,7 +322,7 @@ impl TxBuilder {
 	pub async fn wait(&self, hash: B256) -> Result<TransactionReceipt> {
 		// Poll for receipt
 		let mut attempts = 0;
-		const MAX_ATTEMPTS: u32 = 60; // 60 seconds max wait
+		const MAX_ATTEMPTS: u32 = 180; // 3 minutes max wait (mainnet inclusion can exceed 60s)
 
 		loop {
 			if let Some(receipt) = self
