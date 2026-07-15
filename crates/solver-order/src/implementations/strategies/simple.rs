@@ -94,21 +94,15 @@ impl ExecutionStrategy for SimpleStrategy {
 						1u64
 					});
 
-					// Get token address from the asset's InteropAddress
-					let (token_address, is_native_token) = asset
-						.ethereum_address()
-						.map(|addr| {
-							let address = solver_types::Address(addr.as_slice().to_vec());
-							(hex::encode(addr.as_slice()), is_native_address(&address))
-						})
-						.unwrap_or_else(|e| {
-							tracing::warn!(
-								order_id = %order.id,
-								error = %e,
-								"Failed to get token address from asset"
-							);
-							(String::new(), false)
-						});
+					// Read the raw address bytes directly. `ethereum_address()` requires a
+					// 20-byte EVM address and errors on a 32-byte Starknet felt, which left
+					// the token key empty and forced a Skip for every Starknet-destination
+					// output. Key the balance on the full-width hex (no 0x prefix), which
+					// matches how solver-core populates token balances
+					// (`hex::encode(&token.address.0)`) for both EVM and Starknet tokens.
+					let token_address = hex::encode(&asset.address);
+					let is_native_token =
+						is_native_address(&solver_types::Address(asset.address.clone()));
 
 					let token_display = if is_native_token {
 						"native".to_string()
