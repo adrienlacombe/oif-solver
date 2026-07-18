@@ -367,7 +367,7 @@ mod tests {
 		utils::tests::builders::{
 			IntentBuilder, NetworkConfigBuilder, NetworksConfigBuilder, TokenConfigBuilder,
 		},
-		Address, Intent, NetworksConfig,
+		Address, Intent, NetworkConfig, NetworkKind, NetworksConfig, SolverIdentityAddresses,
 	};
 	use std::collections::HashMap;
 
@@ -475,6 +475,69 @@ mod tests {
 			token_manager,
 			solver_config::ConfigBuilder::default().build(),
 		)
+	}
+
+	fn starknet_network() -> NetworkConfig {
+		NetworkConfigBuilder::new()
+			.kind(NetworkKind::Starknet)
+			.rpc_endpoints(vec![RpcEndpoint::http_only(
+				"http://localhost:9545".to_string(),
+			)])
+			.input_settler_address(Address(vec![0x33; 20]))
+			.output_settler_address(Address(vec![0x44; 20]))
+			.build()
+	}
+
+	// Regression: the intent-handling path must resolve the Starknet felt
+	// identity for Starknet chains. Falling back to the EVM `solver_address`
+	// makes balanceOf hit the wrong account and read zero, which forced an
+	// erroneous "insufficient balance" Skip on every EVM->Starknet order until
+	// the identities were threaded into every ContextBuilder call site.
+	#[test]
+	fn solver_address_for_chain_uses_starknet_identity_for_starknet_chains() {
+		let evm = Address(vec![0xAB; 20]);
+		let sn_felt = Address(
+			hex::decode("065e2bf408a4422b1a586927e6652f99dfeb3c4e242d6b339d0b5851bd1d4eaf")
+				.unwrap(),
+		);
+		let networks = NetworksConfigBuilder::new()
+			.add_network(1, create_test_networks_config().get(&1).unwrap().clone())
+			.add_network(358974494, starknet_network())
+			.build();
+
+		let builder = create_context_builder().with_solver_identities(SolverIdentityAddresses {
+			evm: Some(evm.clone()),
+			starknet: Some(sn_felt.clone()),
+		});
+
+		assert_eq!(
+			builder.solver_address_for_chain(358974494, &networks),
+			sn_felt.to_string(),
+			"Starknet chain must resolve the Starknet felt identity"
+		);
+		assert_eq!(
+			builder.solver_address_for_chain(1, &networks),
+			evm.to_string(),
+			"EVM chain must resolve the EVM identity"
+		);
+	}
+
+	// Documents the exact fallback that produced the balance=0 bug: without a
+	// Starknet identity, a Starknet chain silently resolves the EVM address.
+	#[test]
+	fn solver_address_for_chain_falls_back_to_evm_without_starknet_identity() {
+		let networks = NetworksConfigBuilder::new()
+			.add_network(358974494, starknet_network())
+			.build();
+
+		// create_context_builder sets solver_address = Address([0xAB; 20]) and
+		// leaves solver_identities at default (both None).
+		let builder = create_context_builder();
+
+		assert_eq!(
+			builder.solver_address_for_chain(358974494, &networks),
+			Address(vec![0xAB; 20]).to_string()
+		);
 	}
 
 	#[test]

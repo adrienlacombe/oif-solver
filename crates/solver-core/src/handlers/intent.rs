@@ -58,6 +58,12 @@ pub struct IntentHandler {
 	event_bus: EventBus,
 	delivery: Arc<DeliveryService>,
 	solver_address: Address,
+	/// Per-network solver identities (EVM + Starknet). Selects the correct
+	/// account for balance lookups per chain kind: Starknet chains must query
+	/// the Starknet felt identity, not the EVM `solver_address`, or the balance
+	/// read hits the wrong account and returns zero. Defaults to empty; the
+	/// production path sets it via `with_solver_identities`.
+	solver_identities: solver_types::SolverIdentityAddresses,
 	token_manager: Arc<TokenManager>,
 	cost_profit_service: Arc<CostProfitService>,
 	/// Dynamic config for hot-reload support.
@@ -119,6 +125,7 @@ impl IntentHandler {
 			event_bus,
 			delivery,
 			solver_address,
+			solver_identities: solver_types::SolverIdentityAddresses::default(),
 			token_manager,
 			cost_profit_service,
 			dynamic_config,
@@ -128,6 +135,20 @@ impl IntentHandler {
 			denied_addresses,
 			compact_reservations,
 		}
+	}
+
+	/// Sets the per-network solver identities used for balance lookups.
+	///
+	/// Without this, Starknet-destination balance checks fall back to the EVM
+	/// `solver_address` and read a zero balance on the wrong account, forcing an
+	/// erroneous "insufficient balance" Skip. Mirrors the deferred-order path in
+	/// [`crate::engine`], which threads the same identities into its context.
+	pub fn with_solver_identities(
+		mut self,
+		identities: solver_types::SolverIdentityAddresses,
+	) -> Self {
+		self.solver_identities = identities;
+		self
 	}
 
 	/// Load denied addresses from a JSON file.
@@ -602,7 +623,8 @@ impl IntentHandler {
 					self.solver_address.clone(),
 					self.token_manager.clone(),
 					config.clone(),
-				);
+				)
+				.with_solver_identities(self.solver_identities.clone());
 				let context = builder
 					.build_execution_context(&intent)
 					.await

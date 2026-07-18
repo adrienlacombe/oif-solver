@@ -274,18 +274,21 @@ impl SolverEngine {
 			settlement.clone(),
 		));
 
-		let intent_handler = Arc::new(IntentHandler::new(
-			order.clone(),
-			storage.clone(),
-			state_machine.clone(),
-			event_bus.clone(),
-			delivery.clone(),
-			solver_address,
-			token_manager.clone(),
-			cost_profit_service.clone(),
-			dynamic_config.clone(), // Pass dynamic config for hot-reload support
-			&static_config,         // Pass static config for deny list loading
-		));
+		let intent_handler = Arc::new(
+			IntentHandler::new(
+				order.clone(),
+				storage.clone(),
+				state_machine.clone(),
+				event_bus.clone(),
+				delivery.clone(),
+				solver_address,
+				token_manager.clone(),
+				cost_profit_service.clone(),
+				dynamic_config.clone(), // Pass dynamic config for hot-reload support
+				&static_config,         // Pass static config for deny list loading
+			)
+			.with_solver_identities(solver_identities.clone()),
+		);
 
 		let order_handler = Arc::new(OrderHandler::new(
 			order.clone(),
