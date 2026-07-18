@@ -81,6 +81,11 @@ pub struct TokenManager {
 	delivery: Arc<DeliveryService>,
 	/// Service for managing the solver's account and signatures.
 	account: Arc<AccountService>,
+	/// Per-network solver identities. Balance reads on Starknet chains must use
+	/// the Starknet felt identity, not the EVM account address (which is the
+	/// wrong account on Starknet and reads zero). Empty by default; the
+	/// production path sets it via `with_solver_identities`.
+	solver_identities: solver_types::SolverIdentityAddresses,
 	/// Durable attempt recorder for token-management/admin transactions.
 	attempt_recorder: Option<Arc<dyn TransactionAttemptRecorder>>,
 }
@@ -106,6 +111,7 @@ impl TokenManager {
 			networks: Arc::new(RwLock::new(networks)),
 			delivery,
 			account,
+			solver_identities: solver_types::SolverIdentityAddresses::default(),
 			attempt_recorder: None,
 		}
 	}
@@ -116,6 +122,29 @@ impl TokenManager {
 	) -> Self {
 		self.attempt_recorder = Some(attempt_recorder);
 		self
+	}
+
+	/// Sets the per-network solver identities used for balance lookups.
+	pub fn with_solver_identities(
+		mut self,
+		identities: solver_types::SolverIdentityAddresses,
+	) -> Self {
+		self.solver_identities = identities;
+		self
+	}
+
+	/// Resolves the balance-lookup owner (hex, no `0x`) for a network kind.
+	///
+	/// Starknet chains use the Starknet felt identity when available; the EVM
+	/// account address is the wrong account there and reads zero. All other
+	/// kinds (and Starknet without a configured identity) use `evm_fallback`.
+	fn owner_for_kind(&self, kind: NetworkKind, evm_fallback: &str) -> String {
+		if kind == NetworkKind::Starknet {
+			if let Some(sn) = &self.solver_identities.starknet {
+				return hex::encode(&sn.0);
+			}
+		}
+		evm_fallback.to_string()
 	}
 
 	fn tracking_for_system_tx(
@@ -537,11 +566,12 @@ impl TokenManager {
 		&self,
 	) -> Result<HashMap<(u64, TokenConfig), String>, TokenManagerError> {
 		let solver_address = self.account.get_address().await?;
-		let solver_address_str = hex::encode(&solver_address.0);
+		let evm_address_str = hex::encode(&solver_address.0);
 		let mut balances = HashMap::new();
 
 		let networks = self.networks.read().await;
 		for (chain_id, network) in networks.iter() {
+			let owner = self.owner_for_kind(network.kind, &evm_address_str);
 			for token in &network.tokens {
 				let token_address = if is_native_address(&token.address) {
 					None
@@ -550,7 +580,7 @@ impl TokenManager {
 				};
 				let balance = self
 					.delivery
-					.get_balance(*chain_id, &solver_address_str, token_address.as_deref())
+					.get_balance(*chain_id, &owner, token_address.as_deref())
 					.await?;
 
 				balances.insert((*chain_id, token.clone()), balance);
@@ -848,6 +878,53 @@ mod tests {
 		);
 
 		Arc::new(DeliveryService::new(implementations, 1, 20, 60))
+	}
+
+	#[test]
+	fn owner_for_kind_uses_starknet_identity_for_starknet_chains() {
+		// Regression: the check_balances / initial-balance path must query the
+		// Starknet felt identity on Starknet chains. Using the EVM account
+		// address there reads the wrong account (zero), which surfaced as
+		// "Initial solver balance ... ETH=0" at startup despite a funded account.
+		let evm_fallback = "d4a1a11fb69c906d82ec7d99e91a28fc62447415";
+		let sn_felt = Address(
+			hex::decode("065e2bf408a4422b1a586927e6652f99dfeb3c4e242d6b339d0b5851bd1d4eaf")
+				.unwrap(),
+		);
+		let token_manager = TokenManager::new(
+			create_test_networks_config(),
+			create_mock_delivery_service(),
+			create_mock_account_service(),
+		)
+		.with_solver_identities(solver_types::SolverIdentityAddresses {
+			evm: Some(Address(hex::decode(evm_fallback).unwrap())),
+			starknet: Some(sn_felt.clone()),
+		});
+
+		assert_eq!(
+			token_manager.owner_for_kind(NetworkKind::Starknet, evm_fallback),
+			hex::encode(&sn_felt.0),
+			"Starknet chains must resolve the Starknet felt identity"
+		);
+		assert_eq!(
+			token_manager.owner_for_kind(NetworkKind::Evm, evm_fallback),
+			evm_fallback,
+			"EVM chains must use the EVM account address"
+		);
+	}
+
+	#[test]
+	fn owner_for_kind_falls_back_to_evm_without_starknet_identity() {
+		let evm_fallback = "d4a1a11fb69c906d82ec7d99e91a28fc62447415";
+		let token_manager = TokenManager::new(
+			create_test_networks_config(),
+			create_mock_delivery_service(),
+			create_mock_account_service(),
+		);
+		assert_eq!(
+			token_manager.owner_for_kind(NetworkKind::Starknet, evm_fallback),
+			evm_fallback
+		);
 	}
 
 	#[tokio::test]

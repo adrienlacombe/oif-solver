@@ -713,6 +713,7 @@ impl SolverBuilder {
 				delivery.clone(),
 				account.clone(),
 			)
+			.with_solver_identities(solver_identities.clone())
 			.with_attempt_recorder(transaction_attempt_recorder),
 		);
 
