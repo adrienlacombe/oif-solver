@@ -60,6 +60,13 @@ pub struct StarknetDeliveryConfig {
 	/// Optional maximum total Starknet invoke fee in FRI. Accepts decimal or `0x` hex strings.
 	#[serde(default)]
 	pub max_fee_fri: Option<String>,
+	/// Optional expected/typical Starknet invoke fee in FRI, used for quote/profit
+	/// COST estimation instead of the worst-case `max_fee_fri` cap. Accepts decimal
+	/// or `0x` hex strings. Should be ≤ `max_fee_fri`; when unset, cost falls back
+	/// to the cap (prior behavior). Set from observed actuals to avoid rejecting
+	/// otherwise-profitable orders.
+	#[serde(default)]
+	pub expected_fee_fri: Option<String>,
 }
 
 /// Resolved per-network Starknet delivery metadata.
@@ -1534,6 +1541,12 @@ impl ConfigSchema for StarknetDeliverySchema {
 					};
 					parse_positive_u256(value, "max_fee_fri").map(|_| ())
 				}),
+				Field::new("expected_fee_fri", FieldType::String).with_validator(|value| {
+					let Some(value) = value.as_str() else {
+						return Err("expected_fee_fri must be a string".to_string());
+					};
+					parse_positive_u256(value, "expected_fee_fri").map(|_| ())
+				}),
 			],
 		);
 
@@ -1658,7 +1671,34 @@ impl DeliveryInterface for StarknetDelivery {
 		})?;
 		let max_fee_fri =
 			parse_positive_u256(max_fee_fri, "max_fee_fri").map_err(DeliveryError::Network)?;
-		Ok(FeeParams::starknet_fixed(chain_id, max_fee_fri))
+
+		// Optional expected fee for quote/profit cost (falls back to the cap).
+		let expected_fee_fri = match self.config.expected_fee_fri.as_deref() {
+			Some(raw) => {
+				let expected =
+					parse_positive_u256(raw, "expected_fee_fri").map_err(DeliveryError::Network)?;
+				if expected > max_fee_fri {
+					// A cost estimate above the cap is nonsensical (you never pay
+					// more than the cap). Clamp to the cap rather than over-charge.
+					tracing::warn!(
+						chain_id,
+						%expected,
+						cap = %max_fee_fri,
+						"Starknet expected_fee_fri exceeds max_fee_fri cap; clamping cost estimate to the cap"
+					);
+					Some(max_fee_fri)
+				} else {
+					Some(expected)
+				}
+			},
+			None => None,
+		};
+
+		Ok(FeeParams::starknet_fixed(
+			chain_id,
+			max_fee_fri,
+			expected_fee_fri,
+		))
 	}
 
 	async fn estimate_extra_native_fee(
@@ -2053,17 +2093,18 @@ mod tests {
 		}
 	}
 
+	/// (attempt_id, status, tx_hash, error) recorded per update call.
+	type UpdateRecord = (
+		String,
+		TransactionAttemptStatus,
+		Option<TransactionHash>,
+		Option<String>,
+	);
+
 	#[derive(Default)]
 	struct RecordingAttemptRecorder {
 		planned: Mutex<Vec<TransactionAttempt>>,
-		updates: Mutex<
-			Vec<(
-				String,
-				TransactionAttemptStatus,
-				Option<TransactionHash>,
-				Option<String>,
-			)>,
-		>,
+		updates: Mutex<Vec<UpdateRecord>>,
 	}
 
 	#[async_trait::async_trait]

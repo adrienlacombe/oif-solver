@@ -326,7 +326,15 @@ pub struct FeeParams {
 	pub max_fee_per_gas: Option<u128>,
 	pub max_priority_fee_per_gas: Option<u128>,
 	pub cost_per_gas: u128,
+	/// Hard per-transaction fee CAP for fixed-fee chains (Starknet). Enforced at
+	/// submit time as the max the solver will pay; NOT the expected fee.
 	pub fixed_tx_fee: Option<U256>,
+	/// Expected/typical per-transaction fee for fixed-fee chains, used for
+	/// quote/profit cost estimation instead of the (worst-case) cap. When unset,
+	/// cost falls back to `fixed_tx_fee`. Decoupling the two stops the solver
+	/// over-stating Starknet leg cost (and rejecting profitable orders) while
+	/// keeping the cap as the submit-time safety bound.
+	pub estimated_tx_fee: Option<U256>,
 	pub native_asset_symbol: &'static str,
 	pub native_asset_decimals: u8,
 }
@@ -343,6 +351,7 @@ impl FeeParams {
 			max_priority_fee_per_gas: None,
 			cost_per_gas: gas_price,
 			fixed_tx_fee: None,
+			estimated_tx_fee: None,
 			native_asset_symbol: "ETH",
 			native_asset_decimals: 18,
 		}
@@ -379,12 +388,23 @@ impl FeeParams {
 			max_priority_fee_per_gas: Some(max_priority_fee_per_gas),
 			cost_per_gas,
 			fixed_tx_fee: None,
+			estimated_tx_fee: None,
 			native_asset_symbol: "ETH",
 			native_asset_decimals: 18,
 		}
 	}
 
-	pub fn starknet_fixed(chain_id: u64, max_fee_fri: U256) -> Self {
+	/// Fixed-fee params for Starknet.
+	///
+	/// `max_fee_fri` is the hard per-invoke fee CAP (submit-time safety bound).
+	/// `expected_fee_fri` is the typical fee used for quote/profit COST; when
+	/// `None`, cost falls back to the cap. It should be set to a realistic
+	/// observed fee (≤ cap) so profit estimation is not inflated by the cap.
+	pub fn starknet_fixed(
+		chain_id: u64,
+		max_fee_fri: U256,
+		expected_fee_fri: Option<U256>,
+	) -> Self {
 		Self {
 			chain_id,
 			model: FeeModel::StarknetFixed,
@@ -395,6 +415,7 @@ impl FeeParams {
 			max_priority_fee_per_gas: None,
 			cost_per_gas: 0,
 			fixed_tx_fee: Some(max_fee_fri),
+			estimated_tx_fee: expected_fee_fri,
 			native_asset_symbol: "STRK",
 			native_asset_decimals: 18,
 		}

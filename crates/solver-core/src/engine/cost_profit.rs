@@ -404,6 +404,14 @@ fn calculate_fee_leg_cost(gas_units: u64, fee_params: &FeeParams) -> U256 {
 	if gas_units == 0 {
 		return U256::ZERO;
 	}
+	// Fixed-fee chains (Starknet): price the leg at the EXPECTED fee when the
+	// operator has configured one, falling back to the fee CAP otherwise. The
+	// cap is the worst-case submit-time bound; charging it per leg for quote
+	// cost over-states Starknet cost and rejects otherwise-profitable orders.
+	// The cap still protects submission (delivery rejects an estimate over cap).
+	if let Some(estimated_tx_fee) = fee_params.estimated_tx_fee {
+		return estimated_tx_fee;
+	}
 	if let Some(fixed_tx_fee) = fee_params.fixed_tx_fee {
 		return fixed_tx_fee;
 	}
@@ -4124,6 +4132,7 @@ mod tests {
 					Ok(FeeParams::starknet_fixed(
 						chain_id,
 						U256::from(230_000_000_000_000_000_000u128),
+						None,
 					))
 				})
 			});
@@ -10121,7 +10130,7 @@ mod gas_leg_proptests {
 
 	#[test]
 	fn fixed_fee_params_charge_once_per_nonzero_leg() {
-		let origin_fee = FeeParams::starknet_fixed(700001, U256::from(1000));
+		let origin_fee = FeeParams::starknet_fixed(700001, U256::from(1000), None);
 		let dest_fee = FeeParams::legacy(1, 10);
 		let gas_units = GasUnits {
 			open_units: 1,
@@ -10136,6 +10145,35 @@ mod gas_leg_proptests {
 		assert_eq!(costs.open, U256::from(1000));
 		assert_eq!(costs.pre_claim, U256::from(1000));
 		assert_eq!(costs.claim, U256::ZERO);
+		assert_eq!(costs.fill, U256::from(20));
+		assert_eq!(costs.post_fill, U256::ZERO);
+	}
+
+	// Regression: with a configured expected fee, cost legs are priced at the
+	// expected fee (not the worst-case cap). The cap remains the submit-time
+	// safety bound; over-charging it here rejects otherwise-profitable orders.
+	#[test]
+	fn fixed_fee_params_use_expected_fee_over_cap_for_cost() {
+		let cap = U256::from(1000);
+		let expected = U256::from(150);
+		let origin_fee = FeeParams::starknet_fixed(700001, cap, Some(expected));
+		let dest_fee = FeeParams::legacy(1, 10);
+		let gas_units = GasUnits {
+			open_units: 1,
+			fill_units: 2,
+			post_fill_units: 0,
+			pre_claim_units: 3,
+			claim_units: 0,
+		};
+
+		let costs = calculate_gas_leg_costs_from_fee_params(&gas_units, &origin_fee, &dest_fee);
+
+		// Starknet (origin) legs priced at the expected fee, not the 1000 cap.
+		assert_eq!(costs.open, expected);
+		assert_eq!(costs.pre_claim, expected);
+		// Zero-unit legs cost nothing regardless.
+		assert_eq!(costs.claim, U256::ZERO);
+		// EVM (dest) legs unaffected: per-gas.
 		assert_eq!(costs.fill, U256::from(20));
 		assert_eq!(costs.post_fill, U256::ZERO);
 	}
