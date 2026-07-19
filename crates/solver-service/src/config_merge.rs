@@ -1718,6 +1718,18 @@ fn build_delivery_config_from_operator(
 				serde_json::Value::Object(starknet_rpc_chain_ids),
 			));
 		}
+		// Optional expected/typical Starknet invoke fee for quote-cost estimation
+		// (see FeeParams::estimated_tx_fee). Only set when the env var is present
+		// and non-empty; when absent, cost falls back to the max_fee_fri cap.
+		if let Ok(expected_fee_fri) = std::env::var("STARKNET_EXPECTED_FEE_FRI") {
+			let expected_fee_fri = expected_fee_fri.trim().to_string();
+			if !expected_fee_fri.is_empty() {
+				starknet_entries.push((
+					"expected_fee_fri",
+					serde_json::Value::String(expected_fee_fri),
+				));
+			}
+		}
 		if let Some(account_name) = delivery_account_for_kind(account_config, NetworkKind::Starknet)
 		{
 			starknet_entries.push((
