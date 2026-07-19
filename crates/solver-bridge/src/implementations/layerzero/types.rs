@@ -30,10 +30,58 @@ pub struct LayerZeroBridgeConfig {
 	/// **Deprecated path** — same migration plan as `composer_addresses`.
 	#[serde(default)]
 	pub vault_addresses: HashMap<u64, String>,
+
+	/// Per-Starknet-chain OFT route. A chain is treated as a Starknet leg
+	/// (Cairo OFT adapter, invoke path) iff it appears here. Holds the
+	/// felt-shaped addresses that the EVM-typed `BridgeRequest` (`alloy`
+	/// `Address`, 20 bytes) cannot represent, so the Starknet source/destination
+	/// leg sources its contracts from config rather than the request.
+	#[serde(default)]
+	pub starknet_oft_routes: HashMap<u64, StarknetOftRoute>,
 }
 
 fn default_lz_receive_gas() -> u128 {
 	200_000
+}
+
+fn default_approval_required() -> bool {
+	true
+}
+
+/// LayerZero OFT route data for a Starknet chain side.
+///
+/// All addresses are Starknet felts as `0x`-prefixed hex strings; the EVM-typed
+/// `BridgeRequest` cannot carry a 32-byte felt. Deserialized from
+/// `LayerZeroBridgeConfig.starknet_oft_routes[chain_id]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StarknetOftRoute {
+	/// The OFT adapter contract — target of `quote_send`/`send` and of both
+	/// `approve`s (the sent token and the STRK messaging-fee token).
+	pub adapter: String,
+	/// The ERC-20 token being bridged on this chain (e.g. WBTC on Starknet).
+	/// Approved to the adapter for `amount_ld` before `send` when
+	/// `approval_required`.
+	pub token: String,
+	/// The solver's Starknet account address. Used as the invoke `sender`, as
+	/// the `send` `refund_address`, and as the OFT `to` recipient when this
+	/// chain is the destination of an inbound (EVM→Starknet) transfer.
+	pub solver_account: String,
+	/// The native fee token (STRK) approved to the adapter for the LayerZero
+	/// messaging fee (`MessagingFee.native_fee`). On Starknet there is no
+	/// `msg.value`; the adapter pulls the fee via `transfer_from`.
+	pub native_fee_token: String,
+	/// Whether the sent token needs `approve()` before `send()`. `true` for the
+	/// lock/unlock `OFTAdapter`; a mint/burn adapter that owns the token may
+	/// set this `false`.
+	#[serde(default = "default_approval_required")]
+	pub approval_required: bool,
+	/// Code-level real-funds gate for the Starknet **source** leg. When `false`
+	/// (the default), `quote_send` reads still work (safe, no funds), but the
+	/// actual `send` (`bridge_via_starknet_oft`) refuses to broadcast. Flip to
+	/// `true` only after the adapter/fee flow has been verified on-chain for
+	/// this deployment.
+	#[serde(default)]
+	pub send_enabled: bool,
 }
 
 // ----------------------------------------------------------------------------

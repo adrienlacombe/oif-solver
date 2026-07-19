@@ -18,9 +18,13 @@ use alloy_sol_types::SolCall;
 use async_trait::async_trait;
 use contracts::{address_to_bytes32, encode_lz_receive_option};
 use solver_delivery::DeliveryService;
-use solver_types::TransactionType;
+use solver_types::utils::starknet::starknet_selector;
+use solver_types::{
+	ExecutionTransaction, StarknetCall, StarknetInvokeTransaction, StarknetResourceBoundsMapping,
+	TransactionType,
+};
 use std::sync::Arc;
-use types::LayerZeroBridgeConfig;
+use types::{LayerZeroBridgeConfig, StarknetOftRoute};
 
 /// LayerZero bridge implementation.
 pub struct LayerZeroBridge {
@@ -139,6 +143,37 @@ impl LayerZeroBridge {
 		self.config.composer_addresses.contains_key(&source_chain)
 	}
 
+	/// True when `chain_id` is configured as a Starknet OFT leg (Cairo adapter,
+	/// invoke path) rather than an EVM chain.
+	fn is_starknet_chain(&self, chain_id: u64) -> bool {
+		self.config.starknet_oft_routes.contains_key(&chain_id)
+	}
+
+	/// Resolve the Starknet OFT route for `chain_id`.
+	fn starknet_route(&self, chain_id: u64) -> Result<&StarknetOftRoute, BridgeError> {
+		self.config
+			.starknet_oft_routes
+			.get(&chain_id)
+			.ok_or_else(|| {
+				BridgeError::Config(format!(
+					"No Starknet OFT route configured for chain {chain_id}"
+				))
+			})
+	}
+
+	/// The OFT `to` recipient (a 32-byte value) for a transfer whose destination
+	/// is `chain_id`. For a Starknet destination this is the solver's Starknet
+	/// account felt from config; for an EVM destination it is the solver's EVM
+	/// address left-padded to 32 bytes (unchanged legacy behavior).
+	fn recipient_bytes32(&self, chain_id: u64) -> Result<U256, BridgeError> {
+		match self.config.starknet_oft_routes.get(&chain_id) {
+			Some(route) => parse_felt_u256(&route.solver_account),
+			None => Ok(U256::from_be_slice(&address_to_bytes32(
+				self.solver_address,
+			))),
+		}
+	}
+
 	async fn resolve_composer_gas_limit(
 		&self,
 		chain_id: u64,
@@ -231,7 +266,9 @@ impl LayerZeroBridge {
 		// `approval_required=false` flag only applies to direct OFT sends.
 		let approval_required = true;
 		let dest_eid = self.get_eid(request.dest_chain)?;
-		let to_bytes32 = address_to_bytes32(self.solver_address);
+		let to_bytes32 = self
+			.recipient_bytes32(request.dest_chain)?
+			.to_be_bytes::<32>();
 		let extra_options = self.build_extra_options();
 		let min_amount = request
 			.min_amount
@@ -388,7 +425,9 @@ impl LayerZeroBridge {
 			.map(|s| s.approval_required)
 			.unwrap_or(true);
 		let dest_eid = self.get_eid(request.dest_chain)?;
-		let to_bytes32 = address_to_bytes32(self.solver_address);
+		let to_bytes32 = self
+			.recipient_bytes32(request.dest_chain)?
+			.to_be_bytes::<32>();
 		let extra_options = self.build_extra_options();
 		let min_amount = request
 			.min_amount
@@ -675,6 +714,159 @@ impl LayerZeroBridge {
 		U256::from_str_radix(s, 10)
 			.map_err(|e| BridgeError::Config(format!("invalid {name} '{s}': {e}")))
 	}
+
+	// ------------------------------------------------------------------------
+	// Starknet-source OFT leg.
+	//
+	// Addresses for this leg come from `starknet_oft_routes[source_chain]`, not
+	// the EVM-typed `BridgeRequest` (whose `alloy` `Address` fields cannot hold
+	// a 32-byte Starknet felt). The quote path is a pure view (safe on mainnet);
+	// the send path is gated behind `route.send_enabled`.
+	// ------------------------------------------------------------------------
+
+	/// Fee estimate for a Starknet **source** OFT transfer: reads `quote_send`
+	/// on the adapter and returns `MessagingFee.native_fee` (STRK, in FRI). Pure
+	/// view — no funds move — safe to run on mainnet to verify the route before
+	/// enabling `send`.
+	async fn estimate_fee_starknet(&self, request: &BridgeRequest) -> Result<U256, BridgeError> {
+		let route = self.starknet_route(request.source_chain)?;
+		let dst_eid = self.get_eid(request.dest_chain)?;
+		let to = self.recipient_bytes32(request.dest_chain)?;
+		let min_amount = request
+			.min_amount
+			.unwrap_or(request.amount * U256::from(95) / U256::from(100));
+
+		let param = starknet_oft::SendParam {
+			dst_eid,
+			to,
+			amount_ld: request.amount,
+			min_amount_ld: min_amount,
+			extra_options: Vec::new(),
+		};
+
+		let call = StarknetCall {
+			contract_address: parse_felt_address(&route.adapter)?,
+			entry_point_selector: starknet_selector("quote_send"),
+			calldata: starknet_oft::quote_send_calldata(&param, false),
+		};
+
+		let felts = self
+			.delivery
+			.starknet_call(request.source_chain, &call)
+			.await
+			.map_err(|e| BridgeError::FeeEstimation(format!("Starknet quote_send failed: {e}")))?;
+
+		// MessagingFee { native_fee: u256, lz_token_fee: u256 } serializes as
+		// [native_fee.low, native_fee.high, lz_token_fee.low, lz_token_fee.high].
+		if felts.len() < 2 {
+			return Err(BridgeError::FeeEstimation(format!(
+				"Starknet quote_send returned {} felts; expected >= 2 for MessagingFee.native_fee",
+				felts.len()
+			)));
+		}
+		Ok(felts[0] | (felts[1] << 128))
+	}
+
+	/// Starknet **source** OFT `send`: approve the sent token + the STRK
+	/// messaging fee to the adapter, then `send`, as one invoke multicall.
+	///
+	/// Gated by `route.send_enabled` (default `false`) — a real-funds guard.
+	/// There is no `msg.value` on Starknet: the LayerZero messaging fee
+	/// (`native_fee`, STRK) is paid by approving it to the adapter, which pulls
+	/// it during `send`. The invoke's own L2 gas is paid separately by the
+	/// delivery layer's Starknet signer (also STRK).
+	async fn bridge_via_starknet_oft(
+		&self,
+		request: &BridgeRequest,
+		metadata: &TransferMetadata,
+	) -> Result<BridgeDepositResult, BridgeError> {
+		let route = self.starknet_route(request.source_chain)?.clone();
+		if !route.send_enabled {
+			return Err(BridgeError::Config(format!(
+				"Starknet OFT send is disabled for chain {} (set \
+				 starknet_oft_routes.send_enabled=true after verifying the adapter/fee flow \
+				 on-chain)",
+				request.source_chain
+			)));
+		}
+
+		let dst_eid = self.get_eid(request.dest_chain)?;
+		let to = self.recipient_bytes32(request.dest_chain)?;
+		let min_amount = request
+			.min_amount
+			.unwrap_or(request.amount * U256::from(95) / U256::from(100));
+		let param = starknet_oft::SendParam {
+			dst_eid,
+			to,
+			amount_ld: request.amount,
+			min_amount_ld: min_amount,
+			extra_options: Vec::new(),
+		};
+
+		// native_fee (STRK) from the same quote_send read path.
+		let native_fee = self.estimate_fee_starknet(request).await?;
+
+		let adapter_felt = parse_felt_u256(&route.adapter)?;
+		let refund = parse_felt_u256(&route.solver_account)?;
+
+		let mut calls = Vec::new();
+		if route.approval_required {
+			calls.push(StarknetCall {
+				contract_address: parse_felt_address(&route.token)?,
+				entry_point_selector: starknet_selector("approve"),
+				calldata: starknet_oft::approve_calldata(adapter_felt, request.amount),
+			});
+		}
+		// Approve the STRK messaging fee to the adapter (pulled during send()).
+		calls.push(StarknetCall {
+			contract_address: parse_felt_address(&route.native_fee_token)?,
+			entry_point_selector: starknet_selector("approve"),
+			calldata: starknet_oft::approve_calldata(adapter_felt, native_fee),
+		});
+		calls.push(StarknetCall {
+			contract_address: parse_felt_address(&route.adapter)?,
+			entry_point_selector: starknet_selector("send"),
+			calldata: starknet_oft::send_calldata(&param, native_fee, U256::ZERO, refund),
+		});
+
+		let invoke = StarknetInvokeTransaction {
+			network_id: request.source_chain,
+			sender_address: parse_felt_address(&route.solver_account)?,
+			calls,
+			account_calldata: Vec::new(),
+			nonce: None,
+			resource_bounds: Some(StarknetResourceBoundsMapping::zero()),
+			signature: Vec::new(),
+			tip: U256::ZERO,
+			version: 3,
+			paymaster_data: Vec::new(),
+			account_deployment_data: Vec::new(),
+			nonce_data_availability_mode: None,
+			fee_data_availability_mode: None,
+			starknet_chain_id: None,
+		};
+
+		let tx_hash = self
+			.delivery
+			.deliver_system_execution(
+				ExecutionTransaction::from(invoke),
+				scoped_system_tx(
+					metadata.tx_scope_id.as_deref(),
+					"starknet-oft-send",
+					request.source_chain,
+					metadata.transfer_id.as_deref(),
+				),
+				TransactionType::Bridge,
+			)
+			.await
+			.map_err(|e| map_delivery_error("Starknet OFT send", e))?;
+
+		Ok(BridgeDepositResult {
+			tx_hash: format!("0x{}", hex::encode(&tx_hash.0)),
+			message_guid: None,
+			estimated_arrival: None,
+		})
+	}
 }
 
 #[async_trait]
@@ -697,6 +889,12 @@ impl BridgeInterface for LayerZeroBridge {
 		request: &BridgeRequest,
 		metadata: &TransferMetadata,
 	) -> Result<BridgeDepositResult, BridgeError> {
+		// Starknet-source legs use the Cairo OFT adapter + invoke path; their
+		// addresses come from `starknet_oft_routes`, not the EVM-typed request.
+		if self.is_starknet_chain(request.source_chain) {
+			return self.bridge_via_starknet_oft(request, metadata).await;
+		}
+
 		// The wrap step (when the source side is native) is owned by
 		// `BridgeService::rebalance_token` and is run BEFORE this call, with
 		// `wrap_submit_attempted` / `wrap_tx_hash` persisted for crash safety.
@@ -860,13 +1058,20 @@ impl BridgeInterface for LayerZeroBridge {
 		request: &BridgeRequest,
 		metadata: &TransferMetadata,
 	) -> Result<U256, BridgeError> {
+		// Starknet-source legs quote via the Cairo adapter's `quote_send`.
+		if self.is_starknet_chain(request.source_chain) {
+			return self.estimate_fee_starknet(request).await;
+		}
+
 		// When a per-pair route is provided, use its composer directly instead
 		// of the chain-keyed `get_composer(source_chain)` lookup — chain-keyed
 		// would silently pick the wrong composer for a pair like ETH/vbETH
 		// that lives on the same chain as USDC/vbUSDC.
 		let route = Self::deserialize_route(&metadata.bridge_route)?;
 		let dest_eid = self.get_eid(request.dest_chain)?;
-		let to_bytes32 = address_to_bytes32(self.solver_address);
+		let to_bytes32 = self
+			.recipient_bytes32(request.dest_chain)?
+			.to_be_bytes::<32>();
 		let extra_options = self.build_extra_options();
 		let min_amount = request
 			.min_amount
@@ -1502,6 +1707,28 @@ fn parse_address(s: &str) -> Result<Address, BridgeError> {
 	Ok(Address::from(arr))
 }
 
+/// Parse a Starknet felt (`0x`-hex string) into a `U256`.
+fn parse_felt_u256(s: &str) -> Result<U256, BridgeError> {
+	let hex_str = s.strip_prefix("0x").unwrap_or(s);
+	U256::from_str_radix(hex_str, 16)
+		.map_err(|e| BridgeError::Config(format!("invalid Starknet felt '{s}': {e}")))
+}
+
+/// Parse a Starknet felt (`0x`-hex string) into a `solver_types::Address` (the
+/// felt's big-endian bytes). Odd-length hex is left-padded with a nibble so it
+/// decodes cleanly; the delivery layer re-normalizes to a canonical felt.
+fn parse_felt_address(s: &str) -> Result<solver_types::Address, BridgeError> {
+	let hex_str = s.strip_prefix("0x").unwrap_or(s);
+	let padded = if hex_str.len() % 2 == 1 {
+		format!("0{hex_str}")
+	} else {
+		hex_str.to_string()
+	};
+	let bytes = hex::decode(&padded)
+		.map_err(|e| BridgeError::Config(format!("invalid Starknet felt '{s}': {e}")))?;
+	Ok(solver_types::Address(bytes))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1608,6 +1835,206 @@ mod tests {
 				wrapper: None,
 			},
 		}
+	}
+
+	// ---- Starknet-source OFT leg -------------------------------------------
+
+	const SN_CHAIN: u64 = 358974494;
+	const SN_ADAPTER_FELT: u64 = 0x069a_c468;
+
+	fn starknet_bridge_config(send_enabled: bool) -> serde_json::Value {
+		json!({
+			"endpoint_ids": { "1": 30101, "358974494": 30500 },
+			"lz_receive_gas": 200000u128,
+			"composer_addresses": {},
+			"vault_addresses": {},
+			"starknet_oft_routes": {
+				"358974494": {
+					"adapter": "0x069ac468",
+					"token": "0x03fe2b90",
+					"solver_account": "0x0cd929e61",
+					"native_fee_token": "0x04718f5a",
+					"approval_required": true,
+					"send_enabled": send_enabled
+				}
+			}
+		})
+	}
+
+	fn bridge_with_starknet_delivery(
+		mock: MockDeliveryInterface,
+		send_enabled: bool,
+	) -> LayerZeroBridge {
+		let shared = Arc::new(mock);
+		LayerZeroBridge {
+			delivery: Arc::new(DeliveryService::new(
+				HashMap::from([
+					(
+						1_u64,
+						shared.clone() as Arc<dyn solver_delivery::DeliveryInterface>,
+					),
+					(
+						SN_CHAIN,
+						shared.clone() as Arc<dyn solver_delivery::DeliveryInterface>,
+					),
+				]),
+				3,
+				300,
+				60,
+			)),
+			config: serde_json::from_value(starknet_bridge_config(send_enabled)).unwrap(),
+			solver_address: solver_address(),
+		}
+	}
+
+	fn starknet_bridge_request() -> BridgeRequest {
+		BridgeRequest {
+			pair_id: "wbtc-eth-starknet".to_string(),
+			source_chain: SN_CHAIN,
+			dest_chain: 1,
+			source_token: Address::ZERO,
+			source_oft: Address::ZERO,
+			dest_token: Address::ZERO,
+			dest_oft: Address::ZERO,
+			amount: U256::from(100_000u64),
+			min_amount: None,
+			recipient: Address::ZERO,
+		}
+	}
+
+	#[tokio::test]
+	async fn estimate_fee_starknet_decodes_native_fee_from_messaging_fee_felts() {
+		let mut mock = MockDeliveryInterface::new();
+		// quote_send returns MessagingFee as [nf.low, nf.high, lz.low, lz.high].
+		mock.expect_starknet_call().returning(|_, _| {
+			Box::pin(
+				async move { Ok(vec![U256::from(777u64), U256::ZERO, U256::ZERO, U256::ZERO]) },
+			)
+		});
+		let bridge = bridge_with_starknet_delivery(mock, false);
+
+		let fee = bridge
+			.estimate_fee(&starknet_bridge_request(), &TransferMetadata::default())
+			.await
+			.unwrap();
+
+		assert_eq!(fee, U256::from(777u64));
+	}
+
+	#[tokio::test]
+	async fn estimate_fee_starknet_combines_high_and_low_limbs() {
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_starknet_call().returning(|_, _| {
+			Box::pin(async move { Ok(vec![U256::from(5u64), U256::from(1u64)]) })
+		});
+		let bridge = bridge_with_starknet_delivery(mock, false);
+
+		let fee = bridge
+			.estimate_fee(&starknet_bridge_request(), &TransferMetadata::default())
+			.await
+			.unwrap();
+
+		assert_eq!(fee, (U256::from(1u64) << 128) + U256::from(5u64));
+	}
+
+	#[tokio::test]
+	async fn bridge_via_starknet_oft_refuses_when_send_disabled() {
+		// send_enabled=false: the gate must fire before any delivery call, so no
+		// expectations are set on the mock (an unexpected call would panic).
+		let bridge = bridge_with_starknet_delivery(MockDeliveryInterface::new(), false);
+
+		let err = bridge
+			.bridge_asset(&starknet_bridge_request(), &TransferMetadata::default())
+			.await
+			.unwrap_err();
+
+		assert!(
+			matches!(err, BridgeError::Config(ref m) if m.contains("disabled")),
+			"expected disabled-gate Config error, got {err:?}"
+		);
+	}
+
+	#[test]
+	fn recipient_bytes32_resolves_by_dest_chain_kind() {
+		let bridge = bridge_with_starknet_delivery(MockDeliveryInterface::new(), false);
+
+		// Starknet destination -> configured solver_account felt.
+		assert_eq!(
+			bridge.recipient_bytes32(SN_CHAIN).unwrap(),
+			U256::from(0x0cd9_29e6_1u64)
+		);
+		// EVM destination -> solver EVM address left-padded to 32 bytes.
+		assert_eq!(
+			bridge.recipient_bytes32(1).unwrap(),
+			U256::from_be_slice(&address_to_bytes32(solver_address()))
+		);
+	}
+
+	#[tokio::test]
+	async fn bridge_via_starknet_oft_builds_approve_and_send_multicall() {
+		let captured = Arc::new(Mutex::new(None::<StarknetInvokeTransaction>));
+		let mut mock = MockDeliveryInterface::new();
+		// native_fee = 500 (low limb only).
+		mock.expect_starknet_call().returning(|_, _| {
+			Box::pin(
+				async move { Ok(vec![U256::from(500u64), U256::ZERO, U256::ZERO, U256::ZERO]) },
+			)
+		});
+		{
+			let captured = captured.clone();
+			mock.expect_submit_execution()
+				.times(1)
+				.returning(move |tx, _| {
+					let captured = captured.clone();
+					Box::pin(async move {
+						if let ExecutionTransaction::StarknetInvoke(inv) = tx {
+							*captured.lock().unwrap() = Some(*inv);
+						}
+						Ok(TransactionHash(vec![0xAB; 32]))
+					})
+				});
+		}
+		let bridge = bridge_with_starknet_delivery(mock, true);
+
+		let result = bridge
+			.bridge_asset(&starknet_bridge_request(), &TransferMetadata::default())
+			.await
+			.unwrap();
+		assert!(result.tx_hash.starts_with("0x"));
+
+		let invoke = captured.lock().unwrap().take().expect("invoke captured");
+		assert_eq!(invoke.network_id, SN_CHAIN);
+		// approve(token) + approve(STRK fee) + send.
+		assert_eq!(invoke.calls.len(), 3);
+
+		// Call 0: approve the sent token to the adapter for `amount`.
+		assert_eq!(
+			invoke.calls[0].entry_point_selector,
+			starknet_selector("approve")
+		);
+		assert_eq!(
+			invoke.calls[0].calldata,
+			vec![
+				U256::from(SN_ADAPTER_FELT),
+				U256::from(100_000u64),
+				U256::ZERO
+			]
+		);
+		// Call 1: approve the STRK messaging fee to the adapter.
+		assert_eq!(
+			invoke.calls[1].entry_point_selector,
+			starknet_selector("approve")
+		);
+		assert_eq!(
+			invoke.calls[1].calldata,
+			vec![U256::from(SN_ADAPTER_FELT), U256::from(500u64), U256::ZERO]
+		);
+		// Call 2: send on the adapter — SendParam(16) + fee(4) + refund(1) = 21.
+		assert_eq!(
+			invoke.calls[2].entry_point_selector,
+			starknet_selector("send")
+		);
+		assert_eq!(invoke.calls[2].calldata.len(), 21);
 	}
 
 	#[tokio::test]

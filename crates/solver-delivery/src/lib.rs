@@ -10,8 +10,9 @@ use async_trait::async_trait;
 use solver_types::events::TransactionType;
 use solver_types::{
 	Address, ChainData, ConfigSchema, ExecutionTransaction, Hyperlane7683OrderStatus,
-	ImplementationRegistry, Log, LogFilter, NetworksConfig, Transaction, TransactionAttempt,
-	TransactionAttemptScope, TransactionAttemptStatus, TransactionHash, TransactionReceipt,
+	ImplementationRegistry, Log, LogFilter, NetworksConfig, StarknetCall, Transaction,
+	TransactionAttempt, TransactionAttemptScope, TransactionAttemptStatus, TransactionHash,
+	TransactionReceipt,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -938,6 +939,22 @@ pub trait DeliveryInterface: Send + Sync {
 		Err(DeliveryError::NoImplementationAvailable)
 	}
 
+	/// Executes a Starknet `starknet_call` (contract view) and returns the raw
+	/// felt results as `U256` values, in the order the contract returned them.
+	///
+	/// This is the Starknet analogue of `eth_call`: no transaction is sent. The
+	/// caller is responsible for interpreting the returned felts (e.g. decoding
+	/// a Cairo `u256` from a `[low, high]` pair). Backends that are not Starknet
+	/// fail closed via the default so callers never confuse an unsupported chain
+	/// with an empty result set.
+	async fn starknet_call(
+		&self,
+		_chain_id: u64,
+		_call: &StarknetCall,
+	) -> Result<Vec<U256>, DeliveryError> {
+		Err(DeliveryError::NoImplementationAvailable)
+	}
+
 	/// Executes a contract call at a specific block number.
 	///
 	/// Backends must override this when they support historical reads. The
@@ -1070,23 +1087,17 @@ impl DeliveryService {
 		self
 	}
 
-	/// Delivers a solver-owned non-order transaction with durable attempt tracking.
-	pub async fn deliver_system(
+	/// Builds the durable system-transaction tracking used by `deliver_system`
+	/// and `deliver_system_execution`. Both EVM and Starknet system deliveries
+	/// share the same attempt recorder and monitoring callback so their
+	/// confirmations/failures are logged and ledgered identically.
+	fn build_system_tracking(
 		&self,
-		tx: Transaction,
-		scope_id: impl Into<String>,
+		scope_id: String,
 		tx_type: TransactionType,
-	) -> Result<TransactionHash, DeliveryError> {
-		debug_assert!(matches!(
-			tx_type,
-			TransactionType::Approval
-				| TransactionType::Withdrawal
-				| TransactionType::Bridge
-				| TransactionType::Pusher
-		));
-		let scope_id = scope_id.into();
+	) -> TransactionTracking {
 		let callback_scope = scope_id.clone();
-		let tracking = TransactionTracking {
+		TransactionTracking {
 			id: scope_id,
 			tx_type,
 			attempt_recorder: self.attempt_recorder.clone(),
@@ -1156,9 +1167,48 @@ impl DeliveryService {
 			}),
 			attempt_id: None,
 			replacement_of: None,
-		};
+		}
+	}
 
+	/// Delivers a solver-owned non-order transaction with durable attempt tracking.
+	pub async fn deliver_system(
+		&self,
+		tx: Transaction,
+		scope_id: impl Into<String>,
+		tx_type: TransactionType,
+	) -> Result<TransactionHash, DeliveryError> {
+		debug_assert!(matches!(
+			tx_type,
+			TransactionType::Approval
+				| TransactionType::Withdrawal
+				| TransactionType::Bridge
+				| TransactionType::Pusher
+		));
+		let tracking = self.build_system_tracking(scope_id.into(), tx_type);
 		self.deliver(tx, Some(tracking)).await
+	}
+
+	/// Delivers a solver-owned non-order execution transaction (e.g. a Starknet
+	/// invoke) with the same durable attempt tracking as `deliver_system`.
+	///
+	/// This is the non-EVM sibling of `deliver_system`: it routes through
+	/// `deliver_execution` so Starknet invoke payloads carry system-transaction
+	/// tracking without being forced through EVM-only `Transaction` fields.
+	pub async fn deliver_system_execution(
+		&self,
+		tx: ExecutionTransaction,
+		scope_id: impl Into<String>,
+		tx_type: TransactionType,
+	) -> Result<TransactionHash, DeliveryError> {
+		debug_assert!(matches!(
+			tx_type,
+			TransactionType::Approval
+				| TransactionType::Withdrawal
+				| TransactionType::Bridge
+				| TransactionType::Pusher
+		));
+		let tracking = self.build_system_tracking(scope_id.into(), tx_type);
+		self.deliver_execution(tx, Some(tracking)).await
 	}
 
 	/// Delivers a transaction to the appropriate blockchain network.
@@ -1481,6 +1531,23 @@ impl DeliveryService {
 			.ok_or(DeliveryError::NoImplementationAvailable)?;
 
 		implementation.eth_call(tx).await
+	}
+
+	/// Executes a Starknet contract view (`starknet_call`) on `chain_id` and
+	/// returns the raw felt results as `U256` values. Routes to the chain's
+	/// backend; non-Starknet backends fail closed with
+	/// `NoImplementationAvailable`.
+	pub async fn starknet_call(
+		&self,
+		chain_id: u64,
+		call: &StarknetCall,
+	) -> Result<Vec<U256>, DeliveryError> {
+		let implementation = self
+			.implementations
+			.get(&chain_id)
+			.ok_or(DeliveryError::NoImplementationAvailable)?;
+
+		implementation.starknet_call(chain_id, call).await
 	}
 
 	/// Executes a contract call at a specific block number.

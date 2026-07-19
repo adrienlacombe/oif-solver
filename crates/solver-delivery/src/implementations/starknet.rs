@@ -1663,6 +1663,36 @@ impl DeliveryInterface for StarknetDelivery {
 		Ok(Hyperlane7683OrderStatus::from_starknet_status(&status))
 	}
 
+	async fn starknet_call(
+		&self,
+		chain_id: u64,
+		call: &StarknetCall,
+	) -> Result<Vec<U256>, DeliveryError> {
+		let contract = address_to_starknet_hex(
+			&format!("0x{}", hex::encode(&call.contract_address.0)),
+			"starknet_call contract address",
+		)?;
+		let selector = starknet_felt_hex(&call.entry_point_selector);
+		let calldata: Vec<String> = call
+			.calldata
+			.iter()
+			.map(|value| u256_to_starknet_felt_hex(*value))
+			.collect();
+
+		let result: Vec<String> = self
+			.client(chain_id)?
+			.json_rpc(
+				"starknet_call",
+				starknet_call_params(contract, &selector, calldata),
+			)
+			.await?;
+
+		result
+			.iter()
+			.map(|felt| felt_to_u256(felt, "starknet_call result"))
+			.collect()
+	}
+
 	async fn get_fee_params(&self, chain_id: u64) -> Result<FeeParams, DeliveryError> {
 		let max_fee_fri = self.config.max_fee_fri.as_deref().ok_or_else(|| {
 			DeliveryError::Network(
@@ -3114,6 +3144,38 @@ mod tests {
 		assert_eq!(balance, "42");
 		let expected_allowance = (U256::from(1u8) << 128usize) + U256::from(5u8);
 		assert_eq!(allowance, expected_allowance.to_string());
+	}
+
+	#[tokio::test]
+	async fn starknet_call_returns_decoded_felts() {
+		let server = MockServer::start().await;
+		// A `quote_send` return: MessagingFee { native_fee: u256, lz_token_fee: u256 }
+		// serialized as four felts [nf_low, nf_high, lz_low, lz_high].
+		Mock::given(method("POST"))
+			.and(body_string_contains("\"method\":\"starknet_call\""))
+			.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+				"jsonrpc": "2.0",
+				"id": 1,
+				"result": ["0x64", "0x0", "0x0", "0x0"]
+			})))
+			.mount(&server)
+			.await;
+		let delivery =
+			StarknetDelivery::new(parsed_config(), &test_networks_with_url(server.uri())).unwrap();
+
+		let mut contract_bytes = vec![0u8; 31];
+		contract_bytes.push(0x42);
+		let call = StarknetCall {
+			contract_address: Address(contract_bytes),
+			entry_point_selector: solver_types::utils::starknet::starknet_selector("quote_send"),
+			calldata: vec![U256::from(30101u64), U256::ZERO],
+		};
+		let out = delivery.starknet_call(11155111, &call).await.unwrap();
+
+		assert_eq!(
+			out,
+			vec![U256::from(100u64), U256::ZERO, U256::ZERO, U256::ZERO]
+		);
 	}
 
 	#[test]
