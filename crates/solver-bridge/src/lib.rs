@@ -13,6 +13,7 @@
 pub mod implementations;
 pub mod monitor;
 pub mod storage;
+pub mod swap;
 #[cfg(test)]
 mod test_support;
 pub mod threshold;

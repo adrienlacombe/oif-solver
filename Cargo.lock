@@ -5388,6 +5388,7 @@ dependencies = [
  "async-trait",
  "hex",
  "mockall",
+ "reqwest 0.12.23",
  "serde",
  "serde_json",
  "solver-config",
