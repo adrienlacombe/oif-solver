@@ -113,6 +113,12 @@ pub struct PricingConfig {
 	pub rate_buffer_bps: u32,
 	/// Whether to use live gas estimation.
 	pub enable_live_gas_estimate: bool,
+	/// Optional cross-source price-deviation guard, in basis points. When set and
+	/// at least one fallback provider is configured, `convert_asset` cross-checks
+	/// the primary conversion against the first fallback and fails closed if they
+	/// disagree by more than this many bps — a stale/bad feed price could
+	/// otherwise green-light a loss-making fill. `None` disables the guard.
+	pub max_deviation_bps: Option<u32>,
 }
 
 impl PricingConfig {
@@ -122,6 +128,7 @@ impl PricingConfig {
 			commission_bps: 20,
 			rate_buffer_bps: 14,
 			enable_live_gas_estimate: false,
+			max_deviation_bps: None,
 		}
 	}
 
@@ -146,8 +153,34 @@ impl PricingConfig {
 				.get("enable_live_gas_estimate")
 				.and_then(|v| v.as_bool())
 				.unwrap_or(defaults.enable_live_gas_estimate),
+			max_deviation_bps: table
+				.get("max_deviation_bps")
+				.and_then(|v| v.as_u64())
+				.and_then(|v| u32::try_from(v).ok())
+				.filter(|bps| *bps > 0)
+				.or(defaults.max_deviation_bps),
 		}
 	}
+}
+
+/// Cross-source price-deviation in basis points between two decimal-string
+/// conversions of the same input. Returns `None` when either value can't be
+/// parsed as a decimal (caller then can't cross-check and degrades to primary).
+/// Two zero values agree (0 bps). Rounds up so a borderline deviation is treated
+/// conservatively (as exceeding the threshold rather than under).
+fn price_deviation_bps(primary: &str, fallback: &str) -> Option<u64> {
+	use rust_decimal::prelude::ToPrimitive;
+	use rust_decimal::Decimal;
+
+	let primary: Decimal = primary.trim().parse().ok()?;
+	let fallback: Decimal = fallback.trim().parse().ok()?;
+	let diff = (primary - fallback).abs();
+	let denom = primary.abs().max(fallback.abs());
+	if denom.is_zero() {
+		return Some(0);
+	}
+	let bps = (diff / denom) * Decimal::from(10_000u32);
+	Some(bps.ceil().to_u64().unwrap_or(u64::MAX))
 }
 
 /// Macro to reduce duplication of fallback logic across pricing methods.
@@ -257,11 +290,88 @@ impl PricingService {
 		to_asset: &str,
 		amount: &str,
 	) -> Result<String, PricingError> {
-		try_with_fallback!(
-			self,
-			"convert_asset",
-			convert_asset(from_asset, to_asset, amount)
-		)
+		// Primary; on failure fall back through the configured providers in order
+		// (unchanged behavior).
+		let primary_value = match self
+			.implementation
+			.convert_asset(from_asset, to_asset, amount)
+			.await
+		{
+			Ok(value) => value,
+			Err(e) => {
+				if self.fallbacks.is_empty() {
+					return Err(e);
+				}
+				tracing::warn!(
+					"Primary pricing provider failed for convert_asset: {e}, trying fallbacks"
+				);
+				return self
+					.fallback_convert_asset(from_asset, to_asset, amount)
+					.await;
+			},
+		};
+
+		// Cross-source deviation guard (opt-in via `max_deviation_bps`). When a
+		// fallback is available, cross-check the primary conversion against it and
+		// fail closed on disagreement beyond the threshold — a stale/bad feed
+		// price could otherwise green-light a loss-making fill. If the cross-check
+		// source is unavailable or uncomparable, degrade to the primary value
+		// (can't verify; don't block on the guard source being down).
+		if let Some(max_bps) = self.config.max_deviation_bps {
+			if let Some(fallback) = self.fallbacks.first() {
+				match fallback.convert_asset(from_asset, to_asset, amount).await {
+					Ok(fallback_value) => {
+						match price_deviation_bps(&primary_value, &fallback_value) {
+							Some(dev_bps) if dev_bps > u64::from(max_bps) => {
+								return Err(PricingError::InvalidData(format!(
+								"cross-source price deviation {dev_bps} bps exceeds max {max_bps} bps for {from_asset}->{to_asset} (primary={primary_value}, fallback={fallback_value})"
+							)));
+							},
+							Some(_) => {},
+							None => {
+								tracing::warn!(
+								"deviation guard: could not compare primary/fallback conversions for {from_asset}->{to_asset}; using primary"
+							);
+							},
+						}
+					},
+					Err(e) => {
+						tracing::warn!(
+							"deviation guard: cross-check source unavailable for {from_asset}->{to_asset} ({e}); using primary"
+						);
+					},
+				}
+			}
+		}
+
+		Ok(primary_value)
+	}
+
+	/// Tries each fallback provider in order for `convert_asset`, returning the
+	/// first success. Used when the primary provider fails.
+	async fn fallback_convert_asset(
+		&self,
+		from_asset: &str,
+		to_asset: &str,
+		amount: &str,
+	) -> Result<String, PricingError> {
+		for (idx, fallback) in self.fallbacks.iter().enumerate() {
+			match fallback.convert_asset(from_asset, to_asset, amount).await {
+				Ok(value) => {
+					tracing::debug!("Fallback provider {} succeeded for convert_asset", idx + 1);
+					return Ok(value);
+				},
+				Err(e) => {
+					tracing::warn!(
+						"Fallback provider {} failed for convert_asset: {e}",
+						idx + 1
+					);
+				},
+			}
+		}
+		Err(PricingError::Network(
+			"All pricing providers failed for convert_asset".to_string(),
+		))
 	}
 
 	/// Converts a wei amount to the specified currency using current ETH price.
@@ -298,6 +408,14 @@ mod tests {
 	use super::*;
 
 	// Tests for PricingConfig
+	use crate::implementations::mock::MockPricing;
+
+	fn mock_eth_usd(price: &str) -> Box<dyn PricingInterface> {
+		Box::new(
+			MockPricing::new(&serde_json::json!({ "pair_prices": { "ETH/USD": price } })).unwrap(),
+		)
+	}
+
 	#[test]
 	fn test_pricing_config_default_values() {
 		let config = PricingConfig::default_values();
@@ -305,6 +423,63 @@ mod tests {
 		assert_eq!(config.commission_bps, 20);
 		assert_eq!(config.rate_buffer_bps, 14);
 		assert!(!config.enable_live_gas_estimate);
+		assert_eq!(config.max_deviation_bps, None);
+	}
+
+	#[test]
+	fn price_deviation_bps_computes_relative_deviation() {
+		// |3000-3200| / 3200 = 6.25% = 625 bps.
+		assert_eq!(price_deviation_bps("3000", "3200"), Some(625));
+		assert_eq!(price_deviation_bps("100", "100"), Some(0));
+		assert_eq!(price_deviation_bps("0", "0"), Some(0));
+		// Unparseable -> None (caller degrades to primary).
+		assert_eq!(price_deviation_bps("abc", "100"), None);
+	}
+
+	#[tokio::test]
+	async fn convert_asset_guard_off_returns_primary_even_when_sources_disagree() {
+		// Default config -> guard disabled: primary wins regardless of fallback.
+		let svc = PricingService::new(mock_eth_usd("3000"), vec![mock_eth_usd("9999")]);
+		let out = svc.convert_asset("ETH", "USD", "1").await.unwrap();
+		assert_eq!(out.parse::<f64>().unwrap(), 3000.0);
+	}
+
+	#[tokio::test]
+	async fn convert_asset_guard_rejects_deviation_over_threshold() {
+		let mut cfg = PricingConfig::default_values();
+		cfg.max_deviation_bps = Some(500); // 5%
+		let svc = PricingService::new_with_config(
+			mock_eth_usd("3000"),
+			vec![mock_eth_usd("3200")], // 625 bps apart
+			cfg,
+		);
+		let err = svc.convert_asset("ETH", "USD", "1").await.unwrap_err();
+		assert!(matches!(err, PricingError::InvalidData(_)), "got {err:?}");
+	}
+
+	#[tokio::test]
+	async fn convert_asset_guard_passes_within_threshold() {
+		let mut cfg = PricingConfig::default_values();
+		cfg.max_deviation_bps = Some(1000); // 10% > the 625 bps gap
+		let svc =
+			PricingService::new_with_config(mock_eth_usd("3000"), vec![mock_eth_usd("3200")], cfg);
+		let out = svc.convert_asset("ETH", "USD", "1").await.unwrap();
+		assert_eq!(out.parse::<f64>().unwrap(), 3000.0);
+	}
+
+	#[tokio::test]
+	async fn convert_asset_guard_degrades_to_primary_when_crosscheck_source_errors() {
+		// Primary knows FOO/USD; the fallback does not, so the cross-check source
+		// errors -> guard degrades to the primary value rather than blocking.
+		let mut cfg = PricingConfig::default_values();
+		cfg.max_deviation_bps = Some(100);
+		let primary = Box::new(
+			MockPricing::new(&serde_json::json!({ "pair_prices": { "FOO/USD": "10" } })).unwrap(),
+		) as Box<dyn PricingInterface>;
+		let fallback = Box::new(MockPricing::new(&serde_json::json!({})).unwrap());
+		let svc = PricingService::new_with_config(primary, vec![fallback], cfg);
+		let out = svc.convert_asset("FOO", "USD", "1").await.unwrap();
+		assert_eq!(out.parse::<f64>().unwrap(), 10.0);
 	}
 
 	#[test]
@@ -446,6 +621,7 @@ mod tests {
 				commission_bps: 50,
 				rate_buffer_bps: 25,
 				enable_live_gas_estimate: true,
+				max_deviation_bps: None,
 			};
 			let service = PricingService::new_with_config(primary, Vec::new(), config);
 			assert_eq!(service.config().currency, "EUR");

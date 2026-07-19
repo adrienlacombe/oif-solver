@@ -620,7 +620,21 @@ impl SolverBuilder {
 				"Pricing service initialized with fallbacks"
 			);
 		}
-		let pricing = Arc::new(PricingService::new(pricing_impl, fallback_impls));
+		// Opt-in cross-source price-deviation guard. `PRICING_MAX_DEVIATION_BPS`
+		// enables `PricingService`'s convert_asset cross-check (primary vs first
+		// fallback); unset/zero leaves it off (prior behavior). Read here at the
+		// service-construction site since the service's runtime PricingConfig is
+		// not otherwise operator-wired.
+		let mut pricing_svc_config = solver_pricing::PricingConfig::default_values();
+		pricing_svc_config.max_deviation_bps = std::env::var("PRICING_MAX_DEVIATION_BPS")
+			.ok()
+			.and_then(|value| value.trim().parse::<u32>().ok())
+			.filter(|bps| *bps > 0);
+		let pricing = Arc::new(PricingService::new_with_config(
+			pricing_impl,
+			fallback_impls,
+			pricing_svc_config,
+		));
 
 		// Build oracle routes from settlement implementations
 		let oracle_routes = settlement.build_oracle_routes();
