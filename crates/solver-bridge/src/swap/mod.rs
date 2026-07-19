@@ -73,6 +73,34 @@ pub(crate) fn u256_to_hex(value: U256) -> String {
 	format!("0x{value:x}")
 }
 
+/// Safe `U256 -> f64` for bps/slippage ratios (swap amounts are far below `u128::MAX`).
+pub(crate) fn to_f64(value: U256) -> f64 {
+	if value > U256::from(u128::MAX) {
+		u128::MAX as f64
+	} else {
+		value.to::<u128>() as f64
+	}
+}
+
+/// Parse a Starknet felt (`0x`-hex) into a `U256`.
+pub(crate) fn parse_felt_u256(s: &str) -> Result<U256, BridgeError> {
+	U256::from_str_radix(s.strip_prefix("0x").unwrap_or(s), 16)
+		.map_err(|e| BridgeError::Config(format!("invalid Starknet felt '{s}': {e}")))
+}
+
+/// Parse a Starknet felt (`0x`-hex) into a `solver_types::Address` (its big-endian bytes).
+pub(crate) fn parse_felt_address(s: &str) -> Result<solver_types::Address, BridgeError> {
+	let hex_str = s.strip_prefix("0x").unwrap_or(s);
+	let padded = if hex_str.len() % 2 == 1 {
+		format!("0{hex_str}")
+	} else {
+		hex_str.to_string()
+	};
+	let bytes = hex::decode(&padded)
+		.map_err(|e| BridgeError::Config(format!("invalid Starknet felt '{s}': {e}")))?;
+	Ok(solver_types::Address(bytes))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
