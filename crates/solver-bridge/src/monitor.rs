@@ -2043,6 +2043,55 @@ impl RebalanceMonitor {
 					bridge_route: pair.bridge_route.clone(),
 				};
 
+				// Absolute send-fee cap (Starknet-source legs). Quote the LZ
+				// messaging fee and skip the rebalance if it exceeds the route's
+				// `max_fee_fri`. Fails closed: a quote error skips too, so we never
+				// send blind when we cannot confirm the fee is under the cap.
+				if let Some(cap) = Self::starknet_max_fee_fri(config, source_side.chain_id) {
+					let bridge = match self
+						.bridge_service
+						.get_implementation(&config.implementation)
+					{
+						Ok(bridge) => bridge,
+						Err(e) => {
+							tracing::warn!(
+								pair = %pair.pair_id,
+								error = %e,
+								"Skipping rebalance: bridge implementation unavailable for fee-cap check"
+							);
+							continue;
+						},
+					};
+					match bridge.estimate_fee(&request, &metadata).await {
+						Ok(fee) if fee > cap => {
+							tracing::warn!(
+								pair = %pair.pair_id,
+								source = source_side.chain_id,
+								quoted_fee = %fee,
+								max_fee_fri = %cap,
+								"Skipping rebalance: quoted send fee exceeds max_fee_fri cap"
+							);
+							continue;
+						},
+						Ok(fee) => {
+							tracing::debug!(
+								pair = %pair.pair_id,
+								quoted_fee = %fee,
+								max_fee_fri = %cap,
+								"Send fee within cap"
+							);
+						},
+						Err(e) => {
+							tracing::warn!(
+								pair = %pair.pair_id,
+								error = %e,
+								"Skipping rebalance: could not quote send fee for cap check"
+							);
+							continue;
+						},
+					}
+				}
+
 				match self
 					.bridge_service
 					.rebalance_token(
@@ -2126,6 +2175,13 @@ impl RebalanceMonitor {
 			.and_then(|r| r.get("send_enabled"))
 			.and_then(|v| v.as_bool())
 			.unwrap_or(false)
+	}
+
+	/// The absolute send-fee cap (FRI) for a Starknet-source leg on `chain_id`,
+	/// parsed from the route's `max_fee_fri` decimal string. `None` ⇒ no cap.
+	fn starknet_max_fee_fri(config: &RebalanceConfig, chain_id: u64) -> Option<U256> {
+		let raw = Self::starknet_route_field(config, chain_id, "max_fee_fri")?;
+		U256::from_str_radix(raw.trim(), 10).ok()
 	}
 
 	/// The solver's address on `chain_id` as `get_balance` expects it. Starknet
@@ -2717,6 +2773,36 @@ mod tests {
 		);
 		assert_eq!(
 			RebalanceMonitor::starknet_route_field(&config, 1, "solver_account"),
+			None
+		);
+	}
+
+	#[test]
+	fn starknet_max_fee_fri_reads_cap_or_none() {
+		// Cap present on the route → parsed as U256 (FRI).
+		let mut config = rebalance_config();
+		config.pairs[0].chain_b.chain_id = SN_CHAIN;
+		config.bridge_config = Some(serde_json::json!({
+			"starknet_oft_routes": {
+				"358974494": {
+					"adapter": "0x069ac468",
+					"token": "0x03fe2b90",
+					"solver_account": "0x0cd929e61",
+					"native_fee_token": "0x04718f5a",
+					"send_enabled": false,
+					"max_fee_fri": "40000000000000000000"
+				}
+			}
+		}));
+		assert_eq!(
+			RebalanceMonitor::starknet_max_fee_fri(&config, SN_CHAIN),
+			Some(U256::from(40_000_000_000_000_000_000u128))
+		);
+		// Non-Starknet chain → no route → no cap.
+		assert_eq!(RebalanceMonitor::starknet_max_fee_fri(&config, 1), None);
+		// Route without the field → no cap.
+		assert_eq!(
+			RebalanceMonitor::starknet_max_fee_fri(&config_with_starknet_route(false), SN_CHAIN),
 			None
 		);
 	}

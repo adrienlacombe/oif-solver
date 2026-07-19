@@ -82,6 +82,16 @@ pub struct StarknetOftRoute {
 	/// this deployment.
 	#[serde(default)]
 	pub send_enabled: bool,
+	/// Absolute cap on the LayerZero messaging fee for a send originating on
+	/// this Starknet chain, in FRI (STRK's smallest unit), as a decimal string.
+	/// The rebalance monitor quotes `quote_send` before auto-triggering and
+	/// skips the rebalance if the quoted fee exceeds this. `None` = no cap.
+	/// Since the LZ fee is ~flat per message, this is the meaningful guard
+	/// against a fee spike (it needs no cross-asset pricing). The
+	/// `bridge_via_starknet_oft` send path does not consult it — this is a
+	/// monitor-level trigger guard.
+	#[serde(default)]
+	pub max_fee_fri: Option<String>,
 }
 
 // ----------------------------------------------------------------------------
