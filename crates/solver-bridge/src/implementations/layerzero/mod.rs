@@ -5,6 +5,7 @@
 //! - Katana -> ETH: OFT `send()` on Share OFT, then vault `redeem()` on Ethereum
 
 pub mod contracts;
+pub mod starknet_oft;
 pub mod types;
 
 use crate::types::{
