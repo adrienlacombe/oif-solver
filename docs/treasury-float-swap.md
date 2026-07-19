@@ -64,45 +64,57 @@ Add a **float-top-up pass** to `RebalanceMonitor::tick`, after the cross-chain p
 pass, iterating configured float targets:
 
 ```
-for each (chain, float_asset) in float_targets:
-    bal   = get_balance(chain, solver, float_asset)      // reuse per-chain solver-addr resolution
-    if bal >= target*(1 - band):  continue               // within band
-    deficit = target - bal
-    quote = swap.quote(chain, WBTC, float_asset, wbtc_for(deficit))
-    if quote.price_impact_bps > max_slippage_bps: skip+log   // fee/slippage cap (fails closed)
-    if treasury_balance(chain) < wbtc_for(deficit):
-        # local treasury insufficient -> defer to the WBTC OFT pair to bring treasury,
-        # then top up next tick. Do NOT block.
-        log; continue
-    swap.swap(chain, WBTC, float_asset, amount_in, min_out=quote.amount_out*(1-slip), scope)
+for target in float.targets:                             // {chain, token, min_balance, top_up_amount}
+    if cooldown_active(float:{chain}:{token}):  continue
+    bal      = get_balance(chain, solver, token)
+    treasury = get_balance(chain, solver, treasury_token[chain])   // WBTC
+    if bal >= min_balance:            continue           // float healthy
+    if treasury < top_up_amount:      log; continue      // local treasury drained -> OFT pair refills it
+    quote = backend(chain).quote(chain, WBTC, token, top_up_amount)   // avnu | uniswap
+    if quote.price_impact_bps > max_slippage_bps: skip+log            // slippage cap
+    min_out = quote.amount_out * (1 - max_slippage_bps)
+    if !swap_enabled:  log "would top up"; continue      // monitoring-only default
+    backend(chain).swap(chain, WBTC, token, top_up_amount, min_out, scope)
+    set_cooldown(float:{chain}:{token}, cooldown_seconds)
 ```
 
-Reuse the existing threshold/cooldown/pair-lock machinery, the per-chain solver-address
-resolution, and the `send_enabled`-style gate (here `swap_enabled`, default false).
+A fixed `top_up_amount` (treasury units) avoids needing a price oracle in the monitor to
+size the swap: `min_balance` decides *when*, `top_up_amount` decides *how much*. Overshoot
+rides (decision 4); undershoot tops up again next window. Reuses the per-chain solver-address
+resolution and the cooldown machinery, gated by `swap_enabled` (default false).
 
 ## Config
 
+The float config lives under `rebalance.bridge_config.float` (JSON passthrough, the
+same place as `starknet_oft_routes`) — no new config-crate types. The monitor reads it
+each tick. The backend is chosen by chain kind (AVNU for Starknet legs, Uniswap for EVM).
+
 ```jsonc
 "rebalance": {
-  "float": {                                  // new section
-    "swap_implementation": "avnu|uniswap",     // avnu on Starknet, uniswap on Ethereum
-    "treasury_token": { "1": "0x2260…", "358974494": "0x03fe2b97c…" },   // WBTC per chain
-    "max_slippage_bps": 100,                   // reject a swap whose quote impact exceeds this
-    "targets": [
-      { "chain_id": 1,        "token": "0xA0b8…USDC", "target": "5000000000", "band_bps": 2500 },
-      { "chain_id": 358974494,"token": "0x053c…USDC", "target": "5000000000", "band_bps": 2500 }
-      // …ETH/STRK/USDT entries
-    ],
-    "swap_config": {                           // per-backend
-      "avnu":    { "exchange_address": "0x…", "quote_api": "https://starknet.api.avnu.fi" },
+  "bridge_config": {
+    "float": {
+      "swap_enabled": false,                   // real-funds gate (quote-only until flipped)
+      "max_slippage_bps": 100,                 // skip a top-up whose quote impact exceeds this
+      "treasury_token":   { "1": "0x2260…WBTC", "358974494": "0x03fe2b97c…WBTC" },
+      "solver_addresses": { "1": "0xd4a1…",     "358974494": "0x65e2…" },  // taker/recipient per chain
+      "avnu":    { "api_base": null },          // defaults to https://starknet.api.avnu.fi
       "uniswap": { "quoter": "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
                    "router": "0x…SwapRouter02",
-                   "paths": { "USDC": "0x2260…WBTC-0001f4-…USDC", "WETH": "…" } }  // encoded fee-tier paths
-    },
-    "swap_enabled": false                      // real-funds gate (quote-only until flipped)
+                   "paths":  { "0x…usdc": "0x2260…WBTC‖0001f4‖…USDC" } },  // encoded v3 path, keyed by dest token
+      "targets": [
+        // top up when the float dips below min_balance, by swapping top_up_amount of
+        // treasury (WBTC, 8dp) into the token. min_balance is in the token's units.
+        { "chain_id": 1,         "token": "0xA0b8…USDC", "min_balance": "3000000000", "top_up_amount": "5000000" },
+        { "chain_id": 358974494, "token": "0x053c…USDC", "min_balance": "3000000000", "top_up_amount": "5000000" }
+        // …ETH/USDT entries
+      ]
+    }
   }
 }
 ```
+
+A `float:{chain}:{token}` cooldown (using `rebalance.cooldown_seconds`) is set after each
+submit so a slow-to-mine swap isn't double-submitted on the next tick.
 
 ## Slippage / cost guard
 
