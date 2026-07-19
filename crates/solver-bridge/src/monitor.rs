@@ -1724,10 +1724,14 @@ impl RebalanceMonitor {
 			// `min_native_gas_reserve` continues to use native-only balance and
 			// is checked separately later in this monitor loop.
 			let zero_str = "0x0000000000000000000000000000000000000000";
+			// Resolve the solver's address per side — a Starknet leg reads its
+			// felt account from the bridge config, not the shared EVM address.
+			let solver_a = self.solver_address_for_chain(config, pair.chain_a.chain_id);
+			let solver_b = self.solver_address_for_chain(config, pair.chain_b.chain_id);
 			let balance_a = Self::logical_balance(
 				&self.delivery,
 				pair.chain_a.chain_id,
-				solver_address,
+				&solver_a,
 				&pair.chain_a.token_address,
 				pair.bridge_route.as_ref(),
 				zero_str,
@@ -1736,7 +1740,7 @@ impl RebalanceMonitor {
 			let balance_b = Self::logical_balance(
 				&self.delivery,
 				pair.chain_b.chain_id,
-				solver_address,
+				&solver_b,
 				&pair.chain_b.token_address,
 				pair.bridge_route.as_ref(),
 				zero_str,
@@ -1817,6 +1821,32 @@ impl RebalanceMonitor {
 					RebalanceDirection::BToA => (&pair.chain_b, &pair.chain_a),
 				};
 
+				// Real-funds gate for Starknet legs: the Starknet OFT send path is
+				// unproven on-chain, so a pair involving a Starknet chain is
+				// observed and logged but NOT auto-executed until the route's
+				// `send_enabled` is flipped true. This gates BOTH directions
+				// (EVM→Starknet and Starknet→EVM) of a Starknet-involving pair.
+				if let Some(sn_chain) = [source_side.chain_id, dest_side.chain_id]
+					.into_iter()
+					.find(|c| Self::is_starknet_chain(config, *c))
+				{
+					if !Self::starknet_send_enabled(config, sn_chain) {
+						tracing::info!(
+							pair = %pair.pair_id,
+							direction = ?direction,
+							source = source_side.chain_id,
+							dest = dest_side.chain_id,
+							balance_a = %balance_a,
+							balance_b = %balance_b,
+							suggested_amount = %analysis.suggested_amount,
+							"Rebalance needed but Starknet send is disabled (monitoring only); \
+							 set starknet_oft_routes.send_enabled=true after verifying the \
+							 adapter/fee flow on-chain to enable auto-execution"
+						);
+						continue;
+					}
+				}
+
 				let zero_str = "0x0000000000000000000000000000000000000000";
 				let amount_to_bridge = if source_side.token_address.eq_ignore_ascii_case(zero_str) {
 					let native_balance = match self
@@ -1879,11 +1909,35 @@ impl RebalanceMonitor {
 					analysis.suggested_amount
 				};
 
-				let source_token = Self::parse_address(&source_side.token_address)?;
-				let source_oft = Self::parse_address(&source_side.oft_address)?;
-				let dest_token = Self::parse_address(&dest_side.token_address)?;
-				let dest_oft = Self::parse_address(&dest_side.oft_address)?;
-				let recipient = Self::parse_address(solver_address)?;
+				// Starknet legs supply felt-shaped contracts from the bridge
+				// config, so their EVM request fields are unused — resolve them to
+				// zero rather than failing `parse_address` on a 32-byte felt.
+				let source_token = Self::parse_address_for_chain(
+					config,
+					source_side.chain_id,
+					&source_side.token_address,
+				)?;
+				let source_oft = Self::parse_address_for_chain(
+					config,
+					source_side.chain_id,
+					&source_side.oft_address,
+				)?;
+				let dest_token = Self::parse_address_for_chain(
+					config,
+					dest_side.chain_id,
+					&dest_side.token_address,
+				)?;
+				let dest_oft = Self::parse_address_for_chain(
+					config,
+					dest_side.chain_id,
+					&dest_side.oft_address,
+				)?;
+				let recipient = if Self::is_starknet_chain(config, dest_side.chain_id) {
+					// Resolved from the bridge config by the Starknet leg.
+					Address::ZERO
+				} else {
+					Self::parse_address(&self.solver_address_for_chain(config, dest_side.chain_id))?
+				};
 
 				let request = BridgeRequest {
 					pair_id: pair.pair_id.clone(),
@@ -2026,6 +2080,76 @@ impl RebalanceMonitor {
 			.try_into()
 			.map_err(|_| crate::BridgeError::Config("Address must be 20 bytes".to_string()))?;
 		Ok(Address::from(arr))
+	}
+
+	// ------------------------------------------------------------------------
+	// Starknet OFT leg helpers.
+	//
+	// A chain is a Starknet leg iff it has an entry in
+	// `bridge_config.starknet_oft_routes` (the same map the LayerZero bridge
+	// reads). The monitor consults it to (a) resolve the solver's Starknet
+	// account for balance reads, (b) avoid the EVM `parse_address` on felt-shaped
+	// addresses, and (c) gate auto-execution on the route's `send_enabled`.
+	// ------------------------------------------------------------------------
+
+	/// The `starknet_oft_routes[chain_id]` object from the bridge config, if any.
+	fn starknet_route(config: &RebalanceConfig, chain_id: u64) -> Option<&serde_json::Value> {
+		config
+			.bridge_config
+			.as_ref()?
+			.get("starknet_oft_routes")?
+			.get(chain_id.to_string())
+	}
+
+	/// True when `chain_id` is configured as a Starknet OFT leg.
+	fn is_starknet_chain(config: &RebalanceConfig, chain_id: u64) -> bool {
+		Self::starknet_route(config, chain_id).is_some()
+	}
+
+	/// A string field on the Starknet route for `chain_id`.
+	fn starknet_route_field(
+		config: &RebalanceConfig,
+		chain_id: u64,
+		field: &str,
+	) -> Option<String> {
+		Self::starknet_route(config, chain_id)?
+			.get(field)?
+			.as_str()
+			.map(String::from)
+	}
+
+	/// Whether the Starknet leg's real `send` is enabled. Absent route or missing
+	/// flag ⇒ `false`, so the monitor observes but never auto-executes an
+	/// unproven Starknet send.
+	fn starknet_send_enabled(config: &RebalanceConfig, chain_id: u64) -> bool {
+		Self::starknet_route(config, chain_id)
+			.and_then(|r| r.get("send_enabled"))
+			.and_then(|v| v.as_bool())
+			.unwrap_or(false)
+	}
+
+	/// The solver's address on `chain_id` as `get_balance` expects it. Starknet
+	/// legs use the per-route `solver_account` felt; EVM chains use the monitor's
+	/// default (EVM) solver address.
+	fn solver_address_for_chain(&self, config: &RebalanceConfig, chain_id: u64) -> String {
+		Self::starknet_route_field(config, chain_id, "solver_account")
+			.unwrap_or_else(|| self.solver_address.clone())
+	}
+
+	/// Parse `addr` as an EVM address, or return `Address::ZERO` when `chain_id`
+	/// is a Starknet leg — its felt-shaped contracts come from the bridge config,
+	/// not the EVM-typed `BridgeRequest`, so the request's alloy fields are unused
+	/// on that leg.
+	fn parse_address_for_chain(
+		config: &RebalanceConfig,
+		chain_id: u64,
+		addr: &str,
+	) -> Result<Address, crate::BridgeError> {
+		if Self::is_starknet_chain(config, chain_id) {
+			Ok(Address::ZERO)
+		} else {
+			Self::parse_address(addr)
+		}
 	}
 
 	/// Reconstruct a `BridgeRequest` from a transfer's persisted fields.
@@ -2513,6 +2637,88 @@ mod tests {
 			Arc::new(RwLock::new(RebalanceMonitorStatus::default())),
 		);
 		(bridge_service, monitor)
+	}
+
+	// ---- Starknet OFT leg helpers -----------------------------------------
+
+	const SN_CHAIN: u64 = 358974494;
+
+	fn config_with_starknet_route(send_enabled: bool) -> solver_config::RebalanceConfig {
+		let mut config = rebalance_config();
+		// Make chain_b the Starknet leg.
+		config.pairs[0].chain_b.chain_id = SN_CHAIN;
+		config.bridge_config = Some(serde_json::json!({
+			"endpoint_ids": { "1": 30101, "358974494": 30500 },
+			"starknet_oft_routes": {
+				"358974494": {
+					"adapter": "0x069ac468",
+					"token": "0x03fe2b90",
+					"solver_account": "0x0cd929e61",
+					"native_fee_token": "0x04718f5a",
+					"approval_required": true,
+					"send_enabled": send_enabled
+				}
+			}
+		}));
+		config
+	}
+
+	#[test]
+	fn is_starknet_chain_detects_configured_route() {
+		let config = config_with_starknet_route(false);
+		assert!(RebalanceMonitor::is_starknet_chain(&config, SN_CHAIN));
+		assert!(!RebalanceMonitor::is_starknet_chain(&config, 1));
+	}
+
+	#[test]
+	fn starknet_send_enabled_reflects_flag_and_defaults_false() {
+		assert!(!RebalanceMonitor::starknet_send_enabled(
+			&config_with_starknet_route(false),
+			SN_CHAIN
+		));
+		assert!(RebalanceMonitor::starknet_send_enabled(
+			&config_with_starknet_route(true),
+			SN_CHAIN
+		));
+		// Absent route ⇒ false (an EVM chain never auto-gates on this).
+		assert!(!RebalanceMonitor::starknet_send_enabled(
+			&config_with_starknet_route(true),
+			1
+		));
+	}
+
+	#[test]
+	fn parse_address_for_chain_zeroes_starknet_and_parses_evm() {
+		let config = config_with_starknet_route(false);
+		// A Starknet felt would fail the 20-byte `parse_address`; the helper
+		// returns ZERO instead (the felt-shaped contract comes from config).
+		assert_eq!(
+			RebalanceMonitor::parse_address_for_chain(&config, SN_CHAIN, "0x069ac468").unwrap(),
+			Address::ZERO
+		);
+		// An EVM chain still parses a real 20-byte address.
+		assert_eq!(
+			RebalanceMonitor::parse_address_for_chain(
+				&config,
+				1,
+				"0x1111111111111111111111111111111111111111"
+			)
+			.unwrap(),
+			Address::from([0x11; 20])
+		);
+	}
+
+	#[test]
+	fn starknet_route_field_reads_solver_account() {
+		let config = config_with_starknet_route(false);
+		assert_eq!(
+			RebalanceMonitor::starknet_route_field(&config, SN_CHAIN, "solver_account").as_deref(),
+			Some("0x0cd929e61")
+		);
+		assert_eq!(
+			RebalanceMonitor::starknet_route_field(&config, 1, "solver_account"),
+			None
+		);
 	}
 
 	fn transfer_event_signature() -> [u8; 32] {

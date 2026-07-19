@@ -1961,7 +1961,7 @@ mod tests {
 		// Starknet destination -> configured solver_account felt.
 		assert_eq!(
 			bridge.recipient_bytes32(SN_CHAIN).unwrap(),
-			U256::from(0x0cd9_29e6_1u64)
+			U256::from(0x0cd9_29e61u64)
 		);
 		// EVM destination -> solver EVM address left-padded to 32 bytes.
 		assert_eq!(
