@@ -2037,6 +2037,123 @@ mod tests {
 		assert_eq!(invoke.calls[2].calldata.len(), 21);
 	}
 
+	/// Mainnet quote-only probe. Ignored by default (hits a live Starknet RPC).
+	///
+	/// Exercises the FULL production read path — the `starknet_oft` encoder →
+	/// `DeliveryService::starknet_call` → `LayerZeroBridge::estimate_fee` — for a
+	/// Starknet→ETH WBTC transfer, to confirm the adapter felt is correct and the
+	/// encoder/decode round-trips against the real contract. No funds move:
+	/// `quote_send` is a view and no signer is configured. `send_enabled=false`.
+	///
+	/// Run (fill the felts from your deploy config):
+	/// ```sh
+	/// SN_RPC_URL=https://rpc.starknet.lava.build \
+	/// SN_ADAPTER=0x069ac468...562f9 \
+	/// SN_TOKEN=0x3fe2b97c...e8e7ac \
+	/// SN_SOLVER=0x<solver starknet account felt> \
+	/// PROBE_AMOUNT=1000000 \        # 0.01 WBTC (8 decimals); optional
+	/// cargo test -p solver-bridge quote_probe_wbtc_starknet_to_eth \
+	///   -- --ignored --nocapture
+	/// ```
+	#[tokio::test]
+	#[ignore = "hits a live mainnet Starknet RPC; run manually with SN_* env vars set"]
+	async fn quote_probe_wbtc_starknet_to_eth() {
+		use solver_delivery::implementations::starknet::{
+			StarknetDelivery, StarknetDeliveryConfig,
+		};
+
+		let rpc = std::env::var("SN_RPC_URL").expect("set SN_RPC_URL");
+		let adapter =
+			std::env::var("SN_ADAPTER").expect("set SN_ADAPTER (Starknet OFT adapter felt)");
+		let token = std::env::var("SN_TOKEN").expect("set SN_TOKEN (Starknet WBTC felt)");
+		let solver =
+			std::env::var("SN_SOLVER").expect("set SN_SOLVER (solver Starknet account felt)");
+		let fee_token = std::env::var("SN_STRK").unwrap_or_else(|_| {
+			"0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d".to_string()
+		});
+		let amount: u128 = std::env::var("PROBE_AMOUNT")
+			.ok()
+			.and_then(|s| s.parse().ok())
+			.unwrap_or(1_000_000); // 0.01 WBTC (8 decimals)
+
+		// A view-only Starknet backend for the source chain (no signer needed for
+		// `starknet_call`).
+		let networks: solver_types::NetworksConfig = HashMap::from([(
+			SN_CHAIN,
+			solver_types::NetworkConfig {
+				name: Some("starknet-mainnet".to_string()),
+				network_type: solver_types::NetworkType::New,
+				kind: solver_types::NetworkKind::Starknet,
+				rpc_urls: vec![solver_types::networks::RpcEndpoint::http_only(rpc)],
+				input_settler_address: solver_types::Address(vec![0u8; 32]),
+				output_settler_address: solver_types::Address(vec![0u8; 32]),
+				tokens: Vec::new(),
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		)]);
+		let sk_config: StarknetDeliveryConfig = serde_json::from_value(json!({
+			"network_ids": [SN_CHAIN],
+			"chain_ids": { SN_CHAIN.to_string(): "SN_MAIN" }
+		}))
+		.unwrap();
+		let sk = StarknetDelivery::new(sk_config, &networks).expect("build StarknetDelivery");
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([(
+				SN_CHAIN,
+				Arc::new(sk) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]),
+			3,
+			300,
+			60,
+		));
+
+		let bridge_config = json!({
+			"endpoint_ids": { "1": 30101, SN_CHAIN.to_string(): 30500 },
+			"starknet_oft_routes": {
+				SN_CHAIN.to_string(): {
+					"adapter": adapter,
+					"token": token,
+					"solver_account": solver,
+					"native_fee_token": fee_token,
+					"approval_required": true,
+					"send_enabled": false
+				}
+			}
+		});
+		let bridge =
+			create_bridge(&bridge_config, delivery, solver_address()).expect("create_bridge");
+
+		let request = BridgeRequest {
+			pair_id: "wbtc-eth-starknet".to_string(),
+			source_chain: SN_CHAIN,
+			dest_chain: 1,
+			source_token: Address::ZERO,
+			source_oft: Address::ZERO,
+			dest_token: Address::ZERO,
+			dest_oft: Address::ZERO,
+			amount: U256::from(amount),
+			min_amount: None,
+			recipient: Address::ZERO,
+		};
+
+		let fee = bridge
+			.estimate_fee(&request, &TransferMetadata::default())
+			.await
+			.expect("quote_send should succeed against the live adapter");
+
+		println!("\n=== WBTC Starknet→ETH quote probe ===");
+		println!("adapter               = {adapter}");
+		println!("amount (1e8 units)    = {amount}");
+		println!("native_fee (STRK/FRI) = {fee}");
+		assert!(
+			fee > U256::ZERO,
+			"expected a nonzero LayerZero messaging fee — a zero fee usually means \
+			 the adapter felt or SendParam encoding is wrong"
+		);
+	}
+
 	#[tokio::test]
 	async fn test_bridge_via_composer_approves_source_token_and_calls_deposit_and_send_on_composer()
 	{
