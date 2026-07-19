@@ -10,6 +10,7 @@
 //! lookups, and any pair-level state.
 
 use crate::storage::retire_system_attempt_scope;
+use crate::swap::{avnu::AvnuSwap, uniswap::UniswapSwap, SwapInterface};
 use crate::threshold::{analyze_pair, RebalanceDirection};
 use crate::types::{bridge_system_scope, BridgeRequest, BridgeTransferStatus, RebalanceTrigger};
 use crate::BridgeService;
@@ -296,6 +297,7 @@ impl RebalanceMonitor {
 
 		self.advance_pending_transfers(&rebalance_config).await?;
 		self.check_thresholds_and_trigger(&rebalance_config).await?;
+		self.check_float_top_ups(&rebalance_config).await?;
 
 		Ok(())
 	}
@@ -2184,6 +2186,244 @@ impl RebalanceMonitor {
 		U256::from_str_radix(raw.trim(), 10).ok()
 	}
 
+	// ------------------------------------------------------------------------
+	// Treasury+float: same-chain float top-up pass (docs/treasury-float-swap.md).
+	//
+	// Config lives under `bridge_config.float` (JSON, same pattern as
+	// `starknet_oft_routes`). Per target: if the fill-asset float dips below
+	// `min_balance`, swap a fixed `top_up_amount` of the treasury token into it
+	// via the per-chain DEX backend (AVNU on Starknet, Uniswap on Ethereum),
+	// gated by `swap_enabled` + `max_slippage_bps`. Off the fill critical path.
+	// ------------------------------------------------------------------------
+
+	/// A decimal-string `U256` field on a float target.
+	fn float_u256(target: &serde_json::Value, key: &str) -> Option<U256> {
+		target
+			.get(key)
+			.and_then(|v| v.as_str())
+			.and_then(|s| U256::from_str_radix(s, 10).ok())
+	}
+
+	/// Pure top-up gate: `Some(reason)` to skip, `None` to proceed. Testable.
+	fn float_topup_blocked(
+		balance: U256,
+		min_balance: U256,
+		treasury: U256,
+		top_up: U256,
+	) -> Option<&'static str> {
+		if balance >= min_balance {
+			Some("within band")
+		} else if treasury < top_up {
+			Some("treasury insufficient")
+		} else {
+			None
+		}
+	}
+
+	/// Construct the DEX backend for `chain_id`: AVNU (Starknet legs) or Uniswap (EVM).
+	fn float_swap_backend(
+		&self,
+		config: &RebalanceConfig,
+		float: &serde_json::Value,
+		chain_id: u64,
+		taker: &str,
+		swap_enabled: bool,
+	) -> Result<Box<dyn SwapInterface>, crate::BridgeError> {
+		if Self::is_starknet_chain(config, chain_id) {
+			let api_base = float
+				.get("avnu")
+				.and_then(|a| a.get("api_base"))
+				.and_then(|v| v.as_str())
+				.map(String::from);
+			Ok(Box::new(AvnuSwap::new(
+				self.delivery.clone(),
+				api_base,
+				taker.to_string(),
+				swap_enabled,
+			)))
+		} else {
+			let uni = float.get("uniswap").ok_or_else(|| {
+				crate::BridgeError::Config("float.uniswap config missing".to_string())
+			})?;
+			let field = |name: &str| -> Result<Address, crate::BridgeError> {
+				let s = uni.get(name).and_then(|v| v.as_str()).ok_or_else(|| {
+					crate::BridgeError::Config(format!("float.uniswap.{name} missing"))
+				})?;
+				Self::parse_address(s)
+			};
+			let quoter = field("quoter")?;
+			let router = field("router")?;
+			let recipient = Self::parse_address(taker)?;
+			let mut paths: std::collections::HashMap<String, Vec<u8>> =
+				std::collections::HashMap::new();
+			if let Some(obj) = uni.get("paths").and_then(|v| v.as_object()) {
+				for (k, v) in obj {
+					if let Some(hexpath) = v.as_str() {
+						let bytes = hex::decode(hexpath.strip_prefix("0x").unwrap_or(hexpath))
+							.map_err(|e| {
+								crate::BridgeError::Config(format!(
+									"float.uniswap.paths[{k}] invalid hex: {e}"
+								))
+							})?;
+						paths.insert(k.to_lowercase(), bytes);
+					}
+				}
+			}
+			Ok(Box::new(UniswapSwap::new(
+				self.delivery.clone(),
+				quoter,
+				router,
+				recipient,
+				paths,
+				swap_enabled,
+			)))
+		}
+	}
+
+	/// Top up per-chain fill-asset floats from the treasury via same-chain DEX swaps.
+	async fn check_float_top_ups(
+		&self,
+		config: &RebalanceConfig,
+	) -> Result<(), crate::BridgeError> {
+		let Some(float) = config.bridge_config.as_ref().and_then(|c| c.get("float")) else {
+			return Ok(());
+		};
+		let swap_enabled = float
+			.get("swap_enabled")
+			.and_then(|v| v.as_bool())
+			.unwrap_or(false);
+		let max_slippage_bps = float
+			.get("max_slippage_bps")
+			.and_then(|v| v.as_u64())
+			.unwrap_or(100) as u32;
+		let Some(targets) = float.get("targets").and_then(|v| v.as_array()) else {
+			return Ok(());
+		};
+
+		for target in targets {
+			let (Some(chain), Some(token)) = (
+				target.get("chain_id").and_then(|v| v.as_u64()),
+				target.get("token").and_then(|v| v.as_str()),
+			) else {
+				continue;
+			};
+			let (Some(min_balance), Some(top_up)) = (
+				Self::float_u256(target, "min_balance"),
+				Self::float_u256(target, "top_up_amount"),
+			) else {
+				tracing::warn!(
+					chain,
+					token,
+					"float target missing min_balance/top_up_amount"
+				);
+				continue;
+			};
+			let (Some(solver), Some(treasury)) = (
+				float
+					.get("solver_addresses")
+					.and_then(|m| m.get(chain.to_string()))
+					.and_then(|v| v.as_str()),
+				float
+					.get("treasury_token")
+					.and_then(|m| m.get(chain.to_string()))
+					.and_then(|v| v.as_str()),
+			) else {
+				tracing::warn!(
+					chain,
+					"float missing solver_addresses/treasury_token for chain"
+				);
+				continue;
+			};
+
+			let cd_key = format!("float:{chain}:{token}");
+			if self.bridge_service.is_cooldown_active(&cd_key).await? {
+				continue;
+			}
+
+			let read = |addr: &str, tok: &str| {
+				let (addr, tok) = (addr.to_string(), tok.to_string());
+				async move {
+					self.delivery
+						.get_balance(chain, &addr, Some(&tok))
+						.await
+						.ok()
+						.and_then(|b| U256::from_str_radix(&b, 10).ok())
+				}
+			};
+			let (Some(balance), Some(treasury_bal)) =
+				(read(solver, token).await, read(solver, treasury).await)
+			else {
+				tracing::warn!(chain, token, "float/treasury balance read failed");
+				continue;
+			};
+
+			if let Some(reason) =
+				Self::float_topup_blocked(balance, min_balance, treasury_bal, top_up)
+			{
+				if reason == "treasury insufficient" {
+					tracing::warn!(
+						chain, token, %balance, %treasury_bal,
+						"Float below min but treasury insufficient to top up (bridge WBTC)"
+					);
+				}
+				continue;
+			}
+
+			let backend = match self.float_swap_backend(config, float, chain, solver, swap_enabled)
+			{
+				Ok(b) => b,
+				Err(e) => {
+					tracing::warn!(chain, error = %e, "float swap backend unavailable");
+					continue;
+				},
+			};
+			let quote = match backend.quote(chain, treasury, token, top_up).await {
+				Ok(q) => q,
+				Err(e) => {
+					tracing::warn!(chain, token, error = %e, "float top-up quote failed");
+					continue;
+				},
+			};
+			if quote.price_impact_bps > max_slippage_bps {
+				tracing::warn!(
+					chain,
+					token,
+					impact = quote.price_impact_bps,
+					cap = max_slippage_bps,
+					"Float top-up skipped: slippage over cap"
+				);
+				continue;
+			}
+			let min_out = quote.amount_out * U256::from(10_000u32.saturating_sub(max_slippage_bps))
+				/ U256::from(10_000u32);
+
+			if !swap_enabled {
+				tracing::info!(
+					chain, token, %balance, %min_balance, top_up = %top_up,
+					expected_out = %quote.amount_out, impact = quote.price_impact_bps,
+					"Float below min; would swap treasury->float (swap_enabled=false, monitoring only)"
+				);
+				continue;
+			}
+
+			let scope = bridge_system_scope("float-topup", chain, token);
+			match backend
+				.swap(chain, treasury, token, top_up, min_out, scope)
+				.await
+			{
+				Ok(hash) => {
+					tracing::info!(chain, token, tx = %hash_hex(&hash), "Float top-up swap submitted");
+					let _ = self
+						.bridge_service
+						.set_cooldown(&cd_key, config.cooldown_seconds)
+						.await;
+				},
+				Err(e) => tracing::warn!(chain, token, error = %e, "Float top-up swap failed"),
+			}
+		}
+		Ok(())
+	}
+
 	/// The solver's address on `chain_id` as `get_balance` expects it. Starknet
 	/// legs use the per-route `solver_account` felt; EVM chains use the monitor's
 	/// default (EVM) solver address.
@@ -2805,6 +3045,37 @@ mod tests {
 			RebalanceMonitor::starknet_max_fee_fri(&config_with_starknet_route(false), SN_CHAIN),
 			None
 		);
+	}
+
+	#[test]
+	fn float_topup_blocked_gates_on_balance_then_treasury() {
+		let u = U256::from;
+		// Float within band → skip.
+		assert_eq!(
+			RebalanceMonitor::float_topup_blocked(u(100u64), u(50u64), u(1000u64), u(10u64)),
+			Some("within band")
+		);
+		// Below min, treasury sufficient → proceed.
+		assert_eq!(
+			RebalanceMonitor::float_topup_blocked(u(40u64), u(50u64), u(1000u64), u(10u64)),
+			None
+		);
+		// Below min, treasury insufficient → skip.
+		assert_eq!(
+			RebalanceMonitor::float_topup_blocked(u(40u64), u(50u64), u(5u64), u(10u64)),
+			Some("treasury insufficient")
+		);
+	}
+
+	#[test]
+	fn float_u256_parses_decimal_string_fields_only() {
+		let t = serde_json::json!({ "min_balance": "5000000000", "num": 5 });
+		assert_eq!(
+			RebalanceMonitor::float_u256(&t, "min_balance"),
+			Some(U256::from(5_000_000_000u64))
+		);
+		assert_eq!(RebalanceMonitor::float_u256(&t, "num"), None); // JSON number, not string
+		assert_eq!(RebalanceMonitor::float_u256(&t, "missing"), None);
 	}
 
 	fn transfer_event_signature() -> [u8; 32] {
