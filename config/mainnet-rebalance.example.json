@@ -1,0 +1,85 @@
+{
+  "_comment": "Reference rebalance config for the Ethereum<->Starknet mainnet solver. All addresses on-chain-verified 2026-07-19. Everything is GATED OFF (send_enabled=false, swap_enabled=false): the monitor observes + logs but moves no funds until each gate is flipped after a dry-run. Networks/tokens (fill assets) are configured separately in the `networks` section (see config/example-*.json). Keep starknet_oft_routes present — the monitor uses it to recognize chain 358974494 as Starknet.",
+
+  "rebalance": {
+    "enabled": true,
+    "implementation": "layerzero",
+    "monitor_interval_seconds": 60,
+    "cooldown_seconds": 3600,
+    "max_pending_transfers": 3,
+
+    "min_native_gas_reserve": {
+      "1": "30000000000000000",
+      "358974494": "150000000000000000000"
+    },
+
+    "pairs": [
+      {
+        "pair_id": "wbtc-eth-starknet",
+        "chain_a": {
+          "chain_id": 1,
+          "token_address": "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
+          "oft_address": "0x0555e30da8f98308edb960aa94c0db47230d2b9c"
+        },
+        "chain_b": {
+          "chain_id": 358974494,
+          "token_address": "0x03fe2b97c1fd336e750087d68b9b867997fd64a2661ff3ca5a7c771641e8e7ac",
+          "oft_address": "0x069ac468d7ad7324c2807d9422630c650729a46121f023b11a647edf173562f9"
+        },
+        "target_balance_a": "SET: ETH-side WBTC target, 1e8 units",
+        "target_balance_b": "SET: Starknet-side WBTC target, 1e8 units",
+        "deviation_band_bps": 2000,
+        "max_bridge_amount": "SET: max per transfer, 1e8 units",
+        "bridge_route": null
+      }
+    ],
+
+    "bridge_config": {
+      "endpoint_ids": { "1": 30101, "358974494": 30500 },
+      "lz_receive_gas": 200000,
+
+      "starknet_oft_routes": {
+        "358974494": {
+          "adapter": "0x069ac468d7ad7324c2807d9422630c650729a46121f023b11a647edf173562f9",
+          "token": "0x03fe2b97c1fd336e750087d68b9b867997fd64a2661ff3ca5a7c771641e8e7ac",
+          "solver_account": "0x65e2bf408a4422b1a586927e6652f99dfeb3c4e242d6b339d0b5851bd1d4eaf",
+          "native_fee_token": "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d",
+          "approval_required": true,
+          "send_enabled": false,
+          "max_fee_fri": "60000000000000000000"
+        }
+      },
+
+      "float": {
+        "swap_enabled": false,
+        "max_slippage_bps": 100,
+        "treasury_token": {
+          "1": "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
+          "358974494": "0x03fe2b97c1fd336e750087d68b9b867997fd64a2661ff3ca5a7c771641e8e7ac"
+        },
+        "solver_addresses": {
+          "1": "0xd4a1A11fb69c906D82EC7D99e91a28fc62447415",
+          "358974494": "0x65e2bf408a4422b1a586927e6652f99dfeb3c4e242d6b339d0b5851bd1d4eaf"
+        },
+        "avnu": { "api_base": null },
+        "uniswap": {
+          "quoter": "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
+          "router": "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",
+          "paths": {
+            "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599000bb8c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599000bb8a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            "0xdac17f958d2ee523a2206206994597c13d831ec7": "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599000bb8c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2000bb8dac17f958d2ee523a2206206994597c13d831ec7"
+          }
+        },
+        "targets": [
+          { "chain_id": 1, "token": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "min_balance": "3000000000", "top_up_amount": "10000000" },
+          { "chain_id": 1, "token": "0xdAC17F958D2ee523a2206206994597C13D831ec7", "min_balance": "3000000000", "top_up_amount": "10000000" },
+          { "chain_id": 1, "token": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "min_balance": "1000000000000000000", "top_up_amount": "10000000" },
+          { "chain_id": 358974494, "token": "0x053c91253bc9682c04929ca02ed00b3e423f6710d2ee7e0d5ebb06f3ecf368a8", "min_balance": "3000000000", "top_up_amount": "10000000" },
+          { "chain_id": 358974494, "token": "0x068f5c6a61780768455de69077e07e89787839bf8166decfbf92b645209c0fb8", "min_balance": "3000000000", "top_up_amount": "10000000" },
+          { "chain_id": 358974494, "token": "0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7", "min_balance": "1000000000000000000", "top_up_amount": "10000000" }
+        ]
+      }
+    }
+  }
+}
