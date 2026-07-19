@@ -879,6 +879,7 @@ mod tests {
 			storage,
 			account,
 			solver_address,
+			solver_types::SolverIdentityAddresses::default(),
 			delivery,
 			discovery,
 			order,

@@ -13,6 +13,18 @@ use std::{fmt, sync::Once};
 
 static RUSTLS_PROVIDER: Once = Once::new();
 
+/// TCP connect timeout for HTTP RPC transports built here. Bounds the wait for a
+/// connection before a call can fail and be retried/looped.
+const RPC_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Per-request timeout for HTTP RPC transports built here. An endpoint that
+/// accepts a connection but never answers (e.g. a keep-alive socket silently
+/// dropped by a NAT/idle timeout, leaving a half-open connection) would
+/// otherwise hang the call forever — the `RetryBackoffLayer` only retries
+/// `TransportError` responses, never a hung call. Discovery poll loops depend on
+/// this backstop so a stale connection surfaces as an error (→ retry next tick)
+/// instead of silently wedging the monitor.
+const RPC_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Installs a process-level rustls crypto provider.
 ///
 /// rustls 0.23 requires an explicit provider when multiple crypto backends are
@@ -112,8 +124,29 @@ pub fn create_http_provider(
 		retry_policy,
 	);
 
-	// Create RPC client with retry capabilities
-	let client = RpcClient::builder().layer(retry_layer).http(url);
+	// Build the underlying reqwest client with explicit connect + request
+	// timeouts so an endpoint that accepts connections but never answers cannot
+	// hang a call indefinitely. Without this, a stale/half-open keep-alive
+	// connection (dropped by a NAT/idle timeout after long uptime, no RST) makes
+	// the next `.await` block forever, silently wedging the discovery monitor
+	// loop until a restart establishes fresh connections. `RetryBackoffLayer`
+	// cannot help — a hang is not a `TransportError`.
+	let http_client = reqwest::Client::builder()
+		.connect_timeout(RPC_CONNECT_TIMEOUT)
+		.timeout(RPC_REQUEST_TIMEOUT)
+		.build()
+		.map_err(|e| {
+			ProviderError::Connection(format!(
+				"Failed to build HTTP client for network {network_id}: {e}"
+			))
+		})?;
+
+	// Create RPC client with retry capabilities over the timeout-bounded HTTP
+	// transport. `http_with_client` preserves the RetryBackoffLayer while
+	// swapping in our pre-built reqwest client.
+	let client = RpcClient::builder()
+		.layer(retry_layer)
+		.http_with_client(http_client, url);
 
 	// Create provider with retry-enabled client
 	let provider = ProviderBuilder::new().connect_client(client);

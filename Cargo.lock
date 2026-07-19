@@ -5753,6 +5753,7 @@ dependencies = [
  "axum",
  "bytes",
  "hex",
+ "reqwest 0.12.23",
  "rust_decimal",
  "rustls",
  "serde",

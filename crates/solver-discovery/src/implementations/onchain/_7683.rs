@@ -527,10 +527,17 @@ struct StarknetRpcClient {
 
 impl StarknetRpcClient {
 	fn new(http_url: String) -> Self {
-		Self {
-			http_url,
-			client: reqwest::Client::new(),
-		}
+		// Bound connect + request time so a stale/half-open keep-alive connection
+		// (dropped by a NAT/idle timeout after long uptime, no RST) surfaces as an
+		// error instead of hanging `.send().await` forever and silently wedging the
+		// Starknet discovery monitor loop until a restart. Falls back to the
+		// default client only if the builder fails (which it should not).
+		let client = reqwest::Client::builder()
+			.connect_timeout(std::time::Duration::from_secs(10))
+			.timeout(std::time::Duration::from_secs(30))
+			.build()
+			.unwrap_or_else(|_| reqwest::Client::new());
+		Self { http_url, client }
 	}
 
 	async fn json_rpc<T: DeserializeOwned>(
