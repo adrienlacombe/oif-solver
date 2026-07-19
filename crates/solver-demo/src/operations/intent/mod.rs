@@ -5,6 +5,7 @@
 //! schemes, and order submission workflows with comprehensive parameter validation.
 
 pub mod hyperlane_open;
+pub mod hyperlane_open_starknet;
 
 use crate::{
 	core::logging,

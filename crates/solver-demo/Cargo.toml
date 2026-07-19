@@ -42,6 +42,10 @@ solver-config = { path = "../solver-config" }
 solver-service = { path = "../solver-service" }
 solver-storage = { path = "../solver-storage" }
 solver-types = { path = "../solver-types" }
+starknet-rust-accounts = { workspace = true }
+starknet-rust-core = { workspace = true }
+starknet-rust-providers = { workspace = true }
+starknet-rust-signers = { workspace = true }
 sysinfo = "0.32"
 thiserror = "2"
 tokio = { version = "1.41", features = ["full"] }

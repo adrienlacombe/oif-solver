@@ -120,6 +120,14 @@ pub enum IntentSubcommand {
 	/// from the `ALICE_PRIVATE_KEY` environment variable (never a flag). Defaults
 	/// target the Ethereum↔Starknet mainnet route.
 	Open(OpenArgs),
+
+	/// Open a Hyperlane7683 order on-chain (Starknet origin → EVM destination).
+	///
+	/// The reverse of `open`. Self-contained: builds its own Starknet RPC
+	/// provider and reads the opener Starknet key from the
+	/// `STARKNET_ALICE_PRIVATE_KEY` environment variable (never a flag).
+	/// Defaults target the Starknet→Ethereum mainnet route.
+	OpenSn(OpenSnArgs),
 }
 
 /// Arguments for the on-chain Hyperlane7683 opener (EVM → Starknet).
@@ -169,5 +177,59 @@ pub struct OpenArgs {
 
 	/// Output amount in wei (destination token). Default 1e10.
 	#[arg(long, default_value = "10000000000")]
+	pub output_amount: String,
+}
+
+/// Arguments for the on-chain Hyperlane7683 opener (Starknet → EVM).
+#[derive(Args, Debug)]
+pub struct OpenSnArgs {
+	/// Origin (Starknet) JSON-RPC URL.
+	#[arg(long, env = "STARKNET_RPC_URL")]
+	pub rpc: String,
+
+	/// Origin Hyperlane7683 settler (Starknet felt) — open target + approve spender.
+	#[arg(
+		long,
+		default_value = "0x02361657076c480fece1dbd9f8b03921f25d7d629fc110f6154d22ac27806ba2"
+	)]
+	pub settler: String,
+
+	/// Opener/sender account (Starknet felt); must match STARKNET_ALICE_PRIVATE_KEY.
+	#[arg(long, env = "STARKNET_ALICE_ADDRESS")]
+	pub sender: String,
+
+	/// Origin input token address (Starknet felt) — locked by the opener.
+	#[arg(
+		long,
+		default_value = "0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7"
+	)]
+	pub input_token: String,
+
+	/// Destination output token address (EVM).
+	#[arg(long, default_value = "0xca14007eff0db1f8135f4c25b34de49ab0d42766")]
+	pub output_token: String,
+
+	/// Destination Hyperlane7683 settler (EVM).
+	#[arg(long, default_value = "0xd1519b8eA6B0571aEe55D6A8c055220d9C7f386C")]
+	pub dest_settler: String,
+
+	/// Destination recipient (EVM).
+	#[arg(long, default_value = "0xCD929e61AF1cb2d645667eec6d9aECFEDbE11922")]
+	pub recipient: String,
+
+	/// Origin Hyperlane domain (Starknet mainnet); must equal the settler's local domain.
+	#[arg(long, default_value_t = 358_974_494)]
+	pub origin_domain: u64,
+
+	/// Destination Hyperlane domain (Ethereum mainnet).
+	#[arg(long, default_value_t = 1)]
+	pub dest_chain: u64,
+
+	/// Input amount in wei (origin Starknet token). Default 5e15.
+	#[arg(long, default_value = "5000000000000000")]
+	pub input_amount: String,
+
+	/// Output amount in wei (destination EVM token). Default 1e15.
+	#[arg(long, default_value = "1000000000000000")]
 	pub output_amount: String,
 }

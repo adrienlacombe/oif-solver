@@ -655,6 +655,9 @@ async fn handle_intent(cmd: solver_demo::cli::commands::IntentCommand) -> Result
 	if let IntentSubcommand::Open(args) = cmd.command {
 		return handle_intent_open(args).await;
 	}
+	if let IntentSubcommand::OpenSn(args) = cmd.command {
+		return handle_intent_open_sn(args).await;
+	}
 
 	// Load context
 	let ctx = std::sync::Arc::new(Context::load_existing().await?);
@@ -937,6 +940,9 @@ async fn handle_intent(cmd: solver_demo::cli::commands::IntentCommand) -> Result
 			}
 		},
 		IntentSubcommand::Open(_) => unreachable!("Open is handled before context load"),
+		IntentSubcommand::OpenSn(_) => {
+			unreachable!("OpenSn is handled before context load")
+		},
 	}
 
 	Ok(())
@@ -965,6 +971,36 @@ async fn handle_intent_open(args: solver_demo::cli::commands::OpenArgs) -> Resul
 		output_token: args.output_token,
 		dest_settler: args.dest_settler,
 		recipient: args.recipient,
+		input_amount,
+		output_amount,
+	})
+	.await
+}
+
+/// Handle the self-contained Hyperlane7683 on-chain opener (Starknet → EVM).
+async fn handle_intent_open_sn(args: solver_demo::cli::commands::OpenSnArgs) -> Result<()> {
+	use alloy_primitives::U256;
+	use solver_demo::operations::intent::hyperlane_open_starknet::{run, OpenSnParams};
+
+	let input_amount = args
+		.input_amount
+		.parse::<U256>()
+		.map_err(|e| anyhow::anyhow!("invalid --input-amount '{}': {e}", args.input_amount))?;
+	let output_amount = args
+		.output_amount
+		.parse::<U256>()
+		.map_err(|e| anyhow::anyhow!("invalid --output-amount '{}': {e}", args.output_amount))?;
+
+	run(OpenSnParams {
+		rpc: args.rpc,
+		settler: args.settler,
+		sender: args.sender,
+		input_token: args.input_token,
+		output_token: args.output_token,
+		dest_settler: args.dest_settler,
+		recipient: args.recipient,
+		origin_domain: args.origin_domain,
+		dest_chain: args.dest_chain,
 		input_amount,
 		output_amount,
 	})
