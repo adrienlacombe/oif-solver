@@ -481,10 +481,24 @@ pub async fn handle_trigger_rebalance(
 		pair_id: request.pair_id.clone(),
 		source_chain: request.source_chain,
 		dest_chain: request.dest_chain,
-		source_token: source_side.token_address,
-		source_oft: source_side.oft_address,
-		dest_token: dest_side.token_address,
-		dest_oft: dest_side.oft_address,
+		// Starknet felt sides can't fit alloy Address; the Starknet bridge leg reads
+		// its felts from starknet_oft_routes, so a zero here is unused for those.
+		source_token: source_side
+			.token_address
+			.to_alloy()
+			.unwrap_or(alloy_primitives::Address::ZERO),
+		source_oft: source_side
+			.oft_address
+			.to_alloy()
+			.unwrap_or(alloy_primitives::Address::ZERO),
+		dest_token: dest_side
+			.token_address
+			.to_alloy()
+			.unwrap_or(alloy_primitives::Address::ZERO),
+		dest_oft: dest_side
+			.oft_address
+			.to_alloy()
+			.unwrap_or(alloy_primitives::Address::ZERO),
 		amount,
 		min_amount: None,
 		recipient,
@@ -550,7 +564,8 @@ pub async fn handle_trigger_rebalance(
 			"bridge_route has no side for chain {chain_id}"
 		)))
 	};
-	let effective_source_token: String = if source_side.token_address == zero_addr {
+	let effective_source_token: String = if source_side.token_address.to_alloy() == Some(zero_addr)
+	{
 		route_wrapper_for_chain(request.source_chain)?
 			.unwrap_or_else(|| source_side.token_address.to_string())
 	} else {
@@ -560,12 +575,13 @@ pub async fn handle_trigger_rebalance(
 	// solver — that's the Transfer-event scan target. For non-composer flow,
 	// the existing scan logic falls back to `vault_address` so the pair token
 	// works here (and matches existing test expectations).
-	let delivery_scan_token: String = if is_composer && dest_side.token_address == zero_addr {
-		route_wrapper_for_chain(request.dest_chain)?
-			.unwrap_or_else(|| dest_side.token_address.to_string())
-	} else {
-		dest_side.token_address.to_string()
-	};
+	let delivery_scan_token: String =
+		if is_composer && dest_side.token_address.to_alloy() == Some(zero_addr) {
+			route_wrapper_for_chain(request.dest_chain)?
+				.unwrap_or_else(|| dest_side.token_address.to_string())
+		} else {
+			dest_side.token_address.to_string()
+		};
 
 	let metadata = solver_bridge::types::TransferMetadata {
 		source_token_address: effective_source_token,
@@ -1102,13 +1118,17 @@ mod tests {
 					pair_id: "eth-katana".to_string(),
 					chain_a: RebalancePairSide {
 						chain_id: 1,
-						token_address: alloy_address("0x1111111111111111111111111111111111111111"),
-						oft_address: alloy_address("0x2222222222222222222222222222222222222222"),
+						token_address: alloy_address("0x1111111111111111111111111111111111111111")
+							.into(),
+						oft_address: alloy_address("0x2222222222222222222222222222222222222222")
+							.into(),
 					},
 					chain_b: RebalancePairSide {
 						chain_id: 747474,
-						token_address: alloy_address("0x3333333333333333333333333333333333333333"),
-						oft_address: alloy_address("0x4444444444444444444444444444444444444444"),
+						token_address: alloy_address("0x3333333333333333333333333333333333333333")
+							.into(),
+						oft_address: alloy_address("0x4444444444444444444444444444444444444444")
+							.into(),
 					},
 					target_balance_a: "1000000".to_string(),
 					target_balance_b: "1000000".to_string(),
@@ -1522,7 +1542,7 @@ mod tests {
 	async fn test_handle_trigger_rebalance_rejects_route_without_matching_side() {
 		let mut operator_config = sample_operator_config();
 		let rebalance = operator_config.rebalance.as_mut().unwrap();
-		rebalance.pairs[0].chain_b.token_address = alloy_primitives::Address::ZERO;
+		rebalance.pairs[0].chain_b.token_address = alloy_primitives::Address::ZERO.into();
 		rebalance.pairs[0].bridge_route = Some(serde_json::json!({
 			"composer": "0xcccccccccccccccccccccccccccccccccccccccc",
 			"composer_chain_id": 1,

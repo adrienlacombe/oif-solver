@@ -29,6 +29,42 @@ impl Address {
 	pub fn is_bytes32_address(&self) -> bool {
 		self.0.len() == Self::BYTES32_LENGTH
 	}
+
+	/// The 20-byte EVM `alloy` address, or `None` if this isn't a 20-byte address
+	/// (e.g. a 32-byte Starknet felt). Use at EVM-only boundaries.
+	pub fn to_alloy(&self) -> Option<AlloyAddress> {
+		(self.0.len() == Self::EVM_LENGTH).then(|| AlloyAddress::from_slice(&self.0))
+	}
+}
+
+impl std::str::FromStr for Address {
+	type Err = String;
+
+	/// Parse a `0x`-hex address, accepting 20-byte EVM or 32-byte (cross-chain /
+	/// Starknet felt) values. Mirrors the `Deserialize` impl.
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		let hex_str = s.trim_start_matches("0x");
+		if hex_str.is_empty() {
+			return Err("Address cannot be empty".to_string());
+		}
+		let padded = match hex_str.len() {
+			len if len <= Self::EVM_LENGTH * 2 => format!("{hex_str:0>40}"),
+			len if len <= Self::BYTES32_LENGTH * 2 => format!("{hex_str:0>64}"),
+			len => {
+				return Err(format!(
+					"Invalid address length: expected up to 32 bytes, got {len} hex characters"
+				))
+			},
+		};
+		let bytes = hex::decode(&padded).map_err(|e| format!("Invalid hex address: {e}"))?;
+		if !matches!(bytes.len(), Self::EVM_LENGTH | Self::BYTES32_LENGTH) {
+			return Err(format!(
+				"Invalid address length: expected 20 or 32 bytes, got {}",
+				bytes.len()
+			));
+		}
+		Ok(Address(bytes))
+	}
 }
 
 /// Chain-family-specific solver identities used where protocols need both EVM

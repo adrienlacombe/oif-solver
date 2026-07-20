@@ -818,10 +818,14 @@ pub struct RebalancePairSide {
 	pub chain_id: u64,
 
 	/// Token contract address on this chain (balance-bearing ERC-20).
-	pub token_address: Address,
+	///
+	/// Uses the flexible `SolverAddress` (20-byte EVM OR 32-byte Starknet felt) so a
+	/// Starknet pair side can be represented; alloy `Address` (strict 20 bytes) would
+	/// reject felts and crash-loop config load.
+	pub token_address: SolverAddress,
 
 	/// OFT contract address on this chain (LayerZero transport contract).
-	pub oft_address: Address,
+	pub oft_address: SolverAddress,
 }
 
 impl OperatorConfig {
@@ -991,6 +995,29 @@ mod tests {
 
 	fn test_address() -> Address {
 		Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap()
+	}
+
+	#[test]
+	fn rebalance_pair_side_accepts_starknet_felt_addresses() {
+		// A Starknet pair side carries 32-byte felt token/oft addresses. These must
+		// deserialize — alloy Address's strict 20-byte parse rejected them, which
+		// crash-looped the mainnet config load when the WBTC OFT pair was applied.
+		let json = r#"{
+			"chain_id": 358974494,
+			"token_address": "0x03fe2b97c1fd336e750087d68b9b867997fd64a2661ff3ca5a7c771641e8e7ac",
+			"oft_address": "0x069ac468d7ad7324c2807d9422630c650729a46121f023b11a647edf173562f9"
+		}"#;
+		let side: RebalancePairSide =
+			serde_json::from_str(json).expect("Starknet felt pair side should deserialize");
+		assert_eq!(side.chain_id, 358974494);
+		assert!(side.token_address.is_bytes32_address());
+		assert!(side.oft_address.is_bytes32_address());
+		// An EVM 20-byte side still deserializes.
+		let evm: RebalancePairSide = serde_json::from_str(
+			r#"{"chain_id":1,"token_address":"0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599","oft_address":"0x0555e30da8f98308edb960aa94c0db47230d2b9c"}"#,
+		)
+		.expect("EVM pair side should still deserialize");
+		assert!(evm.token_address.is_evm_address());
 	}
 
 	fn test_token_address() -> SolverAddress {

@@ -497,22 +497,16 @@ impl SolverEngine {
 							Vec::with_capacity(rebalance.pairs.len());
 						let mut convert_err: Option<String> = None;
 						for p in &rebalance.pairs {
+							// Flexible parse (20-byte EVM OR 32-byte Starknet felt) so a
+							// Starknet pair side converts without error. preflight only acts
+							// on `bridge_route` (EVM composer) pairs and converts to a 20-byte
+							// address at its own EVM call sites.
 							let parse = |hex_str: &str,
 							             field: &str|
-							 -> Result<alloy_primitives::Address, String> {
-								let s = hex_str.strip_prefix("0x").unwrap_or(hex_str);
-								let bytes = hex::decode(s).map_err(|e| {
-									format!("pair '{}' {} not hex: {e}", p.pair_id, field)
-								})?;
-								if bytes.len() != 20 {
-									return Err(format!(
-										"pair '{}' {} not 20 bytes",
-										p.pair_id, field
-									));
-								}
-								let mut arr = [0u8; 20];
-								arr.copy_from_slice(&bytes);
-								Ok(alloy_primitives::Address::from(arr))
+							 -> Result<solver_types::Address, String> {
+								hex_str
+									.parse::<solver_types::Address>()
+									.map_err(|e| format!("pair '{}' {}: {e}", p.pair_id, field))
 							};
 							let chain_a = match (
 								parse(&p.chain_a.token_address, "chain_a.token_address"),

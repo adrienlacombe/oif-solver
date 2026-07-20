@@ -1340,7 +1340,7 @@ impl BridgeInterface for LayerZeroBridge {
 				("chain_a", &pair.chain_a, &route.chain_a),
 				("chain_b", &pair.chain_b, &route.chain_b),
 			] {
-				let is_native = pair_side.token_address == Address::ZERO;
+				let is_native = pair_side.token_address.to_alloy() == Some(Address::ZERO);
 				if is_native && side_route.wrapper.is_none() {
 					return Err(BridgeError::Config(format!(
 						"pair '{}' {}: token is native but route side has no wrapper",
@@ -1364,7 +1364,10 @@ impl BridgeInterface for LayerZeroBridge {
 				let call_data = contracts::approvalRequiredCall {}.abi_encode();
 				let call_tx = build_tx(
 					pair_side.chain_id,
-					pair_side.oft_address,
+					to_evm_address(
+						&pair_side.oft_address,
+						"preflight approvalRequired oft_address",
+					)?,
 					call_data,
 					U256::ZERO,
 					None,
@@ -1460,7 +1463,9 @@ impl BridgeInterface for LayerZeroBridge {
 							pair.pair_id
 						))
 					})?;
-			if composer_share_oft != vault_side.oft_address {
+			if composer_share_oft
+				!= to_evm_address(&vault_side.oft_address, "vault-side oft_address")?
+			{
 				return Err(BridgeError::Config(format!(
 					"pair '{}': composer.SHARE_OFT() = {} but vault-side oft_address = {} \
 					 (likely the Asset OFT was configured instead of the Share OFT Adapter)",
@@ -1472,7 +1477,7 @@ impl BridgeInterface for LayerZeroBridge {
 			// (wrapper for native sides, pair token for ERC-20).
 			let expected_vault_asset: Address = match &vault_route.wrapper {
 				Some(w) => w.address,
-				None => vault_side.token_address,
+				None => to_evm_address(&vault_side.token_address, "vault-side token_address")?,
 			};
 			let asset_call = contracts::IVaultComposerSync::ASSET_ERC20Call {}.abi_encode();
 			let asset_tx = build_tx(composer_chain, route.composer, asset_call, U256::ZERO, None);
@@ -1544,12 +1549,12 @@ impl BridgeInterface for LayerZeroBridge {
 			};
 			let expected_remote_token: Address = match &remote_route.wrapper {
 				Some(w) => w.address,
-				None => remote_side.token_address,
+				None => to_evm_address(&remote_side.token_address, "remote-side token_address")?,
 			};
 			let token_call = contracts::tokenCall {}.abi_encode();
 			let token_tx = build_tx(
 				remote_side.chain_id,
-				remote_side.oft_address,
+				to_evm_address(&remote_side.oft_address, "remote-side oft_address")?,
 				token_call,
 				U256::ZERO,
 				None,
@@ -1608,20 +1613,20 @@ impl BridgeInterface for LayerZeroBridge {
 					vault_side,
 					vault_side.chain_id,
 					remote_side_eid,
-					remote_side.oft_address,
+					remote_side.oft_address.clone(),
 				),
 				(
 					"remote-side",
 					remote_side,
 					remote_side.chain_id,
 					vault_side_eid,
-					vault_side.oft_address,
+					vault_side.oft_address.clone(),
 				),
 			] {
 				let peers_call = contracts::peersCall { eid: remote_eid }.abi_encode();
 				let peers_tx = build_tx(
 					query_chain,
-					oft_side.oft_address,
+					to_evm_address(&oft_side.oft_address, "peers oft_side oft_address")?,
 					peers_call,
 					U256::ZERO,
 					None,
@@ -1650,7 +1655,7 @@ impl BridgeInterface for LayerZeroBridge {
 				let mut addr_bytes = [0u8; 20];
 				addr_bytes.copy_from_slice(&raw[12..]);
 				let peer_addr = Address::from(addr_bytes);
-				if peer_addr != expected_remote_oft {
+				if peer_addr != to_evm_address(&expected_remote_oft, "peers expected remote oft")? {
 					return Err(BridgeError::Config(format!(
 						"pair '{}' {} OFT {}.peers({}) = {} but expected remote OFT {} \
 						 (peer wiring missing or mismatched)",
@@ -1705,6 +1710,15 @@ fn parse_address(s: &str) -> Result<Address, BridgeError> {
 		.try_into()
 		.map_err(|_| BridgeError::Config(format!("Address must be 20 bytes: {s}")))?;
 	Ok(Address::from(arr))
+}
+
+/// Convert a config `solver_types::Address` to a 20-byte EVM `Address` for on-chain EVM
+/// calls. `preflight` runs only on EVM composer pairs, so a non-20-byte address here is
+/// a misconfiguration — surfaced as a `Config` error rather than a panic.
+fn to_evm_address(addr: &solver_types::Address, ctx: &str) -> Result<Address, BridgeError> {
+	addr.to_alloy().ok_or_else(|| {
+		BridgeError::Config(format!("{ctx}: expected a 20-byte EVM address, got {addr}"))
+	})
 }
 
 /// Parse a Starknet felt (`0x`-hex string) into a `U256`.

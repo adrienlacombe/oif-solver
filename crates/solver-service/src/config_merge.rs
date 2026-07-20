@@ -3142,13 +3142,13 @@ fn build_rebalance_config_from_operator(
 			pair_id: p.pair_id.clone(),
 			chain_a: RebalancePairSideConfig {
 				chain_id: p.chain_a.chain_id,
-				token_address: format!("0x{}", hex::encode(p.chain_a.token_address.as_slice())),
-				oft_address: format!("0x{}", hex::encode(p.chain_a.oft_address.as_slice())),
+				token_address: p.chain_a.token_address.to_string(),
+				oft_address: p.chain_a.oft_address.to_string(),
 			},
 			chain_b: RebalancePairSideConfig {
 				chain_id: p.chain_b.chain_id,
-				token_address: format!("0x{}", hex::encode(p.chain_b.token_address.as_slice())),
-				oft_address: format!("0x{}", hex::encode(p.chain_b.oft_address.as_slice())),
+				token_address: p.chain_b.token_address.to_string(),
+				oft_address: p.chain_b.oft_address.to_string(),
 			},
 			target_balance_a: p.target_balance_a.clone(),
 			target_balance_b: p.target_balance_b.clone(),
@@ -3228,28 +3228,18 @@ fn translate_tx_bump(op: &solver_types::OperatorTxBumpConfig) -> solver_config::
 fn extract_rebalance_config(
 	rebalance: Option<&RebalanceConfig>,
 ) -> Result<Option<OperatorRebalanceConfig>, MergeError> {
-	use alloy_primitives::Address;
-
 	let rebalance = match rebalance {
 		Some(r) => r,
 		None => return Ok(None),
 	};
 
-	let parse_addr = |s: &str, field: &str, pair_id: &str| -> Result<Address, MergeError> {
-		let hex_str = s.strip_prefix("0x").unwrap_or(s);
-		let bytes = hex::decode(hex_str).map_err(|e| {
-			MergeError::Validation(format!(
-				"Rebalance pair '{pair_id}': invalid hex in {field}: {e}"
-			))
-		})?;
-		let arr: [u8; 20] = bytes.try_into().map_err(|b: Vec<u8>| {
-			MergeError::Validation(format!(
-				"Rebalance pair '{pair_id}': {field} must be 20 bytes, got {}",
-				b.len()
-			))
-		})?;
-		Ok(Address::from(arr))
-	};
+	let parse_addr =
+		|s: &str, field: &str, pair_id: &str| -> Result<solver_types::Address, MergeError> {
+			// Flexible: 20-byte EVM OR 32-byte Starknet felt (a Starknet pair side).
+			s.parse::<solver_types::Address>().map_err(|e| {
+				MergeError::Validation(format!("Rebalance pair '{pair_id}': invalid {field}: {e}"))
+			})
+		};
 
 	let mut pairs = Vec::with_capacity(rebalance.pairs.len());
 	for p in &rebalance.pairs {
@@ -9184,13 +9174,13 @@ mod tests {
 					pair_id: "eth-katana".to_string(),
 					chain_a: solver_types::RebalancePairSide {
 						chain_id: 1,
-						token_address: address!("1111111111111111111111111111111111111111"),
-						oft_address: address!("2222222222222222222222222222222222222222"),
+						token_address: address!("1111111111111111111111111111111111111111").into(),
+						oft_address: address!("2222222222222222222222222222222222222222").into(),
 					},
 					chain_b: solver_types::RebalancePairSide {
 						chain_id: 747474,
-						token_address: address!("3333333333333333333333333333333333333333"),
-						oft_address: address!("4444444444444444444444444444444444444444"),
+						token_address: address!("3333333333333333333333333333333333333333").into(),
+						oft_address: address!("4444444444444444444444444444444444444444").into(),
 					},
 					target_balance_a: "1000000".to_string(),
 					target_balance_b: "1000000".to_string(),
@@ -9202,13 +9192,13 @@ mod tests {
 					pair_id: "eth-katana".to_string(),
 					chain_a: solver_types::RebalancePairSide {
 						chain_id: 1,
-						token_address: address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-						oft_address: address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+						token_address: address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").into(),
+						oft_address: address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").into(),
 					},
 					chain_b: solver_types::RebalancePairSide {
 						chain_id: 8453,
-						token_address: address!("cccccccccccccccccccccccccccccccccccccccc"),
-						oft_address: address!("dddddddddddddddddddddddddddddddddddddddd"),
+						token_address: address!("cccccccccccccccccccccccccccccccccccccccc").into(),
+						oft_address: address!("dddddddddddddddddddddddddddddddddddddddd").into(),
 					},
 					target_balance_a: "1000000".to_string(),
 					target_balance_b: "1000000".to_string(),
@@ -9241,7 +9231,9 @@ mod tests {
 				pair_id: "eth-katana".to_string(),
 				chain_a: solver_config::RebalancePairSideConfig {
 					chain_id: 1,
-					token_address: "0x1234".to_string(),
+					// 33 bytes — invalid under the flexible parser (max 32; 20-byte EVM
+					// or 32-byte felt). Shorter values are zero-padded, so use over-length.
+					token_address: format!("0x{}", "11".repeat(33)),
 					oft_address: "0x2222222222222222222222222222222222222222".to_string(),
 				},
 				chain_b: solver_config::RebalancePairSideConfig {
@@ -9262,7 +9254,7 @@ mod tests {
 		assert!(matches!(err, MergeError::Validation(_)));
 		assert!(err
 			.to_string()
-			.contains("Rebalance pair 'eth-katana': chain_a.token_address must be 20 bytes"));
+			.contains("Rebalance pair 'eth-katana': invalid chain_a.token_address"));
 	}
 
 	#[test]
@@ -9300,6 +9292,6 @@ mod tests {
 		assert!(matches!(err, MergeError::Validation(_)));
 		assert!(err
 			.to_string()
-			.contains("Rebalance pair 'eth-katana': invalid hex in chain_b.oft_address"));
+			.contains("Rebalance pair 'eth-katana': invalid chain_b.oft_address"));
 	}
 }
