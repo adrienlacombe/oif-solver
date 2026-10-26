@@ -550,7 +550,7 @@ pub struct OperatorGasFlowUnits {
 /// Pricing provider configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperatorPricingConfig {
-	/// Primary pricing provider (e.g., "coingecko", "defillama").
+	/// Primary pricing provider (e.g., "coingecko", "defillama", "coinpaprika").
 	pub primary: String,
 
 	/// Fallback providers in order of preference.

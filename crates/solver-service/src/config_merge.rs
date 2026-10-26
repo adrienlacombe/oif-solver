@@ -345,6 +345,51 @@ fn load_public_register_enabled(orders_auth_enabled: bool) -> Result<bool, Merge
 	parse_bool_env_var("AUTH_PUBLIC_REGISTER_ENABLED", false)
 }
 
+fn parse_u64_env_var(name: &str, default: u64) -> Result<u64, MergeError> {
+	match std::env::var(name) {
+		Ok(raw) => raw.trim().parse::<u64>().map_err(|_| {
+			MergeError::Validation(format!(
+				"Invalid integer value for {name}: {raw} (expected a non-negative integer)"
+			))
+		}),
+		Err(std::env::VarError::NotPresent) => Ok(default),
+		Err(std::env::VarError::NotUnicode(_)) => Err(MergeError::Validation(format!(
+			"Invalid unicode value for {name}"
+		))),
+	}
+}
+
+/// Validates the on-chain discovery polling interval.
+///
+/// The upper bound mirrors MAX_POLLING_INTERVAL_SECS in the onchain_eip7683
+/// discovery schema (also used by the Hyperlane and Starknet pollers); values
+/// outside it would pass the merge but abort startup when the discovery
+/// factory validates its config, so reject them here. Zero is rejected
+/// because the EVM implementation treats 0 as WebSocket mode, which is
+/// currently disabled.
+fn validate_discovery_polling_interval_secs(secs: u64) -> Result<u64, MergeError> {
+	if !(1..=300).contains(&secs) {
+		return Err(MergeError::Validation(format!(
+			"SOLVER_DISCOVERY_POLLING_INTERVAL_SECS must be between 1 and 300, got {secs}"
+		)));
+	}
+	Ok(secs)
+}
+
+/// Reads the on-chain discovery polling interval from the environment,
+/// falling back to the seed default when unset.
+fn load_discovery_polling_interval_secs() -> Result<u64, MergeError> {
+	let secs = validate_discovery_polling_interval_secs(parse_u64_env_var(
+		"SOLVER_DISCOVERY_POLLING_INTERVAL_SECS",
+		COMMON_DEFAULTS.polling_interval_secs,
+	)?)?;
+	tracing::info!(
+		polling_interval_secs = secs,
+		"On-chain discovery polling interval resolved"
+	);
+	Ok(secs)
+}
+
 /// Merges seed overrides with a seed config to produce a complete Config.
 ///
 /// # Arguments
@@ -1924,6 +1969,7 @@ fn build_discovery_config_from_operator(
 		.collect::<Vec<_>>();
 	starknet_chain_ids.sort_unstable();
 
+	let polling_interval_secs = load_discovery_polling_interval_secs()?;
 	let broadcaster = operator_config.settlement.broadcaster.as_ref();
 	let default_finality_blocks = broadcaster
 		.map(|config| config.default_finality_blocks)
@@ -1948,7 +1994,7 @@ fn build_discovery_config_from_operator(
 		// EVM onchain discovery - polls chain for new orders.
 		let onchain_config = json_object(vec![
 			("network_ids", evm_network_ids_array.clone()),
-			("polling_interval_secs", int(5)),
+			("polling_interval_secs", int(polling_interval_secs as i64)),
 			(
 				"default_finality_blocks",
 				int(default_finality_blocks as i64),
@@ -1960,7 +2006,7 @@ fn build_discovery_config_from_operator(
 		if hyperlane_discovery_enabled {
 			let hyperlane_onchain_config = json_object(vec![
 				("network_ids", evm_network_ids_array.clone()),
-				("polling_interval_secs", int(5)),
+				("polling_interval_secs", int(polling_interval_secs as i64)),
 				(
 					"default_finality_blocks",
 					int(default_finality_blocks as i64),
@@ -1990,7 +2036,7 @@ fn build_discovery_config_from_operator(
 			build_source_finality_rules_for_discovery(operator_config, &starknet_chain_ids)?;
 		let starknet_onchain_config = json_object(vec![
 			("network_ids", starknet_network_ids_array),
-			("polling_interval_secs", int(5)),
+			("polling_interval_secs", int(polling_interval_secs as i64)),
 			(
 				"default_finality_blocks",
 				int(default_finality_blocks as i64),
@@ -2573,6 +2619,15 @@ fn build_pricing_config_from_operator(pricing: &OperatorPricingConfig) -> Pricin
 		int(pricing.cache_duration_seconds as i64),
 	)]);
 	implementations.insert("defillama".to_string(), defillama_config);
+
+	// CoinPaprika is an additional provider. It is registered unconditionally
+	// so operator config or `PRICING_PRIMARY` / `PRICING_FALLBACKS` can select
+	// it, and it is not the default primary or fallback.
+	let coinpaprika_config = json_object(vec![(
+		"cache_duration_seconds",
+		int(pricing.cache_duration_seconds as i64),
+	)]);
+	implementations.insert("coinpaprika".to_string(), coinpaprika_config);
 
 	// Mock implementation. Registered unconditionally so it can be selected
 	// as primary via `PRICING_PRIMARY=mock` for tests/demos. Includes
@@ -4888,6 +4943,7 @@ mod tests {
 		assert!(pricing.fallbacks.contains(&"defillama".to_string()));
 		assert!(pricing.implementations.contains_key("coingecko"));
 		assert!(pricing.implementations.contains_key("defillama"));
+		assert!(pricing.implementations.contains_key("coinpaprika"));
 	}
 
 	#[test]
@@ -8204,6 +8260,96 @@ mod tests {
 		assert!(offchain.get("api_port").is_none());
 	}
 
+	fn discovery_polling_interval(discovery: &DiscoveryConfig, name: &str) -> Option<u64> {
+		discovery
+			.implementations
+			.get(name)
+			.and_then(|config| config.get("polling_interval_secs"))
+			.and_then(|value| value.as_u64())
+	}
+
+	fn operator_config_with_starknet_network() -> OperatorConfig {
+		let mut op_config = merge_to_operator_config(test_seed_overrides(), &TESTNET_SEED).unwrap();
+		let mut starknet = op_config
+			.networks
+			.get(&11155420)
+			.expect("optimism sepolia network")
+			.clone();
+		starknet.chain_id = 358974494;
+		starknet.kind = NetworkKind::Starknet;
+		starknet.name = "starknet".to_string();
+		op_config.networks.insert(starknet.chain_id, starknet);
+		op_config
+	}
+
+	#[test]
+	fn test_validate_discovery_polling_interval_bounds() {
+		assert!(matches!(
+			validate_discovery_polling_interval_secs(0),
+			Err(MergeError::Validation(_))
+		));
+		assert_eq!(validate_discovery_polling_interval_secs(1).unwrap(), 1);
+		assert_eq!(validate_discovery_polling_interval_secs(5).unwrap(), 5);
+		assert_eq!(validate_discovery_polling_interval_secs(300).unwrap(), 300);
+
+		let err = validate_discovery_polling_interval_secs(301).unwrap_err();
+		assert!(matches!(err, MergeError::Validation(_)));
+		assert!(err
+			.to_string()
+			.contains("SOLVER_DISCOVERY_POLLING_INTERVAL_SECS"));
+	}
+
+	#[test]
+	#[serial]
+	fn test_discovery_polling_interval_env_override() {
+		let _guard = EnvVarGuard::capture("SOLVER_DISCOVERY_POLLING_INTERVAL_SECS");
+		std::env::set_var("SOLVER_DISCOVERY_POLLING_INTERVAL_SECS", "300");
+
+		let op_config = operator_config_with_starknet_network();
+		let chain_ids = vec![11155420, 84532, 358974494];
+		let discovery = build_discovery_config_from_operator(&op_config, &chain_ids).unwrap();
+
+		assert_eq!(
+			discovery_polling_interval(&discovery, "onchain_eip7683"),
+			Some(300)
+		);
+		assert_eq!(
+			discovery_polling_interval(&discovery, "onchain_hyperlane7683"),
+			Some(300)
+		);
+		assert_eq!(
+			discovery_polling_interval(&discovery, "onchain_starknet_hyperlane7683"),
+			Some(300)
+		);
+	}
+
+	#[test]
+	#[serial]
+	fn test_discovery_polling_interval_defaults_to_seed_default_when_unset() {
+		let _guard = EnvVarGuard::capture("SOLVER_DISCOVERY_POLLING_INTERVAL_SECS");
+		std::env::remove_var("SOLVER_DISCOVERY_POLLING_INTERVAL_SECS");
+
+		let op_config = operator_config_with_starknet_network();
+		let chain_ids = vec![11155420, 84532, 358974494];
+		let discovery = build_discovery_config_from_operator(&op_config, &chain_ids).unwrap();
+
+		assert_eq!(
+			discovery_polling_interval(&discovery, "onchain_eip7683"),
+			Some(COMMON_DEFAULTS.polling_interval_secs)
+		);
+		assert_eq!(
+			discovery_polling_interval(&discovery, "onchain_hyperlane7683"),
+			Some(COMMON_DEFAULTS.polling_interval_secs)
+		);
+		assert_eq!(
+			discovery_polling_interval(&discovery, "onchain_starknet_hyperlane7683"),
+			Some(COMMON_DEFAULTS.polling_interval_secs)
+		);
+		// Pin the current default so a change to COMMON_DEFAULTS is a
+		// deliberate, reviewed behavior change rather than a silent one.
+		assert_eq!(COMMON_DEFAULTS.polling_interval_secs, 5);
+	}
+
 	#[test]
 	fn test_build_discovery_config_reuses_broadcaster_finality() {
 		let mut op_config = merge_to_operator_config(test_seed_overrides(), &TESTNET_SEED).unwrap();
@@ -8505,9 +8651,41 @@ mod tests {
 		assert_eq!(pricing.fallbacks, vec!["defillama".to_string()]);
 		assert!(pricing.implementations.contains_key("coingecko"));
 		assert!(pricing.implementations.contains_key("defillama"));
+		assert!(pricing.implementations.contains_key("coinpaprika"));
 		// `mock` is now registered unconditionally so PRICING_PRIMARY=mock
 		// can select it without further config.
 		assert!(pricing.implementations.contains_key("mock"));
+	}
+
+	#[test]
+	#[serial_test::serial(env_pricing)]
+	fn test_build_pricing_config_can_select_coinpaprika_without_replacing_default() {
+		let _g_primary = EnvVarGuard::capture("PRICING_PRIMARY");
+		let _g_fallbacks = EnvVarGuard::capture("PRICING_FALLBACKS");
+		std::env::remove_var("PRICING_PRIMARY");
+		std::env::remove_var("PRICING_FALLBACKS");
+
+		let op_pricing = OperatorPricingConfig {
+			primary: "coingecko".to_string(),
+			fallbacks: vec!["defillama".to_string()],
+			cache_duration_seconds: 120,
+			custom_prices: HashMap::new(),
+		};
+		let defaults = build_pricing_config_from_operator(&op_pricing);
+		assert_eq!(defaults.primary, "coingecko");
+		assert_eq!(defaults.fallbacks, vec!["defillama".to_string()]);
+		assert!(defaults.implementations.contains_key("coinpaprika"));
+
+		std::env::set_var("PRICING_PRIMARY", "coinpaprika");
+		std::env::set_var("PRICING_FALLBACKS", "coingecko,defillama");
+		let selected = build_pricing_config_from_operator(&op_pricing);
+		assert_eq!(selected.primary, "coinpaprika");
+		assert_eq!(
+			selected.fallbacks,
+			vec!["coingecko".to_string(), "defillama".to_string()]
+		);
+		assert!(selected.implementations.contains_key("coinpaprika"));
+		assert!(selected.implementations.contains_key("coingecko"));
 	}
 
 	#[test]
@@ -8745,6 +8923,38 @@ mod tests {
 		std::env::set_var(key, "not-a-port");
 		let err = parse_u16_env_var(key, 8081).unwrap_err();
 		std::env::remove_var(key);
+
+		assert!(matches!(err, MergeError::Validation(_)));
+		assert!(err.to_string().contains("Invalid integer value"));
+	}
+
+	#[test]
+	#[serial]
+	fn test_parse_u64_env_var_uses_default_when_missing() {
+		let key = "TEST_PARSE_U64_MISSING";
+		let _guard = EnvVarGuard::capture(key);
+		std::env::remove_var(key);
+		let parsed = parse_u64_env_var(key, 5).unwrap();
+		assert_eq!(parsed, 5);
+	}
+
+	#[test]
+	#[serial]
+	fn test_parse_u64_env_var_parses_value() {
+		let key = "TEST_PARSE_U64_VALUE";
+		let _guard = EnvVarGuard::capture(key);
+		std::env::set_var(key, " 500 ");
+		let parsed = parse_u64_env_var(key, 5).unwrap();
+		assert_eq!(parsed, 500);
+	}
+
+	#[test]
+	#[serial]
+	fn test_parse_u64_env_var_rejects_invalid_value() {
+		let key = "TEST_PARSE_U64_INVALID";
+		let _guard = EnvVarGuard::capture(key);
+		std::env::set_var(key, "not-a-number");
+		let err = parse_u64_env_var(key, 5).unwrap_err();
 
 		assert!(matches!(err, MergeError::Validation(_)));
 		assert!(err.to_string().contains("Invalid integer value"));
